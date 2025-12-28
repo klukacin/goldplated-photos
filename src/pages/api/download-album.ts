@@ -16,6 +16,14 @@ export const POST: APIRoute = async ({ request }) => {
       });
     }
 
+    // SECURITY: Block path traversal attempts
+    if (albumPath.includes('..') || albumPath.startsWith('/')) {
+      return new Response(JSON.stringify({ error: 'Invalid path' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const albumDir = path.join(process.cwd(), 'src/content/albums', albumPath);
 
     try {
