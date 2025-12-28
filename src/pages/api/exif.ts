@@ -18,6 +18,15 @@ export const POST: APIRoute = async ({ request }) => {
 
     // Convert URL to file path
     const photoPath = photoUrl.replace('/albums/', '');
+
+    // SECURITY: Block path traversal attempts
+    if (photoPath.includes('..') || photoPath.startsWith('/')) {
+      return new Response(JSON.stringify({ error: 'Invalid path' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const fullPath = path.join(process.cwd(), 'src/content/albums', photoPath);
 
     try {
