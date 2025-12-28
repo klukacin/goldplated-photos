@@ -1,0 +1,441 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Development Commands
+
+```bash
+npm run dev      # Start dev server (port 4321, or 4322/4323 if in use)
+npm run build    # Build production site to ./dist/
+npm run preview  # Preview production build locally
+```
+
+## Site Structure
+
+The site has three main sections:
+
+| Route | Page | Description |
+|-------|------|-------------|
+| `/` | Landing Page | Background image with shutter button, navigates to /home |
+| `/home` | Digital Home | Hero slider, intro text, content cards |
+| `/photos/*` | Photo Gallery | Album browser with all photo features |
+
+## Application Overview
+
+### Pages (Screens)
+
+| Route | File | Description |
+|-------|------|-------------|
+| `/` | `src/pages/index.astro` | Landing page - full-screen background with shutter button |
+| `/home` | `src/pages/home.astro` | Digital home - hero slider, intro text, content cards |
+| `/photos` | `src/pages/photos/index.astro` | Gallery root - top-level album list |
+| `/photos/*` | `src/pages/photos/[...path].astro` | Album/Collection view - dynamic route for all albums |
+
+### Components
+
+| Component | File | Description |
+|-----------|------|-------------|
+| PhotoGrid | `src/components/PhotoGrid.astro` | Photo/video grid, lightbox, EXIF/video info, keyboard nav, sorting, inline video players |
+| AlbumGrid | `src/components/AlbumGrid.astro` | Sub-album grid with cover photo thumbnails |
+| Breadcrumbs | `src/components/Breadcrumbs.astro` | Hierarchical navigation path |
+| PasswordProtection | `src/components/PasswordProtection.astro` | Password entry form (DEPRECATED - now inline in SSR) |
+| Footer | `src/components/Footer.astro` | Site footer with email contact and copyright |
+
+### API Endpoints
+
+| Endpoint | File | Description |
+|----------|------|-------------|
+| `/api/thumbnail` | `src/pages/api/thumbnail.ts` | Generate/serve cached thumbnails (small/medium/large) |
+| `/api/exif` | `src/pages/api/exif.ts` | Extract EXIF metadata from photos |
+| `/api/video-info` | `src/pages/api/video-info.ts` | Extract video metadata via ffprobe |
+| `/api/check-password` | `src/pages/api/check-password.ts` | Validate album passwords (legacy) |
+| `/api/check-access` | `src/pages/api/check-access.ts` | Check if user has access to album (legacy) |
+| `/api/unlock` | `src/pages/api/unlock.ts` | SSR password verification, sets HttpOnly cookie |
+| `/api/download-album` | `src/pages/api/download-album.ts` | Create ZIP of album photos (requires X-Album-Token header) |
+
+### PhotoGrid Views & States
+
+| View | Description |
+|------|-------------|
+| Grid view | Square thumbnails in responsive grid |
+| Masonry view | Pinterest-style variable-height layout |
+| Single-column view | Full-width images with original aspect ratios |
+| Lightbox | PhotoSwipe full-screen image viewer |
+| EXIF/Video Info overlay | Metadata popup (camera settings for photos, duration/codec for videos) |
+| Video inline player | Native HTML5 video with controls |
+| Video error state | Error message with filename and download button |
+
+## Architecture Overview
+
+### Rendering Mode
+- **Server-side rendering** (`output: 'server'`) with Node.js standalone adapter
+- API routes run server-side for password protection, EXIF extraction, and thumbnail generation
+- Static pages are pre-rendered using `export const prerender = true`
+- **Protected albums use SSR** (`prerender = false`) - content only rendered after access verification
+
+### Content Collections
+
+**Albums** (`src/content/albums/`):
+```
+src/content/albums/
+  └── {year}/
+      └── {category}/
+          └── {album-name}/
+              ├── index.md          # Album metadata (required)
+              └── *.jpg/png/gif     # Photo files
+```
+
+Each `index.md` contains frontmatter defining album properties (title, password, thumbnail, style, etc.) per the schema in `src/content/config.ts`.
+
+**Home Content** (`src/content/home/`):
+```
+src/content/home/
+  ├── intro.md              # Introduction paragraph
+  └── cards/
+      ├── weddings.md       # Content cards with type, title,
+      ├── people.md         # image, imagePosition (left/right),
+      ├── events.md         # link, and order fields
+      └── ...
+```
+
+### Routing System
+
+**Landing Page:** `src/pages/index.astro`
+- Full-screen background image
+- Shutter button with sound effect (`/sounds/shutter.mp3`)
+- Navigates to `/home` on click
+
+**Digital Home:** `src/pages/home.astro`
+- Hero slider with auto-rotating images from `/home/hero/`
+- Intro text block from `intro.md`
+- Content cards with alternating image positions
+- **Accessibility**: Skip link, keyboard nav, ARIA carousel, pause control, live regions
+- **Design**: Minimalist Modern (Syne + DM Sans typography, black/white palette)
+
+**Photo Gallery Root:** `src/pages/photos/index.astro`
+- Displays top-level albums with breadcrumb navigation (Home / Photos)
+- **Public/Locked Toggle:** Filters albums by password protection status
+  - Public: Albums without passwords (default view)
+  - Locked: Password-protected albums
+  - Toggle preference persisted to localStorage
+- Albums sorted by `order` field, then alphabetically
+
+**Photo Gallery:** `src/pages/photos/[...path].astro`
+- Dynamic route handling all album paths under `/photos/`
+- **Uses SSR** (`prerender = false`) for server-side access control
+- Fetches album metadata from Content Collection
+- **Access verification:** Checks `album-access` cookie before rendering content
+- If password-protected and NOT unlocked: Shows inline password form (no image URLs in source)
+- If authorized: Renders full content
+- Distinguishes between collections (folders) and albums (photos):
+  - **Collections** (`isCollection: true`): Renders `<AlbumGrid>` of sub-albums
+  - **Albums** (`isCollection: false`): Renders `<PhotoGrid>` with photos
+
+Photos are discovered by scanning the album directory for image files (see `getPhotosForAlbum()` in `src/lib/albums.ts`).
+
+### Image Serving & Thumbnails
+
+**Original images:** `src/pages/albums/[...path].ts` serves files from `src/content/albums/`
+- Security: Prevents path traversal (`..` and leading `/` blocked)
+- Caching: `Cache-Control: public, max-age=31536000, immutable`
+
+**Thumbnails:** `src/pages/api/thumbnail.ts` generates optimized thumbnails using Sharp
+- Three sizes: `small` (400px), `medium` (1200px), `large` (1920px)
+- Cached in `.meta/thumbnails/{size}/` using MD5 hash filenames
+- **To regenerate:** Delete `.meta/thumbnails` directory (ignored by git)
+- PhotoGrid component automatically requests thumbnails via `getThumbnailUrl()` helper
+
+**EXIF Orientation:** Sharp's `.rotate()` is applied during thumbnail generation to auto-rotate images based on EXIF orientation metadata.
+- **IMPORTANT:** Always use thumbnails for display (not original images) to ensure correct orientation
+- Original images may display rotated wrong because browsers don't consistently respect EXIF orientation
+- Lightbox always uses large thumbnails (1920px) for this reason
+
+### Album Cover Photos
+
+Albums display cover photos in the grid using this priority:
+1. **Manual selection:** Set `thumbnail: "filename.jpg"` in album's `index.md`
+2. **Auto-fallback:** First photo in the album
+3. **Empty albums:** Show generic icon (📁 for collections, 🖼️ for albums)
+
+### Photo Sorting
+
+Albums support 6 sort options via dropdown (persisted to localStorage):
+- Name (A-Z / Z-A)
+- Date taken (Oldest / Newest) - **default: oldest first**
+- File size (Smallest / Largest)
+
+### Password Protection Flow (SSR)
+
+**SECURITY:** Protected albums use Server-Side Rendering (SSR) - image URLs are NOT exposed in page source until access is verified.
+
+**How it works:**
+1. Album page uses `prerender = false` (SSR, not static)
+2. Server checks `album-access` cookie for unlocked tokens
+3. If NOT authorized: Only password form is rendered (no image URLs in source)
+4. If authorized: Full album content is rendered with image URLs
+
+**Unlock flow:**
+1. User submits password via form POST to `/api/unlock`
+2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min)
+3. On success: Sets HttpOnly cookie with album token, redirects to album
+4. Cookie flags: `httpOnly`, `secure` (prod), `sameSite: strict`, 24h expiry
+
+**Access inheritance:**
+- Parent album access grants access to child albums without passwords
+- Tokens can be passed via `?token=` query parameter (share links)
+
+**Security features:**
+- Path traversal protection on all API endpoints
+- Rate limiting prevents brute force attacks
+- Timing-safe password comparison prevents timing attacks
+- HttpOnly cookies prevent XSS token theft
+
+Passwords are plaintext strings in frontmatter (simple protection, not cryptographically secure).
+
+### EXIF Data
+
+**API:** `src/pages/api/exif.ts` extracts EXIF using `exifr` library
+- Client requests EXIF for specific photo URL
+- Server reads file, extracts metadata, returns JSON
+- **Caching:** PhotoGrid maintains in-memory cache (`exifCache` Map) per session
+
+**Display:** PhotoGrid component shows EXIF in overlay (press `i` key or click info button)
+
+### PhotoSwipe Integration
+
+`PhotoGrid.astro` initializes PhotoSwipe lightbox with:
+- Full-screen photo viewing
+- Touch gestures (swipe, pinch-to-zoom)
+- Keyboard navigation (arrows, `i` for EXIF, `F` for fullscreen, Escape to close)
+- Custom escape key handling: First press closes help, second closes EXIF, third closes lightbox
+- Scroll-to-last-viewed-photo on lightbox close
+- Real-time grid focus sync during navigation
+
+### Custom Lightbox UI
+
+The lightbox includes a custom toolbar (dynamically created in `uiRegister` event):
+
+**UI Elements (top bar):**
+- **Left:** Image counter with thumbnail preview (e.g., "1 / 24")
+- **Right:** Size display, Original button (🔍+), Help (?), Close (×)
+
+**Features:**
+- **Original Mode (O key):** Load full-resolution original images instead of thumbnails
+- **Zen Mode (H key):** Hide all UI elements for distraction-free viewing (hover reveals UI)
+- **Shortcuts Help (? key):** Overlay showing all keyboard shortcuts
+
+**CSS Note:** All custom lightbox UI styles use `:global()` in Astro because the elements are dynamically created and appended to PhotoSwipe's container (outside the component's scoped DOM).
+
+### Keyboard Navigation
+
+**Gallery view** (not in lightbox):
+- Arrow keys: Navigate photos in left-to-right, top-to-bottom order
+- Space/Enter: Open focused photo
+- `i`: Toggle EXIF overlay
+- Home/End: Jump to first/last photo
+- Visual focus indicator (blue outline) via `.keyboard-focused` class
+
+**Lightbox view:**
+- Arrows: Navigate photos
+- `i` / `I`: Toggle EXIF/video info overlay
+- `F` / `f`: Toggle fullscreen mode
+- `O` / `o`: Toggle original quality images
+- `H` / `h`: Toggle zen mode (hide all UI)
+- `?`: Toggle keyboard shortcuts help
+- Escape: Close overlays in order (help → EXIF → lightbox)
+- Event capture phase intercepts keys before PhotoSwipe handlers
+
+### Mobile UX
+
+**Desktop:** Hover icons (info, download) appear in top-right corner of photos
+
+**Mobile (<768px):**
+- Icons hidden
+- Long-press (500ms) triggers context menu at touch position
+- Haptic feedback on long-press (`navigator.vibrate(50)`)
+- Menu options: Photo Info, Download
+- **Swipe up/down:** Close lightbox
+
+### Masonry Layout
+
+CSS Grid with `grid-template-columns: repeat(3, 1fr)` ensures true left-to-right ordering.
+
+- Desktop: 3 columns
+- Mobile: 2 columns
+
+### Design System (Layout.astro)
+
+**Typography:**
+- Headings: `Syne` (Google Font) - geometric, variable weight 500-800
+- Body: `DM Sans` (Google Font) - clean sans-serif
+- Signature: `Satisfy` (Google Font) - elegant script for "by Kristijan Lukačin"
+- Fluid scale using `clamp()`: `--text-xs` to `--text-4xl`
+- CSS variable: `--font-signature: 'Satisfy', cursive`
+
+**Color Tokens (high contrast, WCAG AA):**
+- `--color-text: #0a0a0a` (21:1 contrast on white)
+- `--color-text-secondary: #404040` (9.5:1 contrast)
+- `--color-text-muted: #666666` (5.7:1 contrast)
+- `--color-focus: #2563eb` (blue focus ring)
+
+**Spacing Scale:**
+- `--space-xs` (0.5rem) to `--space-3xl` (8rem)
+- Container widths: `--container-narrow` (700px), `--container-max` (1000px), `--container-wide` (1200px)
+
+**Accessibility Utilities:**
+- `.sr-only` - Screen reader only content
+- `.skip-link` - Skip to main content link
+- `:focus-visible` - 3px blue outline with 2px offset
+- `@media (prefers-reduced-motion: reduce)` - Disables all animations
+- `@media (forced-colors: active)` - High contrast mode support
+
+### Home Page Accessibility (home.astro)
+
+**Carousel (AccessibleSlider class):**
+- ARIA: `role="region"`, `aria-roledescription="carousel"`, `aria-label`
+- Slides: `role="group"`, `aria-roledescription="slide"`, `aria-hidden` state
+- Live region announces slide changes to screen readers
+- Keyboard: Arrow keys navigate, Space/Enter toggles pause
+- Pause button with `aria-pressed` state
+- Auto-play disabled when `prefers-reduced-motion: reduce`
+
+**Card Layout:**
+- Uses CSS Grid `order` property for alternating image positions (no RTL hack)
+- Entry animations via Intersection Observer (respects reduced motion)
+
+**Touch Targets:**
+- All interactive elements ≥44x44px (WCAG requirement)
+- Slider dots use `::before` pseudo-element for expanded tap area
+
+## Key Files
+
+**Pages:**
+- `src/pages/index.astro` - Landing page with shutter button
+- `src/pages/home.astro` - Digital home with hero slider and cards
+- `src/pages/photos/index.astro` - Photo gallery root (album list)
+- `src/pages/photos/[...path].astro` - Dynamic album/collection pages
+
+**Components:**
+- `src/components/PhotoGrid.astro` - Photo display, lightbox, EXIF, keyboard nav, sorting
+- `src/components/AlbumGrid.astro` - Sub-album grid with cover photos
+- `src/components/PasswordProtection.astro` - Password entry form
+- `src/components/Breadcrumbs.astro` - Hierarchical navigation
+- `src/components/Footer.astro` - Site footer with email contact and copyright
+- `src/layouts/Layout.astro` - Base layout wrapper
+
+**API Routes:**
+- `src/pages/albums/[...path].ts` - Serve original images
+- `src/pages/api/thumbnail.ts` - Generate/serve cached thumbnails
+- `src/pages/api/exif.ts` - Extract EXIF metadata
+- `src/pages/api/unlock.ts` - SSR password verification (sets HttpOnly cookie)
+- `src/pages/api/check-password.ts` - Validate album passwords (legacy)
+- `src/pages/api/download-album.ts` - Create ZIP of album photos
+
+**Utilities:**
+- `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos, password checking
+- `src/lib/rate-limit.ts` - In-memory rate limiting (10 attempts / 15 minutes per IP)
+
+**Static Assets:**
+- `public/images/landing-bg.jpg` - Landing page background
+- `public/sounds/shutter.mp3` - Shutter button sound
+- `public/home/hero/*.jpg` - Hero slider images
+- `public/home/cards/*.jpg` - Content card images
+
+## Important Patterns
+
+### Album Folder Naming
+**IMPORTANT:** Avoid dots (`.`) in album folder names, especially after numbers.
+- ❌ `16.album-name` → Astro normalizes to `16album-name` (breaks file lookups)
+- ✅ `16-album-name` → Works correctly
+
+Use dashes (`-`) or underscores (`_`) as separators instead of dots.
+
+### Adding Photos to Albums
+1. Copy photos to `src/content/albums/{path}/`
+2. Photos auto-discovered by file extension (.jpg, .jpeg, .png, .gif, .webp, .heic, .heif)
+3. Thumbnails generated on first request, cached thereafter
+
+### Setting Album Cover Photo
+In album's `index.md`:
+```yaml
+---
+title: "My Album"
+thumbnail: "best-photo.jpg"  # Optional: specific cover photo
+---
+```
+
+### Album Ordering and Visibility
+Albums support `order` and `hidden` fields in frontmatter:
+```yaml
+---
+title: "My Album"
+order: 1          # Lower numbers appear first (optional)
+hidden: true      # Only accessible via direct link (default: false)
+---
+```
+- **Order:** Albums without an order value appear after ordered albums
+- **Hidden:** Hidden albums don't appear in album listings but can still be accessed directly
+
+### Adding Home Page Content Cards
+Create markdown file in `src/content/home/cards/`:
+```yaml
+---
+type: "card"
+title: "Card Title"
+image: "/home/cards/image.jpg"
+imagePosition: "left"  # or "right"
+link: "/photos/album-path"
+order: 1
+---
+
+Card body text in markdown.
+```
+
+### Modifying Thumbnail Quality/Size
+Edit `src/pages/api/thumbnail.ts`:
+- Change `THUMBNAIL_SIZES` object for dimensions
+- Modify Sharp `.jpeg({ quality: 85 })` for compression
+
+### Event Handling Hierarchy
+PhotoGrid uses event **capture phase** (`addEventListener(..., true)`) to intercept keyboard events before PhotoSwipe's bubble-phase handlers.
+
+### Async Content Rendering
+When rendering Content Collections in Astro components, pre-render with `Promise.all`:
+```typescript
+const renderedCards = await Promise.all(
+  cards.map(async (card) => ({
+    ...card,
+    RenderedContent: (await card.render()).Content
+  }))
+);
+```
+
+## Troubleshooting
+
+**Thumbnails not updating:** Delete `.meta/thumbnails` directory
+
+**Password not working:** Check `album-access` cookie in browser DevTools (Application > Cookies); clear it to reset. Rate limiting may block after 10 failed attempts (15 min cooldown).
+
+**Navigation jumping:** Position-based nav uses 80px tolerance for row detection; adjust in `getNextIndex()` if needed
+
+**EXIF not showing:** Some photos lack EXIF data; check console for errors from exifr library
+
+**EXIF not visible in fullscreen:** Overlay should be inside PhotoSwipe container (handled automatically)
+
+**Sort not persisting:** Check localStorage for `photoGallery_sortOption` key
+
+**/home page not rendering:** Ensure `export const prerender = true` is set in frontmatter
+
+**Slider not auto-playing:** Check if user has `prefers-reduced-motion: reduce` enabled in OS settings
+
+**Focus styles not visible:** Ensure `:focus-visible` is not overridden; check for `outline: none` on elements
+
+**Fonts not loading:** Check network tab for Google Fonts; ensure preconnect hints are in Layout.astro `<head>`
+
+**Broken thumbnails / "album not found":** Astro's glob loader normalizes folder names, removing dots after numbers. Folders like `16.album-name` become album ID `16album-name`, causing file system lookups to fail. **Fix:** Use dashes instead of dots after number prefixes: `16-album-name`
+
+**Rate limited on password entry:** Wait 15 minutes or restart the server (rate limit is in-memory). Check `src/lib/rate-limit.ts` to adjust limits.
+
+**Protected album showing content unexpectedly:** Clear `album-access` cookie. Verify `prerender = false` in `[...path].astro`. Check that access verification runs before content fetch in frontmatter.
+
+**Download album failing on protected content:** Ensure `X-Album-Token` header is sent with the request. Check browser DevTools Network tab for 401 errors.
