@@ -1,66 +1,158 @@
 ---
-export const prerender = true;
+// SECURITY: Server-side rendering for protected albums
+// Photos are only fetched and rendered AFTER access is verified
+export const prerender = false;
 
-import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, buildBreadcrumbs, getAncestors, checkAccess, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown } from '../../lib/albums';
+import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, buildBreadcrumbs, getAncestors, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown } from '../../lib/albums';
 import Layout from '../../layouts/Layout.astro';
 import AlbumGrid from '../../components/AlbumGrid.astro';
 import PhotoGrid from '../../components/PhotoGrid.astro';
 import Breadcrumbs from '../../components/Breadcrumbs.astro';
-import PasswordProtection from '../../components/PasswordProtection.astro';
 import Footer from '../../components/Footer.astro';
-
-export async function getStaticPaths() {
-  const { getCollection } = await import('astro:content');
-  const albums = await getCollection('albums');
-
-  return albums.map(album => ({
-    params: { path: album.id.replace('/index.md', '') },
-    props: { album }
-  }));
-}
+// Note: PasswordProtection component no longer used - SSR form is inline
 
 const { path } = Astro.params;
-const { album } = Astro.props;
+const { cookies } = Astro;
 
-// Get token from query parameter
+// Get album - redirect to 404 if not found
+const album = await getAlbumByPath(path!);
+if (!album) {
+  return Astro.redirect('/404');
+}
+
+// Get token from query parameter (for share links)
 const url = new URL(Astro.request.url);
 const providedToken = url.searchParams.get('token');
+const errorParam = url.searchParams.get('error');
+const remainingAttempts = url.searchParams.get('remaining');
 
 // Get ancestors for password inheritance checking
 const ancestors = await getAncestors(path!);
 
-// Note: In SSG mode, we can't access sessionStorage here
-// Access control will be enforced client-side in the script below
-const subAlbums = await getSubAlbums(path!);
-const allMedia = await getPhotosForAlbum(path!);
-const breadcrumbs = buildBreadcrumbs(path!);
+// Check if album or any ancestor has password
+const albumHasPassword = !!album.data.password;
+const hasPasswordProtection = albumHasPassword || ancestors.some(a => !!a.data.password);
 
-// Get body content from body.md and render description as markdown
+// SECURITY: Server-side access verification
+let hasAccess = false;
+let blockingAlbum: { path: string; title: string } | null = null;
+
+if (!hasPasswordProtection) {
+  // No password protection - grant access
+  hasAccess = true;
+} else {
+  // Get unlocked tokens from cookie
+  const accessCookie = cookies.get('album-access')?.value;
+  let unlockedTokens: string[] = [];
+  try {
+    unlockedTokens = accessCookie ? JSON.parse(accessCookie) : [];
+  } catch {
+    unlockedTokens = [];
+  }
+
+  // Check if URL token grants access (share links)
+  if (providedToken) {
+    // Check if token matches this album
+    if (providedToken === album.data.token && album.data.allowAnonymous !== false) {
+      hasAccess = true;
+      // Add to cookie for subsequent requests
+      if (!unlockedTokens.includes(album.data.token)) {
+        unlockedTokens.push(album.data.token);
+        cookies.set('album-access', JSON.stringify(unlockedTokens), {
+          httpOnly: true,
+          secure: import.meta.env.PROD,
+          sameSite: 'strict',
+          maxAge: 60 * 60 * 24,
+          path: '/'
+        });
+      }
+    }
+    // Check if token matches any ancestor
+    if (!hasAccess) {
+      for (const ancestor of ancestors) {
+        if (providedToken === ancestor.data.token) {
+          hasAccess = true;
+          if (!unlockedTokens.includes(ancestor.data.token)) {
+            unlockedTokens.push(ancestor.data.token);
+            cookies.set('album-access', JSON.stringify(unlockedTokens), {
+              httpOnly: true,
+              secure: import.meta.env.PROD,
+              sameSite: 'strict',
+              maxAge: 60 * 60 * 24,
+              path: '/'
+            });
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Check cookie-based access
+  if (!hasAccess) {
+    // Check if this album's token is unlocked
+    if (unlockedTokens.includes(album.data.token)) {
+      hasAccess = true;
+    } else {
+      // Check ancestors - if any unlocked ancestor exists above a password-protected one, grant access
+      let foundUnlockedAncestor = false;
+      for (const ancestor of ancestors) {
+        if (unlockedTokens.includes(ancestor.data.token)) {
+          foundUnlockedAncestor = true;
+          break;
+        }
+        if (ancestor.data.password) {
+          // Found a password-protected ancestor that's not unlocked
+          blockingAlbum = {
+            path: ancestor.id.replace('/index.md', ''),
+            title: ancestor.data.title
+          };
+          break;
+        }
+      }
+
+      if (foundUnlockedAncestor) {
+        hasAccess = true;
+      } else if (!blockingAlbum && albumHasPassword) {
+        // This album itself is blocking
+        blockingAlbum = { path: path!, title: album.data.title };
+      } else if (!blockingAlbum) {
+        // No blocking ancestor found and album doesn't have password
+        hasAccess = true;
+      }
+    }
+  }
+}
+
+// SECURITY: Only fetch content if access is granted
+let subAlbums: Awaited<ReturnType<typeof getSubAlbums>> = [];
+let allMedia: Awaited<ReturnType<typeof getPhotosForAlbum>> = [];
+let subAlbumsWithCovers: { album: typeof subAlbums[0]; coverPhotoUrl: string | null }[] = [];
+
+if (hasAccess) {
+  subAlbums = await getSubAlbums(path!);
+  allMedia = await getPhotosForAlbum(path!);
+
+  // Fetch cover photos for sub-albums
+  subAlbumsWithCovers = await Promise.all(
+    subAlbums.map(async (subAlbum) => {
+      const subAlbumPath = subAlbum.id.replace('/index.md', '');
+      const coverPhotoUrl = await getAlbumCoverPhoto(subAlbumPath, subAlbum.data.thumbnail);
+      return { album: subAlbum, coverPhotoUrl };
+    })
+  );
+}
+
+const breadcrumbs = buildBreadcrumbs(path!);
 const bodyHtml = await getAlbumBody(path!);
 const descriptionHtml = parseInlineMarkdown(album.data.description || '');
 
-// Separate photos and videos for counts
-const photos = allMedia; // Keep all media for display
+// Counts (only meaningful if hasAccess)
+const photos = allMedia;
 const photoCount = allMedia.filter(m => !m.isVideo).length;
 const videoCount = allMedia.filter(m => m.isVideo).length;
 const hasVideos = videoCount > 0;
-
 const isCollection = album.data.isCollection || subAlbums.length > 0;
-
-// Check if album or any ancestor has password
-const hasPassword = !!album.data.password || ancestors.some(a => !!a.data.password);
-
-// Fetch cover photos for sub-albums
-const subAlbumsWithCovers = await Promise.all(
-  subAlbums.map(async (subAlbum) => {
-    const subAlbumPath = subAlbum.id.replace('/index.md', '');
-    const coverPhotoUrl = await getAlbumCoverPhoto(subAlbumPath, subAlbum.data.thumbnail);
-    return {
-      album: subAlbum,
-      coverPhotoUrl
-    };
-  })
-);
 ---
 
 <Layout title={album.data.title}>
@@ -94,22 +186,57 @@ const subAlbumsWithCovers = await Promise.all(
     </div>
 
     <div class="album-content" id="album-content"
-         data-has-password={hasPassword}
          data-album-path={path}
          data-album-token={album.data.token}
-         data-provided-token={providedToken}
-         data-allow-anonymous={album.data.allowAnonymous !== false}
-         data-album-has-password={!!album.data.password}
-         data-ancestors={JSON.stringify(ancestors.map(a => ({
-           path: a.id.replace('/index.md', ''),
-           token: a.data.token,
-           hasPassword: !!a.data.password,
-           title: a.data.title
-         })))}>
-      {hasPassword && (
-        <PasswordProtection albumPath={path!} />
+         data-has-access={hasAccess}>
+
+      {/* SECURITY: Show password form only when access is denied */}
+      {!hasAccess && hasPasswordProtection && (
+        <div class="password-protection">
+          <div class="password-form">
+            <div class="lock-icon">🔒</div>
+            <h2>This album is password protected</h2>
+            <p>Please enter the password to view the photos</p>
+
+            {/* Show which album is blocking access */}
+            {blockingAlbum && blockingAlbum.path !== path && (
+              <p class="blocking-info">
+                Access blocked by: <strong>{blockingAlbum.title}</strong>
+              </p>
+            )}
+
+            {/* Error messages from URL params */}
+            {errorParam === 'wrong-password' && (
+              <p class="error-message">
+                Incorrect password.
+                {remainingAttempts && parseInt(remainingAttempts) > 0 && (
+                  <span>{remainingAttempts} attempts remaining.</span>
+                )}
+              </p>
+            )}
+            {errorParam === 'rate-limited' && (
+              <p class="error-message">Too many attempts. Please try again in 15 minutes.</p>
+            )}
+
+            <form method="POST" action="/api/unlock">
+              <input type="hidden" name="albumPath" value={blockingAlbum?.path || path} />
+              <input type="hidden" name="returnUrl" value={`/photos/${path}`} />
+              <input
+                type="password"
+                name="password"
+                placeholder="Enter password"
+                autocomplete="off"
+                required
+              />
+              <button type="submit">Unlock Album</button>
+            </form>
+          </div>
+        </div>
       )}
-      <div class="protected-content" style={hasPassword ? 'display: none;' : ''}>
+
+      {/* SECURITY: Protected content only rendered when access is granted */}
+      {hasAccess && (
+        <div class="protected-content">
         {isCollection && subAlbums.length > 0 && (
           <div class="section">
             <h2>Albums</h2>
@@ -166,7 +293,8 @@ const subAlbumsWithCovers = await Promise.all(
         {subAlbums.length === 0 && photos.length === 0 && (
           <p class="empty">This album is empty. Add photos to the folder: src/content/albums/{path}</p>
         )}
-      </div>
+        </div>
+      )}
     </div>
 
     <Footer />
@@ -536,6 +664,102 @@ const subAlbumsWithCovers = await Promise.all(
     border-radius: 8px;
   }
 
+  /* Password Protection Form (SSR) */
+  .password-protection {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 400px;
+    padding: 2rem;
+  }
+
+  .password-form {
+    background: white;
+    border: 1px solid var(--color-border, #e5e5e5);
+    border-radius: 12px;
+    padding: 3rem;
+    max-width: 400px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  }
+
+  .lock-icon {
+    font-size: 4rem;
+    margin-bottom: 1rem;
+  }
+
+  .password-form h2 {
+    font-size: 1.5rem;
+    margin-bottom: 0.5rem;
+    color: #333;
+  }
+
+  .password-form p {
+    color: #666;
+    margin-bottom: 1rem;
+  }
+
+  .password-form .blocking-info {
+    font-size: 0.9rem;
+    color: #856404;
+    background: #fff3cd;
+    padding: 0.75rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+  }
+
+  .password-form .error-message {
+    color: #d32f2f;
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
+    background: #ffebee;
+    padding: 0.75rem;
+    border-radius: 6px;
+  }
+
+  .password-form form {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .password-form input[type="password"] {
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--color-border, #e5e5e5);
+    border-radius: 6px;
+    font-size: 1rem;
+    font-family: inherit;
+  }
+
+  .password-form input[type="password"]:focus {
+    outline: none;
+    border-color: var(--color-primary, #2563eb);
+  }
+
+  .password-form button[type="submit"] {
+    padding: 0.75rem 1.5rem;
+    background: var(--color-primary, #2563eb);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+
+  .password-form button[type="submit"]:hover {
+    background: var(--color-hover, #1d4ed8);
+  }
+
+  @media (max-width: 768px) {
+    .password-form {
+      padding: 2rem;
+    }
+  }
+
   @media (max-width: 768px) {
     h1 {
       font-size: 1.75rem;
@@ -601,109 +825,16 @@ const subAlbumsWithCovers = await Promise.all(
 </style>
 
 <script>
+  // SECURITY: Access control is now handled server-side (SSR)
+  // This script only handles UI features: sorting, display style, media filter, download
   document.addEventListener('DOMContentLoaded', () => {
-    console.log('[AlbumPage] DOM loaded');
-
     const albumContent = document.getElementById('album-content');
-    const hasPassword = albumContent?.dataset.hasPassword === 'true';
     const albumPath = albumContent?.dataset.albumPath;
     const albumToken = albumContent?.dataset.albumToken;
-    // Read token from URL (since page is prerendered, data attribute won't have it)
-    const urlParams = new URLSearchParams(window.location.search);
-    const providedToken = urlParams.get('token');
-    const allowAnonymous = albumContent?.dataset.allowAnonymous === 'true';
-    const albumHasPassword = albumContent?.dataset.albumHasPassword === 'true';
-    const ancestors = JSON.parse(albumContent?.dataset.ancestors || '[]');
+    const hasAccess = albumContent?.dataset.hasAccess === 'true';
 
-    console.log('[AlbumPage] Album:', albumPath, 'HasPassword:', hasPassword, 'AlbumHasPassword:', albumHasPassword, 'Token:', albumToken, 'ProvidedToken:', providedToken, 'AllowAnonymous:', allowAnonymous);
-
-    // Get unlocked tokens from session storage
-    const unlockedTokensJson = sessionStorage.getItem('unlocked-albums');
-    const unlockedTokens = unlockedTokensJson ? JSON.parse(unlockedTokensJson) : [];
-
-    console.log('[AlbumPage] Unlocked tokens:', unlockedTokens);
-
-    // Check if token-based access granted (either this album's token or any ancestor's token)
-    if (providedToken) {
-      // Check if token matches this album
-      if (providedToken === albumToken && allowAnonymous) {
-        console.log('[AlbumPage] Valid token provided for this album - granting access');
-        if (!unlockedTokens.includes(albumToken)) {
-          unlockedTokens.push(albumToken);
-          sessionStorage.setItem('unlocked-albums', JSON.stringify(unlockedTokens));
-        }
-        showProtectedContent();
-        return;
-      }
-
-      // Check if token matches any ancestor (parent token grants access to children)
-      for (const ancestor of ancestors) {
-        if (providedToken === ancestor.token) {
-          console.log('[AlbumPage] Valid ancestor token provided:', ancestor.title, '- granting access');
-          if (!unlockedTokens.includes(ancestor.token)) {
-            unlockedTokens.push(ancestor.token);
-            sessionStorage.setItem('unlocked-albums', JSON.stringify(unlockedTokens));
-          }
-          showProtectedContent();
-          return;
-        }
-      }
-    }
-
-    if (hasPassword && albumPath) {
-      // Check if current album token is unlocked
-      if (unlockedTokens.includes(albumToken)) {
-        console.log('[AlbumPage] Album token already unlocked');
-        showProtectedContent();
-        return;
-      }
-
-      // Check access: first this album, then ancestors
-      let hasBlockingAncestor = false;
-
-      // First: check if THIS album has a password that's not unlocked
-      if (albumHasPassword && !unlockedTokens.includes(albumToken)) {
-        hasBlockingAncestor = true;
-        console.log('[AlbumPage] Album has password, not unlocked');
-      } else {
-        // Then: check ancestors - stop at first unlocked one
-        for (const ancestor of ancestors) {
-          if (unlockedTokens.includes(ancestor.token)) {
-            console.log('[AlbumPage] Ancestor unlocked:', ancestor.title);
-            break;
-          }
-          if (ancestor.hasPassword) {
-            hasBlockingAncestor = true;
-            console.log('[AlbumPage] Blocked by ancestor:', ancestor.title);
-            break;
-          }
-        }
-      }
-
-      if (!hasBlockingAncestor) {
-        console.log('[AlbumPage] Access granted, showing content');
-        showProtectedContent();
-        return;
-      }
-    } else {
-      // No password protection
-      showProtectedContent();
-    }
-
-    function showProtectedContent() {
-      const passwordProtection = document.querySelector('.password-protection');
-      const protectedContent = document.querySelector('.protected-content');
-
-      if (passwordProtection) {
-        passwordProtection.remove();
-      }
-      if (protectedContent) {
-        protectedContent.style.display = 'block';
-      }
-
-      // Initialize sorting after content is visible
-      initializeSorting();
-    }
+    // Only initialize UI controls if we have access (content is rendered)
+    if (!hasAccess) return;
 
     // Initialize sorting and display style functionality
     function initializeSorting() {
@@ -934,15 +1065,13 @@ const subAlbumsWithCovers = await Promise.all(
       console.log('[MediaFilter] Media filter initialized');
     }
 
-    // If no password protection, initialize sorting immediately
-    if (!hasPassword) {
-      initializeSorting();
-    }
+    // Initialize UI controls (access already verified server-side)
+    initializeSorting();
 
+    // Download album button
     const downloadBtn = document.querySelector('.download-all');
-
     downloadBtn?.addEventListener('click', async (e) => {
-      const albumPath = (e.target as HTMLElement).dataset.albumPath;
+      const downloadPath = (e.target as HTMLElement).dataset.albumPath;
       const btn = e.target as HTMLButtonElement;
       const originalText = btn.textContent;
 
@@ -959,7 +1088,7 @@ const subAlbumsWithCovers = await Promise.all(
         const response = await fetch('/api/download-album', {
           method: 'POST',
           headers,
-          body: JSON.stringify({ albumPath })
+          body: JSON.stringify({ albumPath: downloadPath })
         });
 
         if (!response.ok) {
@@ -970,7 +1099,7 @@ const subAlbumsWithCovers = await Promise.all(
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `${albumPath?.split('/').pop() || 'album'}.zip`;
+        a.download = `${downloadPath?.split('/').pop() || 'album'}.zip`;
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
