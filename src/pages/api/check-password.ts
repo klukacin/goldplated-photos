@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { timingSafeEqual } from 'crypto';
 import { getAlbumByPath } from '../../lib/albums';
+import { isRateLimited, recordFailedAttempt, clearRateLimit, getRemainingAttempts } from '../../lib/rate-limit';
 
 // SECURITY: Timing-safe string comparison to prevent timing attacks
 function safeCompare(a: string, b: string): boolean {
@@ -12,8 +13,21 @@ function safeCompare(a: string, b: string): boolean {
 
 export const prerender = false;
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, clientAddress }) => {
   try {
+    // SECURITY: Rate limiting to prevent brute force attacks
+    const ip = clientAddress || request.headers.get('x-forwarded-for') || 'unknown';
+    if (isRateLimited(ip)) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Too many attempts. Please try again in 15 minutes.',
+        rateLimited: true
+      }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const { albumPath, password } = await request.json();
 
     if (!albumPath || !password) {
@@ -44,10 +58,25 @@ export const POST: APIRoute = async ({ request }) => {
 
     const isCorrect = safeCompare(password, correctPassword);
 
-    return new Response(JSON.stringify({ success: isCorrect }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    if (isCorrect) {
+      // Clear rate limit on successful login
+      clearRateLimit(ip);
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } else {
+      // Record failed attempt
+      recordFailedAttempt(ip);
+      const remaining = getRemainingAttempts(ip);
+      return new Response(JSON.stringify({
+        success: false,
+        remainingAttempts: remaining
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   } catch (error) {
     console.error('Error checking password:', error);
     return new Response(JSON.stringify({ success: false, error: 'Server error' }), {
