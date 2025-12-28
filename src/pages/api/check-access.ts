@@ -1,6 +1,7 @@
 import type { APIRoute } from 'astro';
 import { timingSafeEqual } from 'crypto';
 import { getAlbumByPath, getAncestors, getAllDescendants } from '../../lib/albums';
+import { isRateLimited, recordFailedAttempt, clearRateLimit, getRemainingAttempts } from '../../lib/rate-limit';
 
 // SECURITY: Timing-safe string comparison to prevent timing attacks
 function safeCompare(a: string, b: string): boolean {
@@ -12,8 +13,11 @@ function safeCompare(a: string, b: string): boolean {
 
 export const prerender = false;
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, clientAddress }) => {
   try {
+    // Get IP for rate limiting
+    const ip = clientAddress || request.headers.get('x-forwarded-for') || 'unknown';
+
     const { albumPath, password, unlockedTokens, providedToken } = await request.json();
 
     if (!albumPath) {
@@ -50,6 +54,18 @@ export const POST: APIRoute = async ({ request }) => {
 
     // Handle password validation
     if (password) {
+      // SECURITY: Rate limiting to prevent brute force attacks
+      if (isRateLimited(ip)) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Too many attempts. Please try again in 15 minutes.',
+          rateLimited: true
+        }), {
+          status: 429,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
       const correctPassword = album.data.password;
 
       if (!correctPassword) {
@@ -65,6 +81,7 @@ export const POST: APIRoute = async ({ request }) => {
 
       if (safeCompare(password, correctPassword)) {
         // Password correct - unlock this album
+        clearRateLimit(ip); // Clear rate limit on success
         unlocked.add(album.data.token);
 
         // CASCADE: Unlock all descendants without passwords
@@ -84,9 +101,13 @@ export const POST: APIRoute = async ({ request }) => {
           headers: { 'Content-Type': 'application/json' }
         });
       } else {
+        // Record failed attempt
+        recordFailedAttempt(ip);
+        const remaining = getRemainingAttempts(ip);
         return new Response(JSON.stringify({
           success: false,
-          error: 'Incorrect password'
+          error: 'Incorrect password',
+          remainingAttempts: remaining
         }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' }
