@@ -4,7 +4,130 @@ Deploy your gallery to production.
 
 ---
 
-## Build for Production
+## Recommended Workflow
+
+Goldplated Photos is designed for a **local development → deploy to server** workflow:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  LOCAL DEVELOPMENT                                       │
+│                                                          │
+│  ┌─────────────┐         ┌─────────────┐                │
+│  │ Admin Panel │ ──────► │ Dev Server  │                │
+│  │ :4444       │  edits  │ :4321       │                │
+│  └─────────────┘         └─────────────┘                │
+│                                                          │
+│  • Edit albums, upload photos via Admin Panel            │
+│  • Preview changes in Dev Server                         │
+│  • All changes saved to src/content/albums/              │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          │ npm run deploy
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  PRODUCTION SERVER                                       │
+│                                                          │
+│  • Builds site locally (npm run build)                  │
+│  • Syncs content via rsync (--delete)                   │
+│  • Restarts Node.js app via PM2                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+!!! info "Key Points"
+    - **Admin Panel is LOCAL ONLY** - Never deployed to production
+    - **Local content is source of truth** - rsync uses `--delete` flag
+    - **Single command deployment** - `npm run deploy` handles everything
+
+---
+
+## Quick Deploy
+
+If you have SSH access configured and PM2 on your server:
+
+```bash
+npm run deploy
+```
+
+This single command:
+
+1. Builds the production site locally
+2. Fixes paths for production server
+3. Syncs all files to remote via rsync
+4. Sets up symlinks on server
+5. Installs production dependencies
+6. Restarts PM2
+
+---
+
+## Deploy Script Details
+
+The `npm run deploy` command runs `scripts/deploy.sh` which performs:
+
+### Step 1: Build
+
+```bash
+npm run build
+```
+
+Creates `dist/` folder with optimized site.
+
+### Step 2: Fix Paths
+
+Runs `fix-server-paths.mjs` to update paths for production.
+
+### Step 3: Sync Files
+
+Uses rsync to transfer:
+
+- `dist/client/` - Static assets
+- `dist/server/` - Server code
+- `src/content/albums/` - All albums (**with --delete**)
+- `public/` - Hero images, card images, etc.
+- `package.json` - Dependencies
+- `ecosystem.config.cjs` - PM2 configuration
+
+### Step 4: Configure Remote
+
+Creates symlinks on server for Apache to serve images directly.
+
+### Step 5: Install Dependencies
+
+```bash
+npm install --production
+```
+
+### Step 6: Restart PM2
+
+```bash
+pm2 restart ecosystem.config.cjs
+```
+
+---
+
+## Deploy Configuration
+
+Edit `scripts/deploy.sh` to configure your server:
+
+```bash
+REMOTE_USER="your-username"
+REMOTE_HOST="your-server.com"
+REMOTE_ROOT="/path/to/public_html"
+```
+
+### Prerequisites
+
+- SSH key access to server (no password prompt)
+- PM2 installed on server
+- Node.js 18+ on server
+- `ecosystem.config.cjs` file in project root
+
+---
+
+## Manual Deployment
+
+If you prefer manual deployment or don't have rsync:
+
+### Build for Production
 
 ```bash
 npm run build
@@ -298,5 +421,6 @@ mogrify -strip -quality 85 -resize "6000x6000>" *.jpg
 
 ## Related
 
+- [Admin Panel](admin-panel.md) - Local content management
 - [Configuration](../getting-started/configuration.md) - All options
 - [Architecture](../reference/architecture.md) - Technical details

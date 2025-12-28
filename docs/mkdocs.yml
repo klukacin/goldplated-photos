@@ -45,6 +45,7 @@ nav:
     - Thumbnails: features/thumbnails.md
   - Guides:
     - Adding Albums: guides/adding-albums.md
+    - Admin Panel: guides/admin-panel.md
     - Customization: guides/customization.md
     - Deployment: guides/deployment.md
     - Assets Setup: guides/assets-setup.md

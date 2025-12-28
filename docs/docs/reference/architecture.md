@@ -378,7 +378,79 @@ src/
 
 ---
 
+## Admin Panel
+
+A separate Express.js server for local content management.
+
+### Overview
+
+| Component | Description |
+|-----------|-------------|
+| **Server** | Express.js on port 4444 |
+| **Frontend** | Vanilla JS + CodeMirror |
+| **Storage** | File-based (no database) |
+| **Deployment** | Local only (never deployed) |
+
+### Architecture
+
+```
+admin/
+├── server.js           # Express server
+├── index.html          # Single-page admin UI
+├── admin.css           # Styles
+└── js/
+    ├── app.js          # Main controller
+    ├── albums.js       # Album management
+    ├── photos.js       # Photo upload/delete
+    ├── home.js         # Home page content
+    └── utils.js        # API client, utilities
+```
+
+### Admin API Endpoints
+
+The admin server provides its own API:
+
+**Albums:**
+- `GET/POST /api/albums` - List/create albums
+- `GET/PUT/DELETE /api/albums/*path` - Album CRUD
+
+**Content:**
+- `GET/POST /api/photos/*path` - Photos
+- `GET/POST /api/videos/*path` - Videos
+- `GET/PUT /api/home/intro` - Intro text
+- `GET/POST/PUT/DELETE /api/home/cards` - Content cards
+
+**Assets:**
+- `GET/POST/DELETE /api/assets/hero` - Hero images
+- `GET/POST/DELETE /api/assets/cards` - Card images
+- `POST /api/assets/landing` - Landing background
+
+**Cache:**
+- `GET/DELETE /api/cache/stats` - Global cache
+- `GET/DELETE /api/cache/album/*path` - Per-album cache
+
+### Data Flow
+
+```
+Admin Panel (browser)
+       ↓
+Admin API (Express :4444)
+       ↓
+File System
+├── src/content/albums/    # Album metadata & photos
+├── src/content/home/      # Home page content
+└── public/                # Static assets
+       ↓
+Dev Server (Astro :4321)   # Auto-reloads on changes
+```
+
+!!! note "Local Only"
+    The admin panel is never deployed. All changes are synced to production via `npm run deploy`.
+
+---
+
 ## Related
 
+- [Admin Panel Guide](../guides/admin-panel.md) - User guide
 - [API Endpoints](api-endpoints.md) - Full API reference
 - [Configuration](../getting-started/configuration.md) - Config options

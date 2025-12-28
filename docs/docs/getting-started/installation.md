@@ -57,13 +57,43 @@ goldplated-photos/
 
 ---
 
-## Development Commands
+## All npm Commands
 
 | Command | Description |
 |---------|-------------|
-| `npm run dev` | Start development server (port 4321) |
+| `npm run dev` | Start Astro dev server (foreground, port 4321) |
+| `npm run dev:bg` | Start dev server in background |
+| `npm run stop:dev` | Stop background dev server |
 | `npm run build` | Build production site to `./dist/` |
 | `npm run preview` | Preview production build locally |
+| `npm run deploy` | Full deployment to production server |
+| `npm run update` | Normalize album structure (auto-create index.md) |
+| `npm run admin` | Start admin panel (foreground, port 4444) |
+| `npm run admin:bg` | Start admin panel in background |
+| `npm run stop:admin` | Stop background admin panel |
+
+---
+
+## Development Setup
+
+The recommended setup runs both the dev server and admin panel:
+
+```bash
+# Start both servers in background
+npm run dev:bg
+npm run admin:bg
+
+# Open in browser
+# Admin Panel: http://localhost:4444
+# Gallery Preview: http://localhost:4321
+
+# Stop when done
+npm run stop:dev
+npm run stop:admin
+```
+
+!!! tip "Admin Panel"
+    The [Admin Panel](../guides/admin-panel.md) provides a web-based interface for managing albums, photos, and home page content. It's optional but makes content management much easier.
 
 ---
 
