@@ -160,8 +160,6 @@ export const POST: APIRoute = async ({ request }) => {
       frameRate: videoInfo.frameRate,
     };
 
-    console.log('[VideoInfo] Extracted for:', videoPath, formattedInfo);
-
     return new Response(JSON.stringify({ info: formattedInfo }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' }

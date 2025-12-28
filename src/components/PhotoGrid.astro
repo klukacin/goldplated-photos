@@ -1,0 +1,2000 @@
+---
+import type { Photo } from '../lib/albums';
+
+interface Props {
+  photos: Photo[];
+  style: 'grid' | 'masonry' | 'slideshow' | 'single-column';
+  albumPath: string;
+}
+
+const { photos, style, albumPath } = Astro.props;
+
+// Cache version - increment to bust browser cache after thumbnail changes
+const THUMBNAIL_VERSION = 2;
+
+// Helper function to generate thumbnail URL
+function getThumbnailUrl(photoUrl: string, size: 'small' | 'medium' | 'large' = 'small'): string {
+  // Extract path from URL (e.g., /albums/2025/Birthdays/Marias-Birthday/photo.jpg -> 2025/Birthdays/Marias-Birthday/photo.jpg)
+  const path = photoUrl.replace('/albums/', '');
+  return `/api/thumbnail?path=${encodeURIComponent(path)}&size=${size}&v=${THUMBNAIL_VERSION}`;
+}
+
+// Helper function to get the best thumbnail size for lightbox based on viewport
+function getLightboxSize(photoUrl: string): string {
+  const path = photoUrl.replace('/albums/', '');
+  // For lightbox, use 'large' by default (1920px) which should fit most screens
+  return `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=${THUMBNAIL_VERSION}`;
+}
+
+// Helper function to get video MIME type from filename
+function getVideoMimeType(filename: string): string {
+  const ext = filename.split('.').pop()?.toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    'mp4': 'video/mp4',
+    'm4v': 'video/mp4',
+    'mov': 'video/quicktime',
+    'webm': 'video/webm',
+    'avi': 'video/x-msvideo',
+    'mkv': 'video/x-matroska',
+  };
+  return mimeTypes[ext || ''] || 'video/mp4';
+}
+---
+
+<div class={`photo-grid photo-grid-${style}`} id="photo-gallery">
+  {photos.map((photo, index) => (
+    <div class={`photo-item ${photo.isVideo ? 'is-video' : ''}`}
+         data-index={index}
+         data-photo-url={photo.url}
+         data-photo-filename={photo.filename}
+         data-photo-size={photo.size || 0}
+         data-photo-mtime={photo.mtime ? photo.mtime.getTime() : 0}
+         data-photo-exif-date={photo.exifDate ? photo.exifDate.getTime() : 0}
+         data-is-video={photo.isVideo ? 'true' : 'false'}>
+      {photo.isVideo ? (
+        <!-- Video: Inline player -->
+        <div class="video-container">
+          <video
+            controls
+            playsinline
+            preload="none"
+            class="video-player"
+            data-video-url={photo.url}
+            data-video-filename={photo.filename}
+          >
+            <source src={photo.url} type={getVideoMimeType(photo.filename)} />
+            Your browser does not support the video tag.
+          </video>
+          <div class="video-error" style="display: none;">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <p class="video-error-filename">{photo.filename}</p>
+            <p>Cannot play this video format</p>
+            <a href={photo.url} download={photo.filename} class="video-error-download">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              Download
+            </a>
+          </div>
+        </div>
+      ) : (
+        <!-- Photo: Thumbnail with lightbox link -->
+        <a
+          href={getLightboxSize(photo.url)}
+          class="photo-link"
+          data-pswp-width={photo.width || 1920}
+          data-pswp-height={photo.height || 1280}
+          data-photo-url={photo.url}
+          data-photo-filename={photo.filename}
+        >
+          <div class="photo-thumb" style={`--aspect-ratio: ${photo.width || 3} / ${photo.height || 2}`}>
+            <img
+              src={getThumbnailUrl(photo.url, 'large')}
+              alt={photo.filename}
+              loading="lazy"
+              class="photo-img"
+            />
+          </div>
+        </a>
+      )}
+      <div class="photo-icons">
+        <button class="icon-btn icon-info" data-photo-url={photo.url} data-is-video={photo.isVideo ? 'true' : 'false'} title={photo.isVideo ? "Video info" : "Photo info"} aria-label={photo.isVideo ? "Video info" : "Photo info"}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="16" x2="12" y2="12"></line>
+            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+          </svg>
+        </button>
+        <a class="icon-btn icon-download" href={photo.url} download={photo.filename} title={photo.isVideo ? "Download video" : "Download photo"} aria-label={photo.isVideo ? "Download video" : "Download photo"}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+        </a>
+      </div>
+    </div>
+  ))}
+</div>
+
+<div id="context-menu" class="context-menu">
+  <button class="context-menu-item" data-action="info">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="12" cy="12" r="10"></circle>
+      <line x1="12" y1="16" x2="12" y2="12"></line>
+      <line x1="12" y1="8" x2="12.01" y2="8"></line>
+    </svg>
+    Photo Info
+  </button>
+  <button class="context-menu-item" data-action="download">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+      <polyline points="7 10 12 15 17 10"></polyline>
+      <line x1="12" y1="15" x2="12" y2="3"></line>
+    </svg>
+    Download
+  </button>
+</div>
+
+<div id="exif-overlay" class="exif-overlay">
+  <div class="exif-overlay-content">
+    <div class="exif-overlay-header">
+      <h3>Photo Information</h3>
+      <button class="exif-overlay-close">&times;</button>
+    </div>
+    <div class="exif-overlay-body" id="exif-overlay-data">
+      Loading...
+    </div>
+  </div>
+</div>
+
+<!-- Back to Top Button -->
+<button class="back-to-top" aria-label="Back to top" type="button">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="18 15 12 9 6 15"></polyline>
+  </svg>
+</button>
+
+<style>
+  .photo-grid {
+    display: grid;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .photo-grid-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  }
+
+  .photo-grid-masonry {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.75rem;
+    grid-auto-flow: row;
+  }
+
+  .photo-grid-masonry .photo-item {
+    height: auto;
+  }
+
+  .photo-grid-slideshow {
+    grid-template-columns: 1fr;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .photo-grid-single-column {
+    grid-template-columns: 1fr;
+    max-width: 1200px;
+    margin: 0 auto;
+    gap: 2rem;
+  }
+
+  .photo-grid-single-column .photo-thumb {
+    padding-top: 0; /* Remove fixed aspect ratio */
+    aspect-ratio: var(--aspect-ratio, 3/2); /* Use dynamic aspect ratio from inline style */
+  }
+
+  .photo-grid-single-column .photo-img {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* Show full image without cropping */
+  }
+
+  .photo-item {
+    position: relative;
+    background: #f5f5f5;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    transition: transform 0.2s, box-shadow 0.2s;
+    break-inside: avoid;
+    margin-bottom: 0.75rem;
+  }
+
+  .photo-grid-masonry .photo-item {
+    display: inline-block;
+    width: 100%;
+  }
+
+  .photo-item:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  }
+
+  .photo-link {
+    display: block;
+    position: relative;
+    cursor: pointer;
+    text-decoration: none;
+  }
+
+  .photo-thumb {
+    position: relative;
+    width: 100%;
+    padding-top: 66.67%; /* 3:2 aspect ratio */
+    overflow: hidden;
+    background: #e5e5e5;
+  }
+
+  .photo-grid-grid .photo-thumb {
+    padding-top: 100%; /* Square for grid */
+  }
+
+  .photo-grid-masonry .photo-thumb {
+    padding-top: 0;
+    height: auto;
+  }
+
+  .photo-img {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.3s;
+  }
+
+  .photo-grid-masonry .photo-img {
+    position: relative;
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+
+  .photo-link:hover .photo-img {
+    transform: scale(1.05);
+  }
+
+  /* Video Container & Inline Player */
+  .video-container {
+    position: relative;
+    width: 100%;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    min-height: 200px; /* Ensure error overlay visible when video hidden */
+  }
+
+  .video-player {
+    width: 100%;
+    display: block;
+    background: #000;
+    min-height: 200px;
+  }
+
+  .photo-item.is-video {
+    position: relative;
+    background: #000;
+  }
+
+  .photo-item.is-video:hover {
+    transform: none; /* Disable hover transform for videos */
+  }
+
+  /* Video Error Overlay (inline) */
+  .video-error {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    color: white;
+    text-align: center;
+    padding: 1.5rem;
+    gap: 0.75rem;
+  }
+
+  .video-error svg {
+    color: rgba(255, 255, 255, 0.6);
+  }
+
+  .video-error p {
+    margin: 0;
+    font-size: 0.9rem;
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  .video-error-filename {
+    font-weight: 600;
+    font-size: 1rem;
+    color: white;
+    word-break: break-all;
+    max-width: 100%;
+  }
+
+  .video-error-download {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    background: rgba(255, 255, 255, 0.15);
+    color: white;
+    text-decoration: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    transition: background 0.2s;
+  }
+
+  .video-error-download:hover {
+    background: rgba(255, 255, 255, 0.25);
+  }
+
+  /* Photo Icons (Desktop) */
+  .photo-icons {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    display: flex;
+    gap: 0.5rem;
+    opacity: 0;
+    transition: opacity 0.3s;
+    z-index: 10;
+  }
+
+  .photo-item:hover .photo-icons {
+    opacity: 1;
+  }
+
+  .icon-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.95);
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    color: #333;
+    text-decoration: none;
+    backdrop-filter: blur(10px);
+  }
+
+  .icon-btn:hover {
+    background: white;
+    transform: scale(1.1);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    color: var(--color-primary);
+  }
+
+  .icon-btn svg {
+    display: block;
+  }
+
+  /* Hide icons on mobile, use long-press instead */
+  @media (max-width: 768px) {
+    .photo-icons {
+      display: none;
+    }
+  }
+
+  /* Context Menu (Mobile Long-Press) */
+  .context-menu {
+    position: fixed;
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    padding: 0.5rem;
+    z-index: 10001;
+    display: none;
+    min-width: 180px;
+  }
+
+  .context-menu.active {
+    display: block;
+    animation: contextMenuAppear 0.2s ease-out;
+  }
+
+  @keyframes contextMenuAppear {
+    from {
+      opacity: 0;
+      transform: scale(0.9);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .context-menu-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border: none;
+    background: white;
+    color: #333;
+    font-size: 1rem;
+    cursor: pointer;
+    border-radius: 8px;
+    transition: background 0.2s;
+    text-align: left;
+  }
+
+  .context-menu-item:hover {
+    background: #f5f5f5;
+  }
+
+  .context-menu-item:active {
+    background: #e5e5e5;
+  }
+
+  .context-menu-item svg {
+    color: #666;
+  }
+
+  /* EXIF Overlay Styles */
+  .exif-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.95);
+    z-index: 2147483647; /* Maximum z-index value - ensures it's always on top */
+    padding: 2rem;
+    overflow-y: auto;
+  }
+
+  .exif-overlay.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.2s;
+  }
+
+  .exif-overlay-content {
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 12px;
+    max-width: 600px;
+    width: 100%;
+    max-height: 80vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .exif-overlay-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1.5rem;
+    border-bottom: 1px solid #ddd;
+    background: white;
+  }
+
+  .exif-overlay-header h3 {
+    margin: 0;
+    font-size: 1.25rem;
+    color: #333;
+  }
+
+  .exif-overlay-close {
+    background: none;
+    border: none;
+    font-size: 2rem;
+    color: #666;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0;
+    width: 2rem;
+    height: 2rem;
+    transition: color 0.2s;
+  }
+
+  .exif-overlay-close:hover {
+    color: #333;
+  }
+
+  .exif-overlay-body {
+    padding: 1.5rem;
+    overflow-y: auto;
+    background: white;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+
+  @media (max-width: 768px) {
+    .photo-grid-grid {
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 0.5rem;
+    }
+
+    .photo-grid-masonry {
+      column-count: 2;
+      column-gap: 0.5rem;
+    }
+
+    .photo-item {
+      margin-bottom: 0.5rem;
+    }
+
+    .exif-overlay {
+      padding: 1rem;
+    }
+
+    .exif-overlay-content {
+      max-height: 90vh;
+    }
+  }
+
+  /* Custom Lightbox UI - must use :global() for dynamically created PhotoSwipe elements */
+  :global(.pswp-custom-ui) {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    z-index: 10;
+    pointer-events: none;
+    background: linear-gradient(to bottom, rgba(0,0,0,0.4) 0%, transparent 100%);
+  }
+
+  :global(.pswp-custom-ui > *) {
+    pointer-events: auto;
+  }
+
+  :global(.pswp-counter) {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: white;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    font-size: 0.9rem;
+    font-weight: 500;
+  }
+
+  :global(.pswp-counter-text) {
+    /* inherits from .pswp-counter */
+  }
+
+  :global(.pswp-separator) {
+    opacity: 0.6;
+  }
+
+  :global(.pswp-size) {
+    /* inherits from .pswp-counter - same style as numbers */
+    opacity: 0.9;
+  }
+
+  :global(.pswp-toolbar) {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  /* Toolbar buttons - plain text style */
+  :global(.pswp-btn) {
+    color: white;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 0.25rem;
+    opacity: 0.8;
+    transition: opacity 0.2s;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    user-select: none;
+  }
+
+  :global(.pswp-btn:hover) {
+    opacity: 1;
+  }
+
+  :global(.pswp-btn-original.active) {
+    color: #60a5fa;
+    opacity: 1;
+  }
+
+  /* Shortcuts Help Overlay */
+  :global(.pswp-shortcuts-overlay) {
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,0.9);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+
+  :global(.pswp-shortcuts-overlay.active) {
+    display: flex;
+  }
+
+  :global(.pswp-shortcuts-content) {
+    background: rgba(30,30,30,0.98);
+    border-radius: 12px;
+    padding: 2rem;
+    max-width: 340px;
+    color: white;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+
+  :global(.pswp-shortcuts-content h3) {
+    margin: 0 0 1.5rem;
+    font-size: 1.25rem;
+    text-align: center;
+    font-weight: 600;
+  }
+
+  :global(.pswp-shortcuts-content table) {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  :global(.pswp-shortcuts-content tr) {
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+  }
+
+  :global(.pswp-shortcuts-content tr:last-child) {
+    border-bottom: none;
+  }
+
+  :global(.pswp-shortcuts-content td) {
+    padding: 0.6rem 0;
+  }
+
+  :global(.pswp-shortcuts-content td:first-child) {
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+    background: rgba(255,255,255,0.1);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    text-align: center;
+    width: 50px;
+    font-size: 0.85rem;
+  }
+
+  :global(.pswp-shortcuts-content td:last-child) {
+    padding-left: 1rem;
+    color: rgba(255,255,255,0.8);
+    font-size: 0.9rem;
+  }
+
+  :global(.pswp-shortcuts-hint) {
+    margin: 1.5rem 0 0;
+    font-size: 0.75rem;
+    color: rgba(255,255,255,0.5);
+    text-align: center;
+  }
+
+  /* Zen mode - hide all UI completely, no hover reveal */
+  :global(.pswp--zen .pswp-custom-ui),
+  :global(.pswp--zen .pswp__button--arrow--prev),
+  :global(.pswp--zen .pswp__button--arrow--next),
+  :global(.pswp--zen .pswp__button--zoom) {
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
+
+  /* Hide default PhotoSwipe UI elements (we use custom) */
+  :global(.pswp__button--close),
+  :global(.pswp__button--zoom),
+  :global(.pswp__counter) {
+    display: none !important;
+  }
+
+  /* Back to Top Button */
+  .back-to-top {
+    position: fixed;
+    bottom: 2rem;
+    right: 2rem;
+    width: 44px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    border: none;
+    border-radius: 50%;
+    cursor: pointer;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(10px);
+    transition: opacity 0.3s ease, visibility 0.3s ease, transform 0.3s ease, background 0.2s ease;
+    z-index: 100;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+
+  .back-to-top.visible {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+  }
+
+  .back-to-top:hover {
+    background: rgba(0, 0, 0, 0.9);
+  }
+
+  .back-to-top:active {
+    transform: translateY(0) scale(0.95);
+  }
+
+  @media (max-width: 768px) {
+    .back-to-top {
+      bottom: 1.5rem;
+      right: 1.5rem;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .back-to-top {
+      transition: none;
+    }
+  }
+</style>
+
+<script>
+  import PhotoSwipeLightbox from 'photoswipe/lightbox';
+  import PhotoSwipe from 'photoswipe';
+  import 'photoswipe/style.css';
+
+  // Current photo URL for EXIF data
+  let currentPhotoUrl = '';
+
+  // EXIF cache
+  const exifCache = new Map();
+
+  // Thumbnail size cache
+  const thumbnailSizeCache = new Map<string, number>();
+
+  async function getThumbnailSize(thumbnailUrl: string): Promise<number> {
+    if (thumbnailSizeCache.has(thumbnailUrl)) {
+      return thumbnailSizeCache.get(thumbnailUrl)!;
+    }
+    try {
+      const response = await fetch(thumbnailUrl, { method: 'HEAD' });
+      const size = parseInt(response.headers.get('Content-Length') || '0');
+      thumbnailSizeCache.set(thumbnailUrl, size);
+      return size;
+    } catch {
+      return 0;
+    }
+  }
+
+  // Format file size: KB when < 1MB, otherwise MB
+  function formatFileSize(bytes: number): string {
+    if (bytes < 1024 * 1024) {
+      return `${Math.round(bytes / 1024)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  // Gallery navigation state
+  let currentFocusedIndex = -1; // Start at -1 so first arrow press focuses first photo
+  const photoItems = document.querySelectorAll('.photo-item');
+  const photoLinks = document.querySelectorAll('.photo-link');
+
+  // Video info cache
+  const videoInfoCache = new Map();
+
+  // Back to Top Button
+  const backToTopBtn = document.querySelector('.back-to-top') as HTMLButtonElement;
+
+  if (backToTopBtn) {
+    // Show/hide button based on scroll position
+    let ticking = false;
+    window.addEventListener('scroll', () => {
+      if (!ticking) {
+        window.requestAnimationFrame(() => {
+          if (window.scrollY > 500) {
+            backToTopBtn.classList.add('visible');
+          } else {
+            backToTopBtn.classList.remove('visible');
+          }
+          ticking = false;
+        });
+        ticking = true;
+      }
+    }, { passive: true });
+
+    // Smooth scroll to top on click
+    backToTopBtn.addEventListener('click', () => {
+      const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      window.scrollTo({
+        top: 0,
+        behavior: prefersReducedMotion ? 'auto' : 'smooth'
+      });
+    });
+  }
+
+  // Setup inline video players with lazy loading and error handling
+  function setupInlineVideos() {
+    const videos = document.querySelectorAll('.video-player') as NodeListOf<HTMLVideoElement>;
+
+    // IntersectionObserver for lazy loading videos
+    const videoObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const video = entry.target as HTMLVideoElement;
+          // Start loading metadata when video comes into view
+          video.preload = 'metadata';
+          videoObserver.unobserve(video);
+        }
+      });
+    }, { rootMargin: '100px' }); // Preload slightly before visible
+
+    videos.forEach(video => {
+      // Observe for lazy loading
+      videoObserver.observe(video);
+
+      // Setup error handling
+      let hasError = false;
+      const source = video.querySelector('source');
+      const container = video.closest('.video-container');
+      const errorOverlay = container?.querySelector('.video-error') as HTMLElement;
+
+      const handleVideoError = () => {
+        if (hasError) return;
+        hasError = true;
+
+        // Hide video and show error overlay
+        video.style.display = 'none';
+        if (errorOverlay) {
+          errorOverlay.style.display = 'flex';
+        }
+      };
+
+      // Listen on both video and source elements
+      video.addEventListener('error', handleVideoError);
+      source?.addEventListener('error', handleVideoError);
+
+      // Timeout fallback after video becomes visible
+      video.addEventListener('loadstart', () => {
+        setTimeout(() => {
+          if (video.readyState === 0 && !hasError) {
+            handleVideoError();
+          }
+        }, 5000);
+      }, { once: true });
+    });
+  }
+
+  // Initialize inline videos
+  setupInlineVideos();
+
+  // Fetch video info from server
+  async function fetchVideoInfo(videoUrl: string): Promise<any> {
+    if (videoInfoCache.has(videoUrl)) {
+      return videoInfoCache.get(videoUrl);
+    }
+
+    try {
+      const response = await fetch('/api/video-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoUrl })
+      });
+
+      const data = await response.json();
+
+      if (data.info) {
+        videoInfoCache.set(videoUrl, data.info);
+        return data.info;
+      }
+      return null;
+    } catch (error) {
+      console.error('[PhotoGrid] Error fetching video info:', error);
+      return null;
+    }
+  }
+
+  // Format video info for display
+  function formatVideoInfo(info: any): string {
+    const sections = [];
+
+    // Video section
+    const videoFields = [];
+    if (info.duration) videoFields.push({ label: 'Duration', value: info.duration });
+    if (info.resolution) videoFields.push({ label: 'Resolution', value: info.resolution });
+    if (info.codec) videoFields.push({ label: 'Video Codec', value: info.codec });
+    if (info.frameRate) videoFields.push({ label: 'Frame Rate', value: info.frameRate });
+
+    if (videoFields.length > 0) {
+      sections.push({ title: '🎬 Video', fields: videoFields });
+    }
+
+    // Audio section
+    const audioFields = [];
+    if (info.audioCodec) audioFields.push({ label: 'Audio Codec', value: info.audioCodec });
+
+    if (audioFields.length > 0) {
+      sections.push({ title: '🔊 Audio', fields: audioFields });
+    }
+
+    // File section
+    const fileFields = [];
+    if (info.size) fileFields.push({ label: 'File Size', value: info.size });
+    if (info.bitrate) fileFields.push({ label: 'Bitrate', value: info.bitrate });
+
+    if (fileFields.length > 0) {
+      sections.push({ title: '📁 File', fields: fileFields });
+    }
+
+    if (sections.length === 0) {
+      return '<p style="color: #666;">No video information available.</p>';
+    }
+
+    let html = '';
+    sections.forEach(section => {
+      html += `
+        <div class="exif-section" style="margin-bottom: 1.5rem;">
+          <h4 style="margin-bottom: 0.75rem; color: #333; font-size: 1.1rem;">${section.title}</h4>
+          <dl style="display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; margin: 0;">
+      `;
+      section.fields.forEach((field: any) => {
+        html += `
+          <dt style="font-weight: 500; color: #666;">${field.label}</dt>
+          <dd style="color: #333; margin: 0;">${field.value}</dd>
+        `;
+      });
+      html += `</dl></div>`;
+    });
+
+    return html;
+  }
+
+  // Helper function to update visual focus
+  function updateVisualFocus(index: number) {
+    // Remove keyboard-focused class from all items
+    photoItems.forEach(item => item.classList.remove('keyboard-focused'));
+
+    // Add to current item
+    if (index >= 0 && index < photoItems.length) {
+      photoItems[index].classList.add('keyboard-focused');
+    }
+  }
+
+  // Initialize PhotoSwipe lightbox (exclude videos - they use video modal)
+  const lightbox = new PhotoSwipeLightbox({
+    gallery: '#photo-gallery',
+    children: '.photo-item:not(.is-video) a.photo-link',
+    pswpModule: PhotoSwipe,
+    padding: { top: 0, bottom: 0, left: 0, right: 0 },
+    bgOpacity: 0.95,
+    showHideAnimationType: 'fade',
+    zoom: true,
+    preload: [1, 2],
+  });
+
+  // Set image dimensions from data attributes for correct aspect ratio
+  lightbox.on('itemData', (e) => {
+    // Read actual dimensions from data attributes set by the server
+    const element = e.itemData.element;
+    if (element) {
+      const width = parseInt(element.getAttribute('data-pswp-width') || '1920', 10);
+      const height = parseInt(element.getAttribute('data-pswp-height') || '1280', 10);
+      e.itemData.w = width;
+      e.itemData.h = height;
+    } else {
+      // Fallback if no element (shouldn't happen normally)
+      if (!e.itemData.w) e.itemData.w = 1920;
+      if (!e.itemData.h) e.itemData.h = 1280;
+    }
+
+    // Always use large thumbnail for lightbox (has correct EXIF orientation via Sharp .rotate())
+    // Original images may have wrong orientation as browsers don't always respect EXIF
+    const photoUrl = e.itemData.element?.getAttribute('data-photo-url');
+    if (photoUrl) {
+      const path = photoUrl.replace('/albums/', '');
+      e.itemData.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
+    }
+  });
+
+  // Track current photo when lightbox changes
+  lightbox.on('change', () => {
+    const pswp = lightbox.pswp;
+    if (pswp) {
+      const currentItem = pswp.currSlide;
+      if (currentItem && currentItem.data && currentItem.data.element) {
+        currentPhotoUrl = currentItem.data.element.getAttribute('data-photo-url') || '';
+      }
+    }
+  });
+
+  // Track last viewed photo index
+  let lastViewedPhotoIndex = 0;
+
+  // Handle keyboard shortcuts in lightbox
+  lightbox.on('uiRegister', function() {
+    const pswp = lightbox.pswp;
+
+    // Prevent duplicate UI creation
+    if (pswp.element?.querySelector('.pswp-custom-ui')) {
+      return;
+    }
+
+    // Move EXIF overlay into PhotoSwipe container for fullscreen compatibility
+    const exifOverlay = document.getElementById('exif-overlay');
+    if (exifOverlay && pswp.element && !pswp.element.contains(exifOverlay)) {
+      pswp.element.appendChild(exifOverlay);
+    }
+
+    // === Custom Lightbox UI ===
+    // State for custom UI
+    let isOriginalMode = false;
+    let isZenMode = false;
+    let isHelpVisible = false;
+
+    // Create custom UI elements
+    const customUI = document.createElement('div');
+    customUI.className = 'pswp-custom-ui';
+    customUI.innerHTML = `
+      <div class="pswp-counter">
+        <span class="pswp-counter-text">1 / 1</span>
+        <span class="pswp-separator">·</span>
+        <span class="pswp-size"></span>
+      </div>
+      <div class="pswp-toolbar">
+        <span class="pswp-btn pswp-btn-info" title="Photo info (I)">i</span>
+        <span class="pswp-btn pswp-btn-original" title="Original quality (O)">+</span>
+        <span class="pswp-btn pswp-btn-help" title="Shortcuts (?)">?</span>
+        <span class="pswp-btn pswp-btn-close" title="Close (Esc)">×</span>
+      </div>
+    `;
+    pswp.element.appendChild(customUI);
+
+    // Create shortcuts help overlay
+    const shortcutsOverlay = document.createElement('div');
+    shortcutsOverlay.className = 'pswp-shortcuts-overlay';
+    shortcutsOverlay.innerHTML = `
+      <div class="pswp-shortcuts-content">
+        <h3>Keyboard Shortcuts</h3>
+        <table>
+          <tr><td>← →</td><td>Navigate photos</td></tr>
+          <tr><td>O</td><td>Toggle original quality</td></tr>
+          <tr><td>I</td><td>Toggle photo info</td></tr>
+          <tr><td>F</td><td>Toggle fullscreen</td></tr>
+          <tr><td>H</td><td>Toggle zen mode (hide UI)</td></tr>
+          <tr><td>?</td><td>Toggle this help</td></tr>
+          <tr><td>Esc</td><td>Close overlay / lightbox</td></tr>
+        </table>
+        <p class="pswp-shortcuts-hint">Press ? or click outside to close</p>
+      </div>
+    `;
+    pswp.element.appendChild(shortcutsOverlay);
+
+    // Get UI elements
+    const counterText = customUI.querySelector('.pswp-counter-text') as HTMLElement;
+    const sizeDisplay = customUI.querySelector('.pswp-size') as HTMLElement;
+    const infoBtn = customUI.querySelector('.pswp-btn-info') as HTMLElement;
+    const originalBtn = customUI.querySelector('.pswp-btn-original') as HTMLElement;
+    const helpBtn = customUI.querySelector('.pswp-btn-help') as HTMLElement;
+    const closeBtn = customUI.querySelector('.pswp-btn-close') as HTMLElement;
+
+    // Update custom UI on slide change
+    async function updateCustomUI() {
+      if (!pswp || !pswp.currSlide) return;
+
+      const index = pswp.currIndex;
+      const total = pswp.getNumItems();
+
+      // Update counter
+      counterText.textContent = `${index + 1} / ${total}`;
+
+      // Get original dimensions from data attributes
+      const element = pswp.currSlide.data.element;
+      const originalW = element?.getAttribute('data-pswp-width') || '0';
+      const originalH = element?.getAttribute('data-pswp-height') || '0';
+
+      // Get file size from photo-item
+      const photoItem = element?.closest('.photo-item') as HTMLElement | null;
+      const originalSizeBytes = parseInt(photoItem?.getAttribute('data-photo-size') || '0');
+
+      // Update size display based on mode
+      if (isOriginalMode) {
+        sizeDisplay.textContent = `Original · ${originalW}×${originalH} · ${formatFileSize(originalSizeBytes)}`;
+      } else {
+        // Thumbnail mode - calculate actual thumbnail dimensions (1920px max on longest side)
+        const origW = parseInt(originalW) || 1920;
+        const origH = parseInt(originalH) || 1280;
+        const maxSize = 1920;
+
+        let thumbW, thumbH;
+        if (origW >= origH) {
+          // Landscape or square - width is constrained
+          thumbW = Math.min(origW, maxSize);
+          thumbH = Math.round(origH * (thumbW / origW));
+        } else {
+          // Portrait - height is constrained
+          thumbH = Math.min(origH, maxSize);
+          thumbW = Math.round(origW * (thumbH / origH));
+        }
+
+        // Get actual thumbnail file size
+        const photoUrl = element?.getAttribute('data-photo-url');
+        if (photoUrl) {
+          const path = photoUrl.replace('/albums/', '');
+          const thumbnailUrl = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
+          const thumbSizeBytes = await getThumbnailSize(thumbnailUrl);
+          sizeDisplay.textContent = `${thumbW}×${thumbH} · ${formatFileSize(thumbSizeBytes)}`;
+        } else {
+          sizeDisplay.textContent = `${thumbW}×${thumbH}`;
+        }
+      }
+
+      // Update original button state
+      originalBtn.classList.toggle('active', isOriginalMode);
+    }
+
+    // Toggle original mode
+    function toggleOriginalMode() {
+      isOriginalMode = !isOriginalMode;
+
+      if (isOriginalMode) {
+        // Load original image for current slide
+        const photoUrl = pswp.currSlide?.data?.element?.getAttribute('data-photo-url');
+        if (photoUrl) {
+          pswp.currSlide.data.src = photoUrl;
+          pswp.refreshSlideContent(pswp.currIndex);
+        }
+      } else {
+        // Revert to thumbnail
+        const photoUrl = pswp.currSlide?.data?.element?.getAttribute('data-photo-url');
+        if (photoUrl) {
+          const path = photoUrl.replace('/albums/', '');
+          pswp.currSlide.data.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
+          pswp.refreshSlideContent(pswp.currIndex);
+        }
+      }
+
+      updateCustomUI();
+    }
+
+    // Toggle help overlay
+    function toggleHelp() {
+      isHelpVisible = !isHelpVisible;
+      shortcutsOverlay.classList.toggle('active', isHelpVisible);
+    }
+
+    // Toggle zen mode
+    function toggleZenMode() {
+      isZenMode = !isZenMode;
+      pswp.element.classList.toggle('pswp--zen', isZenMode);
+    }
+
+    // Button click handlers
+    infoBtn.addEventListener('click', () => {
+      showInfoOverlay(currentPhotoUrl, false);
+    });
+    originalBtn.addEventListener('click', toggleOriginalMode);
+    helpBtn.addEventListener('click', toggleHelp);
+    closeBtn.addEventListener('click', () => pswp.close());
+
+    // Close help overlay when clicking background
+    shortcutsOverlay.addEventListener('click', (e) => {
+      if (e.target === shortcutsOverlay) {
+        toggleHelp();
+      }
+    });
+
+    // Custom keyboard handler that runs before PhotoSwipe's handler
+    document.addEventListener('keydown', (event) => {
+      // Only handle when lightbox is open
+      if (!pswp || !document.querySelector('.pswp--open')) {
+        return;
+      }
+
+      const exifOverlay = document.getElementById('exif-overlay');
+
+      // Handle Escape key - close overlays in order: help → EXIF → lightbox
+      if (event.key === 'Escape') {
+        // First: close help overlay
+        if (isHelpVisible) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          toggleHelp();
+          return;
+        }
+        // Second: close EXIF overlay
+        if (exifOverlay?.classList.contains('active')) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          exifOverlay.classList.remove('active');
+          return;
+        }
+        // Third: allow PhotoSwipe to handle Escape and close lightbox
+      }
+
+      // Handle 'h' or 'H' key to toggle zen mode
+      if (event.key === 'h' || event.key === 'H') {
+        event.preventDefault();
+        toggleZenMode();
+      }
+
+      // Handle 'o' or 'O' key to toggle original mode
+      if (event.key === 'o' || event.key === 'O') {
+        event.preventDefault();
+        toggleOriginalMode();
+      }
+
+      // Handle '?' key to toggle help overlay
+      if (event.key === '?') {
+        event.preventDefault();
+        toggleHelp();
+      }
+
+      // Handle 'i' key to toggle EXIF
+      if (event.key === 'i' || event.key === 'I') {
+        event.preventDefault();
+        if (exifOverlay?.classList.contains('active')) {
+          // If EXIF is open, close it
+          exifOverlay.classList.remove('active');
+        } else {
+          // If EXIF is closed, open it
+          showEXIFOverlay(currentPhotoUrl);
+        }
+      }
+
+      // Handle 'f' or 'F' key to toggle fullscreen
+      if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault();
+        const pswpElement = pswp.element;
+
+        if (!document.fullscreenElement) {
+          // Enter fullscreen
+          if (pswpElement.requestFullscreen) {
+            pswpElement.requestFullscreen();
+          } else if (pswpElement.webkitRequestFullscreen) {
+            pswpElement.webkitRequestFullscreen();
+          }
+        } else {
+          // Exit fullscreen
+          if (document.exitFullscreen) {
+            document.exitFullscreen();
+          } else if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen();
+          }
+        }
+      }
+    }, true); // Use capture phase to run before PhotoSwipe's handlers
+
+    // Note: We always use large thumbnails (1920px) for correct EXIF orientation
+    // Original images may have wrong orientation as browsers don't consistently respect EXIF metadata
+
+    // Handle swipe up/down gestures to close lightbox on mobile
+    let touchStartY = 0;
+    let touchStartX = 0;
+    const SWIPE_THRESHOLD = 50; // Minimum distance for swipe detection
+
+    pswp.element.addEventListener('touchstart', (event) => {
+      touchStartY = event.touches[0].clientY;
+      touchStartX = event.touches[0].clientX;
+    }, { passive: true });
+
+    pswp.element.addEventListener('touchend', (event) => {
+      const touchEndY = event.changedTouches[0].clientY;
+      const touchEndX = event.changedTouches[0].clientX;
+
+      const verticalDistance = Math.abs(touchStartY - touchEndY);
+      const horizontalDistance = Math.abs(touchStartX - touchEndX);
+
+      // Check if it's a vertical swipe (up or down) and not horizontal navigation
+      if (verticalDistance > SWIPE_THRESHOLD && verticalDistance > horizontalDistance) {
+        pswp.close();
+      }
+    }, { passive: true });
+
+    // Update current photo on slide change
+    pswp.on('change', () => {
+      const currentItem = pswp.currSlide;
+      if (currentItem && currentItem.data && currentItem.data.element) {
+        currentPhotoUrl = currentItem.data.element.getAttribute('data-photo-url') || '';
+        lastViewedPhotoIndex = pswp.currIndex;
+
+        // Update visual focus in grid to match current lightbox image
+        currentFocusedIndex = pswp.currIndex;
+        updateVisualFocus(currentFocusedIndex);
+
+        // Update custom UI
+        updateCustomUI();
+      }
+    });
+
+    // Store initial index when opening and update visual focus
+    pswp.on('afterInit', () => {
+      lastViewedPhotoIndex = pswp.currIndex;
+      currentFocusedIndex = pswp.currIndex;
+      updateVisualFocus(currentFocusedIndex);
+
+      // Initialize custom UI
+      updateCustomUI();
+    });
+
+    // Scroll to last viewed photo when closing and reset state
+    pswp.on('destroy', () => {
+      // Reset custom UI state
+      isOriginalMode = false;
+      isZenMode = false;
+      isHelpVisible = false;
+
+      const photoItems = document.querySelectorAll('.photo-item');
+      if (photoItems[lastViewedPhotoIndex]) {
+        // Slight delay to ensure lightbox is fully closed
+        setTimeout(() => {
+          photoItems[lastViewedPhotoIndex].scrollIntoView({
+            behavior: 'smooth',
+            block: 'center'
+          });
+        }, 100);
+      }
+    });
+  });
+
+  lightbox.init();
+
+  // EXIF overlay handling
+  const exifOverlay = document.getElementById('exif-overlay');
+  const exifOverlayClose = document.querySelector('.exif-overlay-close');
+  const exifOverlayData = document.getElementById('exif-overlay-data');
+
+  // Show info overlay (EXIF for photos, video info for videos)
+  async function showInfoOverlay(url: string, isVideo: boolean = false) {
+    if (!url) {
+      return;
+    }
+
+    // Update overlay header
+    const overlayHeader = document.querySelector('.exif-overlay-header h3');
+    if (overlayHeader) {
+      overlayHeader.textContent = isVideo ? 'Video Information' : 'Photo Information';
+    }
+
+    exifOverlay?.classList.add('active');
+    if (exifOverlayData) exifOverlayData.innerHTML = isVideo ? 'Loading video info...' : 'Loading EXIF data...';
+
+    try {
+      if (isVideo) {
+        // Fetch video info
+        const videoInfo = await fetchVideoInfo(url);
+        if (videoInfo) {
+          const infoHtml = formatVideoInfo(videoInfo);
+          if (exifOverlayData) exifOverlayData.innerHTML = infoHtml;
+        } else {
+          if (exifOverlayData) exifOverlayData.innerHTML = '<p style="color: #666;">No video information available.</p>';
+        }
+      } else {
+        // Fetch EXIF data for photos
+        // Check cache first
+        if (exifCache.has(url)) {
+          if (exifOverlayData) exifOverlayData.innerHTML = exifCache.get(url);
+          return;
+        }
+
+        const response = await fetch('/api/exif', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photoUrl: url })
+        });
+
+        const data = await response.json();
+
+        if (data.exif && Object.keys(data.exif).length > 0) {
+          const exifHtml = formatExifData(data.exif);
+          if (exifOverlayData) exifOverlayData.innerHTML = exifHtml;
+          exifCache.set(url, exifHtml);
+        } else {
+          const noData = '<p style="color: #666;">No EXIF data available for this photo.</p>';
+          if (exifOverlayData) exifOverlayData.innerHTML = noData;
+          exifCache.set(url, noData);
+        }
+      }
+    } catch (error) {
+      console.error('[PhotoGrid] Error loading info:', error);
+      if (exifOverlayData) exifOverlayData.innerHTML = '<p style="color: #d32f2f;">Error loading information.</p>';
+    }
+  }
+
+  // Backward compatibility wrapper
+  async function showEXIFOverlay(photoUrl: string) {
+    return showInfoOverlay(photoUrl, false);
+  }
+
+  // Icon button handlers (Desktop) - use capture phase to fire before PhotoSwipe
+  document.querySelectorAll('.icon-info').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation(); // Prevent any other handlers
+      const element = e.currentTarget as HTMLElement;
+      const photoUrl = element.dataset.photoUrl;
+      const isVideo = element.dataset.isVideo === 'true';
+      if (photoUrl) {
+        showInfoOverlay(photoUrl, isVideo);
+      }
+    }, true); // capture phase
+  });
+
+  // Context menu (Mobile long-press)
+  const contextMenu = document.getElementById('context-menu');
+  let longPressTimer: number;
+  let longPressTarget: HTMLElement | null = null;
+  let currentContextPhoto = '';
+  let currentContextIsVideo = false;
+
+  document.querySelectorAll('.photo-item').forEach(item => {
+    const element = item as HTMLElement;
+
+    // Touch start
+    element.addEventListener('touchstart', (e) => {
+      longPressTarget = element;
+      currentContextPhoto = element.dataset.photoUrl || '';
+      currentContextIsVideo = element.dataset.isVideo === 'true';
+
+      longPressTimer = window.setTimeout(() => {
+        if (contextMenu && currentContextPhoto) {
+          e.preventDefault();
+
+          const touch = (e as TouchEvent).touches[0];
+          const x = touch.clientX;
+          const y = touch.clientY;
+
+          // Position menu near touch point
+          contextMenu.style.left = `${Math.min(x, window.innerWidth - 200)}px`;
+          contextMenu.style.top = `${Math.min(y, window.innerHeight - 120)}px`;
+          contextMenu.classList.add('active');
+
+          // Haptic feedback if available
+          if (navigator.vibrate) {
+            navigator.vibrate(50);
+          }
+        }
+      }, 500); // 500ms for long press
+    });
+
+    // Touch end/cancel
+    const cancelLongPress = () => {
+      clearTimeout(longPressTimer);
+    };
+
+    element.addEventListener('touchend', cancelLongPress);
+    element.addEventListener('touchmove', cancelLongPress);
+    element.addEventListener('touchcancel', cancelLongPress);
+  });
+
+  // Context menu actions
+  document.querySelectorAll('.context-menu-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      const action = (e.currentTarget as HTMLElement).dataset.action;
+
+      if (action === 'info' && currentContextPhoto) {
+        showInfoOverlay(currentContextPhoto, currentContextIsVideo);
+      } else if (action === 'download' && currentContextPhoto) {
+        const filename = longPressTarget?.dataset.photoFilename || (currentContextIsVideo ? 'video.mp4' : 'photo.jpg');
+        const link = document.createElement('a');
+        link.href = currentContextPhoto;
+        link.download = filename;
+        link.click();
+      }
+
+      contextMenu?.classList.remove('active');
+    });
+  });
+
+  // Close context menu on outside click
+  document.addEventListener('click', (e) => {
+    if (contextMenu && !contextMenu.contains(e.target as Node)) {
+      contextMenu.classList.remove('active');
+    }
+  });
+
+  document.addEventListener('touchstart', (e) => {
+    if (contextMenu && !contextMenu.contains(e.target as Node) &&
+        !(e.target as HTMLElement).closest('.photo-item')) {
+      contextMenu.classList.remove('active');
+    }
+  });
+
+  // Close EXIF overlay
+  exifOverlayClose?.addEventListener('click', () => {
+    exifOverlay?.classList.remove('active');
+  });
+
+  // Close on overlay background click
+  exifOverlay?.addEventListener('click', (e) => {
+    if (e.target === exifOverlay) {
+      exifOverlay.classList.remove('active');
+    }
+  });
+
+  // Gallery keyboard navigation (when not in lightbox)
+  // Add tabindex to make photos focusable
+  photoLinks.forEach((link, index) => {
+    (link as HTMLElement).setAttribute('tabindex', '0');
+  });
+
+  // Focus visual indicator - discreet but visible
+  const style = document.createElement('style');
+  style.textContent = `
+    .photo-link:focus {
+      outline: none;
+    }
+    .photo-link:focus-visible {
+      outline: none;
+    }
+    .photo-item.keyboard-focused {
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.8), 0 4px 16px rgba(0, 0, 0, 0.2) !important;
+      transform: translateY(-4px) !important;
+    }
+    .photo-item.keyboard-focused .photo-img {
+      transform: scale(1.03) !important;
+    }
+  `;
+  document.head.appendChild(style);
+
+  // Track focus changes
+  photoLinks.forEach((link, index) => {
+    link.addEventListener('focus', () => {
+      currentFocusedIndex = index;
+    });
+  });
+
+  // Calculate grid layout for navigation
+  function getGridLayout() {
+    const gallery = document.getElementById('photo-gallery');
+    const isMasonry = gallery?.classList.contains('photo-grid-masonry');
+    const isGrid = gallery?.classList.contains('photo-grid-grid');
+
+    // Determine columns based on layout and screen size
+    let columns = 1;
+    if (isMasonry || isGrid) {
+      if (window.innerWidth > 768) {
+        columns = 3;
+      } else {
+        columns = 2;
+      }
+    }
+
+    const rows = Math.ceil(photoItems.length / columns);
+    return { columns, rows };
+  }
+
+  // Get actual positions of photos based on their rendered location
+  function getPhotoPositions() {
+    const positions: Array<{index: number, x: number, y: number, rect: DOMRect}> = [];
+
+    photoItems.forEach((item, index) => {
+      const rect = item.getBoundingClientRect();
+      positions.push({
+        index,
+        x: rect.left,
+        y: rect.top,
+        rect
+      });
+    });
+
+    return positions;
+  }
+
+  // Find closest photo in a given direction
+  function getNextIndex(currentIndex: number, direction: 'up' | 'down' | 'left' | 'right') {
+    const positions = getPhotoPositions();
+    const current = positions.find(p => p.index === currentIndex);
+    if (!current) return currentIndex;
+
+    const tolerance = 80; // Increased tolerance for row detection
+    let candidates: typeof positions = [];
+
+    switch(direction) {
+      case 'right':
+        // Find photos to the right in the same row
+        const sameRowRight = positions.filter(p =>
+          p.x > current.x + 10 &&
+          Math.abs(p.y - current.y) < tolerance
+        );
+
+        if (sameRowRight.length > 0) {
+          // Found photo(s) in same row - pick closest
+          sameRowRight.sort((a, b) => a.x - b.x);
+          return sameRowRight[0].index;
+        }
+
+        // No photos in same row to the right - move to next row, first photo
+        const nextRows = positions.filter(p => p.y > current.y + 10);
+        if (nextRows.length === 0) {
+          // No rows below, wrap to first photo
+          return 0;
+        }
+
+        // Find first photo in next row (lowest y, then leftmost x)
+        nextRows.sort((a, b) => {
+          const yDiff = a.y - b.y;
+          if (Math.abs(yDiff) < 10) {
+            return a.x - b.x; // Same row, pick leftmost
+          }
+          return yDiff; // Different rows, pick topmost
+        });
+        return nextRows[0].index;
+
+      case 'left':
+        // Find photos to the left in the same row
+        const sameRowLeft = positions.filter(p =>
+          p.x < current.x - 10 &&
+          Math.abs(p.y - current.y) < tolerance
+        );
+
+        if (sameRowLeft.length > 0) {
+          // Found photo(s) in same row - pick closest (rightmost of left photos)
+          sameRowLeft.sort((a, b) => b.x - a.x);
+          return sameRowLeft[0].index;
+        }
+
+        // No photos in same row to the left - move to previous row, last photo
+        const prevRows = positions.filter(p => p.y < current.y - 10);
+        if (prevRows.length === 0) {
+          // No rows above, wrap to last photo
+          return positions.length - 1;
+        }
+
+        // Find last photo in previous row (highest y, then rightmost x)
+        prevRows.sort((a, b) => {
+          const yDiff = b.y - a.y; // Reversed - want highest y
+          if (Math.abs(yDiff) < 10) {
+            return b.x - a.x; // Same row, pick rightmost
+          }
+          return yDiff; // Different rows, pick bottommost
+        });
+        return prevRows[0].index;
+
+      case 'down':
+        // Find photos below
+        candidates = positions.filter(p => p.y > current.y + 10);
+        if (candidates.length === 0) {
+          // No photos below, wrap to top of same column
+          candidates = positions.filter(p => Math.abs(p.x - current.x) < tolerance);
+          if (candidates.length === 0) return 0;
+          candidates.sort((a, b) => a.y - b.y);
+          return candidates[0].index;
+        }
+        // Sort by: same column first, then by distance
+        candidates.sort((a, b) => {
+          const aDeltaX = Math.abs(a.x - current.x);
+          const bDeltaX = Math.abs(b.x - current.x);
+
+          if (aDeltaX < tolerance && bDeltaX < tolerance) {
+            return a.y - b.y; // Closest below
+          }
+          if (aDeltaX < tolerance) return -1;
+          if (bDeltaX < tolerance) return 1;
+
+          // Different columns, pick closest y then closest x
+          const yDiff = Math.abs(a.y - b.y);
+          if (yDiff > 10) {
+            return a.y - b.y;
+          }
+          return aDeltaX - bDeltaX;
+        });
+        return candidates[0].index;
+
+      case 'up':
+        // Find photos above
+        candidates = positions.filter(p => p.y < current.y - 10);
+        if (candidates.length === 0) {
+          // No photos above, wrap to bottom of same column
+          candidates = positions.filter(p => Math.abs(p.x - current.x) < tolerance);
+          if (candidates.length === 0) return positions.length - 1;
+          candidates.sort((a, b) => b.y - a.y);
+          return candidates[0].index;
+        }
+        // Sort by: same column first, then by distance
+        candidates.sort((a, b) => {
+          const aDeltaX = Math.abs(a.x - current.x);
+          const bDeltaX = Math.abs(b.x - current.x);
+
+          if (aDeltaX < tolerance && bDeltaX < tolerance) {
+            return b.y - a.y; // Closest above (highest y)
+          }
+          if (aDeltaX < tolerance) return -1;
+          if (bDeltaX < tolerance) return 1;
+
+          // Different columns, pick closest y then closest x
+          const yDiff = Math.abs(a.y - b.y);
+          if (yDiff > 10) {
+            return b.y - a.y;
+          }
+          return aDeltaX - bDeltaX;
+        });
+        return candidates[0].index;
+    }
+
+    return currentIndex;
+  }
+
+  // Gallery keyboard navigation
+  document.addEventListener('keydown', (e) => {
+    // Only handle keyboard navigation when:
+    // 1. No lightbox is open
+    // 2. No EXIF overlay is open
+    // 3. No context menu is open
+    // 4. Not typing in an input field
+    const isLightboxOpen = document.querySelector('.pswp--open');
+    const isExifOpen = exifOverlay?.classList.contains('active');
+    const isContextMenuOpen = contextMenu?.classList.contains('active');
+    const isTyping = (e.target as HTMLElement).tagName === 'INPUT' ||
+                     (e.target as HTMLElement).tagName === 'TEXTAREA';
+
+    if (isLightboxOpen || isExifOpen || isContextMenuOpen || isTyping) {
+      return;
+    }
+
+    const totalPhotos = photoLinks.length;
+    let handled = false;
+
+    switch(e.key) {
+      case 'ArrowRight':
+        e.preventDefault();
+        // If no photo focused yet, start at first photo
+        if (currentFocusedIndex === -1) {
+          currentFocusedIndex = 0;
+        } else {
+          currentFocusedIndex = getNextIndex(currentFocusedIndex, 'right');
+        }
+        handled = true;
+        break;
+
+      case 'ArrowLeft':
+        e.preventDefault();
+        if (currentFocusedIndex === -1) {
+          currentFocusedIndex = 0;
+        } else {
+          currentFocusedIndex = getNextIndex(currentFocusedIndex, 'left');
+        }
+        handled = true;
+        break;
+
+      case 'ArrowDown':
+        e.preventDefault();
+        if (currentFocusedIndex === -1) {
+          currentFocusedIndex = 0;
+        } else {
+          currentFocusedIndex = getNextIndex(currentFocusedIndex, 'down');
+        }
+        handled = true;
+        break;
+
+      case 'ArrowUp':
+        e.preventDefault();
+        if (currentFocusedIndex === -1) {
+          currentFocusedIndex = 0;
+        } else {
+          currentFocusedIndex = getNextIndex(currentFocusedIndex, 'up');
+        }
+        handled = true;
+        break;
+
+      case ' ':
+      case 'Enter':
+        if (currentFocusedIndex >= 0) {
+          e.preventDefault();
+          // Open the currently focused photo in lightbox
+          const focusedLink = photoLinks[currentFocusedIndex] as HTMLElement;
+          if (focusedLink) {
+            focusedLink.click();
+          }
+        }
+        break;
+
+      case 'i':
+      case 'I':
+        e.preventDefault();
+        // Toggle EXIF for currently focused photo
+        if (currentFocusedIndex >= 0) {
+          if (exifOverlay?.classList.contains('active')) {
+            // If EXIF is open, close it
+            exifOverlay.classList.remove('active');
+          } else {
+            // If EXIF is closed, open it
+            const focusedPhotoUrl = (photoItems[currentFocusedIndex] as HTMLElement).dataset.photoUrl;
+            if (focusedPhotoUrl) {
+              showEXIFOverlay(focusedPhotoUrl);
+            }
+          }
+        } else {
+          // If no photo selected, focus first photo
+          currentFocusedIndex = 0;
+          updateVisualFocus(currentFocusedIndex);
+          photoItems[currentFocusedIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        break;
+
+      case 'Escape':
+        // Close EXIF if open (in gallery view)
+        if (exifOverlay?.classList.contains('active')) {
+          e.preventDefault();
+          exifOverlay.classList.remove('active');
+        }
+        break;
+
+      case 'Home':
+        e.preventDefault();
+        currentFocusedIndex = 0;
+        updateVisualFocus(currentFocusedIndex);
+        photoItems[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        break;
+
+      case 'End':
+        e.preventDefault();
+        currentFocusedIndex = totalPhotos - 1;
+        updateVisualFocus(currentFocusedIndex);
+        photoItems[currentFocusedIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        break;
+    }
+
+    // Focus and scroll to the new photo if navigation happened
+    if (handled) {
+      updateVisualFocus(currentFocusedIndex);
+      photoItems[currentFocusedIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  });
+
+  function formatExifData(exif: any): string {
+    const sections: any[] = [];
+
+    // Rating section - show first if available (from XMP metadata)
+    if (exif.Rating !== undefined && exif.Rating > 0) {
+      const rating = Math.min(5, Math.max(0, Math.round(exif.Rating)));
+      const stars = '★'.repeat(rating) + '☆'.repeat(5 - rating);
+      sections.push({
+        isRating: true,
+        stars: stars
+      });
+    }
+
+    // Camera section
+    const cameraFields = [];
+    if (exif.Make) cameraFields.push({ label: 'Make', value: exif.Make });
+    if (exif.Model) cameraFields.push({ label: 'Model', value: exif.Model });
+    if (exif.LensModel || exif.Lens) cameraFields.push({ label: 'Lens', value: exif.LensModel || exif.Lens });
+
+    if (cameraFields.length > 0) {
+      sections.push({
+        title: '📷 Camera',
+        fields: cameraFields
+      });
+    }
+
+    // Settings section
+    const settingsFields = [];
+    if (exif.ISO) settingsFields.push({ label: 'ISO', value: exif.ISO });
+    if (exif.FNumber) settingsFields.push({ label: 'Aperture', value: `f/${exif.FNumber}` });
+    if (exif.ExposureTime) {
+      const shutterSpeed = exif.ExposureTime < 1
+        ? `1/${Math.round(1/exif.ExposureTime)}s`
+        : `${exif.ExposureTime}s`;
+      settingsFields.push({ label: 'Shutter Speed', value: shutterSpeed });
+    }
+    if (exif.FocalLength) settingsFields.push({ label: 'Focal Length', value: `${exif.FocalLength}mm` });
+    if (exif.ExposureCompensation) settingsFields.push({ label: 'Exposure Comp', value: `${exif.ExposureCompensation > 0 ? '+' : ''}${exif.ExposureCompensation} EV` });
+
+    if (settingsFields.length > 0) {
+      sections.push({
+        title: '⚙️ Settings',
+        fields: settingsFields
+      });
+    }
+
+    // Image info section
+    const imageFields = [];
+    if (exif.ImageWidth && exif.ImageHeight) {
+      imageFields.push({ label: 'Dimensions', value: `${exif.ImageWidth} × ${exif.ImageHeight}` });
+    }
+    if (exif.DateTimeOriginal || exif.DateTime) {
+      const dateStr = exif.DateTimeOriginal || exif.DateTime;
+      imageFields.push({ label: 'Date Taken', value: dateStr });
+    }
+    if (exif.Flash !== undefined) {
+      imageFields.push({ label: 'Flash', value: exif.Flash ? 'Yes' : 'No' });
+    }
+
+    if (imageFields.length > 0) {
+      sections.push({
+        title: 'ℹ️ Image',
+        fields: imageFields
+      });
+    }
+
+    // Location section
+    if (exif.GPSLatitude && exif.GPSLongitude) {
+      const locationFields = [
+        { label: 'Latitude', value: exif.GPSLatitude },
+        { label: 'Longitude', value: exif.GPSLongitude }
+      ];
+      if (exif.GPSAltitude) {
+        locationFields.push({ label: 'Altitude', value: `${exif.GPSAltitude}m` });
+      }
+      sections.push({
+        title: '📍 Location',
+        fields: locationFields
+      });
+    }
+
+    if (sections.length === 0) {
+      return '<p style="color: #666;">No detailed EXIF data available.</p>';
+    }
+
+    let html = '';
+    sections.forEach(section => {
+      if (section.isRating) {
+        // Rating display - elegant gold stars, centered
+        html += `
+          <div class="exif-rating" style="
+            text-align: center;
+            margin-bottom: 1.25rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid #eee;
+          ">
+            <span class="rating-stars" style="
+              font-size: 1.4rem;
+              letter-spacing: 3px;
+              color: #d4af37;
+              text-shadow: 0 1px 2px rgba(0,0,0,0.08);
+            ">${section.stars}</span>
+          </div>
+        `;
+      } else {
+        html += `
+          <div class="exif-section" style="margin-bottom: 1.5rem;">
+            <h4 style="margin-bottom: 0.75rem; color: #333; font-size: 1.1rem;">${section.title}</h4>
+            <dl style="display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; margin: 0;">
+        `;
+        section.fields.forEach((field: any) => {
+          html += `
+            <dt style="font-weight: 500; color: #666;">${field.label}</dt>
+            <dd style="color: #333; margin: 0;">${field.value}</dd>
+          `;
+        });
+        html += `</dl></div>`;
+      }
+    });
+
+    return html;
+  }
+</script>

@@ -842,8 +842,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
       const styleSelect = document.getElementById('style-select') as HTMLSelectElement;
       const photoGallery = document.getElementById('photo-gallery');
 
-      console.log('[AlbumPage] Initializing controls. Sort:', !!sortSelect, 'Style:', !!styleSelect, 'Gallery:', !!photoGallery);
-
       if (sortSelect && photoGallery) {
         // Map schema sort values to frontend sort values
         const sortMapping: Record<string, string> = {
@@ -864,27 +862,22 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
 
         if (savedSort) {
           sortSelect.value = savedSort;
-          console.log('[AlbumPage] Applying saved sort:', savedSort);
           sortPhotos(savedSort);
         } else {
           sortSelect.value = defaultSort;
-          console.log('[AlbumPage] Applying album default sort:', defaultSort, '(from schema:', albumSort, ')');
           sortPhotos(defaultSort);
         }
 
         sortSelect.addEventListener('change', (e) => {
           const sortValue = (e.target as HTMLSelectElement).value;
-          console.log('[AlbumPage] Sort changed to:', sortValue);
           localStorage.setItem('photo-sort-preference', sortValue);
           sortPhotos(sortValue);
         });
 
         function sortPhotos(sortBy: string) {
           const photoItems = Array.from(photoGallery.querySelectorAll('.photo-item'));
-          console.log('[AlbumPage] Sorting', photoItems.length, 'photos by:', sortBy);
 
           if (photoItems.length === 0) {
-            console.warn('[AlbumPage] No photo items found to sort');
             return;
           }
 
@@ -903,7 +896,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
               case 'date-oldest': {
                 const dateA = parseInt(a.getAttribute('data-photo-mtime') || '0');
                 const dateB = parseInt(b.getAttribute('data-photo-mtime') || '0');
-                console.log('[AlbumPage] Comparing dates:', dateA, 'vs', dateB);
                 return sortBy === 'date-newest' ? dateB - dateA : dateA - dateB;
               }
 
@@ -915,7 +907,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
                 if (exifA === 0 && exifB === 0) return 0;
                 if (exifA === 0) return 1;  // a has no EXIF, sort to end
                 if (exifB === 0) return -1; // b has no EXIF, sort to end
-                console.log('[AlbumPage] Comparing EXIF dates:', exifA, 'vs', exifB);
                 return sortBy === 'exif-newest' ? exifB - exifA : exifA - exifB;
               }
 
@@ -923,7 +914,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
               case 'size-smallest': {
                 const sizeA = parseInt(a.getAttribute('data-photo-size') || '0');
                 const sizeB = parseInt(b.getAttribute('data-photo-size') || '0');
-                console.log('[AlbumPage] Comparing sizes:', sizeA, 'vs', sizeB);
                 return sortBy === 'size-largest' ? sizeB - sizeA : sizeA - sizeB;
               }
 
@@ -934,8 +924,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
 
           // Reorder DOM elements
           photoItems.forEach(item => photoGallery.appendChild(item));
-
-          console.log('[AlbumPage] Photos sorted successfully');
         }
       }
 
@@ -949,11 +937,8 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
         styleSelect.value = currentStyle;
         applyDisplayStyle(currentStyle);
 
-        console.log('[AlbumPage] Display style initialized:', currentStyle);
-
         styleSelect.addEventListener('change', (e) => {
           const styleValue = (e.target as HTMLSelectElement).value;
-          console.log('[AlbumPage] Display style changed to:', styleValue);
           localStorage.setItem('photo-display-style', styleValue);
           applyDisplayStyle(styleValue);
         });
@@ -963,7 +948,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
           photoGallery.classList.remove('photo-grid-grid', 'photo-grid-masonry', 'photo-grid-slideshow', 'photo-grid-single-column');
           // Add the new style class
           photoGallery.classList.add(`photo-grid-${style}`);
-          console.log('[AlbumPage] Applied display style:', style);
         }
       }
 
@@ -979,8 +963,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
       const options = filter.querySelectorAll('.media-filter-option');
       const gallery = document.getElementById('photo-gallery');
       const styleSelect = document.getElementById('style-select') as HTMLSelectElement;
-
-      console.log('[MediaFilter] Initializing media filter');
 
       // Filter items (photos or videos only, no 'all' option)
       function filterItems(filterType: string) {
@@ -1021,8 +1003,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
 
           // Store preference
           localStorage.setItem('photo-media-filter', filterType);
-
-          console.log('[MediaFilter] Filter changed to:', filterType);
         });
       });
 
@@ -1061,8 +1041,6 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
         filterItems('photos');
         localStorage.setItem('photo-media-filter', 'photos');
       }
-
-      console.log('[MediaFilter] Media filter initialized');
     }
 
     // Initialize UI controls (access already verified server-side)

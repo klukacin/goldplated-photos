@@ -51,8 +51,6 @@ export const POST: APIRoute = async ({ request }) => {
         interop: false,
       });
 
-      console.log('[EXIF] Extracted for:', photoPath, exifData ? 'success' : 'no data');
-
       return new Response(JSON.stringify({ exif: exifData || {} }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }

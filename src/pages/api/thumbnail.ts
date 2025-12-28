@@ -49,7 +49,6 @@ export const GET: APIRoute = async ({ request }) => {
     // Check if thumbnail already exists in cache
     try {
       await fs.access(cachePath);
-      console.log(`[Thumbnail] Cache hit: ${photoPath} (${size})`);
 
       const cachedBuffer = await fs.readFile(cachePath);
       return new Response(cachedBuffer, {
@@ -62,7 +61,6 @@ export const GET: APIRoute = async ({ request }) => {
       });
     } catch {
       // Cache miss, continue to generate
-      console.log(`[Thumbnail] Cache miss: ${photoPath} (${size})`);
     }
 
     // Check if source file exists
@@ -87,7 +85,6 @@ export const GET: APIRoute = async ({ request }) => {
 
     // Save to cache
     await fs.writeFile(cachePath, thumbnail);
-    console.log(`[Thumbnail] Generated and cached: ${photoPath} (${size})`);
 
     // Return thumbnail
     return new Response(thumbnail, {
