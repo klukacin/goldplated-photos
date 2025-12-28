@@ -1,0 +1,60 @@
+{
+  "name": "goldplated-photos",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "A beautiful, secure photo gallery for photographers and enthusiasts",
+  "author": "Kristijan Lukacin",
+  "contributors": [
+    "Claude Code <noreply@anthropic.com>"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/klukacin/goldplated-photos"
+  },
+  "homepage": "https://klukacin.github.io/goldplated-photos",
+  "bugs": {
+    "url": "https://github.com/klukacin/goldplated-photos/issues"
+  },
+  "keywords": [
+    "photo-gallery",
+    "photography",
+    "astro",
+    "photoswipe",
+    "portfolio",
+    "image-gallery",
+    "lightbox"
+  ],
+  "scripts": {
+    "dev": "astro dev",
+    "dev:bg": "./scripts/start-dev.sh",
+    "stop:dev": "./scripts/stop-dev.sh",
+    "build": "astro build",
+    "preview": "astro preview",
+    "deploy": "./scripts/deploy.sh",
+    "update": "node scripts/update-albums.mjs",
+    "astro": "astro",
+    "admin": "node admin/server.js",
+    "admin:bg": "./scripts/start-admin.sh",
+    "stop:admin": "./scripts/stop-admin.sh"
+  },
+  "dependencies": {
+    "@astrojs/node": "^9.5.1",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "astro": "^5.16.6",
+    "cors": "^2.8.5",
+    "exifr": "^7.1.3",
+    "express": "^5.2.1",
+    "fluent-ffmpeg": "^2.1.3",
+    "gray-matter": "^4.0.3",
+    "jszip": "^3.10.1",
+    "marked": "^17.0.1",
+    "mrmime": "^2.0.1",
+    "multer": "^2.0.2",
+    "photoswipe": "^5.4.4",
+    "rollup": "^4.54.0"
+  },
+  "devDependencies": {
+    "@types/fluent-ffmpeg": "^2.1.28"
+  }
+}
