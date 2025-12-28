@@ -83,6 +83,15 @@ export const POST: APIRoute = async ({ request }) => {
 
     // Convert URL to file path
     const videoPath = videoUrl.replace('/albums/', '');
+
+    // SECURITY: Block path traversal attempts
+    if (videoPath.includes('..') || videoPath.startsWith('/')) {
+      return new Response(JSON.stringify({ error: 'Invalid path' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const fullPath = path.join(process.cwd(), 'src/content/albums', videoPath);
 
     // Check if file exists
