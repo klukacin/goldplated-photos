@@ -1,0 +1,991 @@
+---
+export const prerender = true;
+
+import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, buildBreadcrumbs, getAncestors, checkAccess, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown } from '../../lib/albums';
+import Layout from '../../layouts/Layout.astro';
+import AlbumGrid from '../../components/AlbumGrid.astro';
+import PhotoGrid from '../../components/PhotoGrid.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import PasswordProtection from '../../components/PasswordProtection.astro';
+import Footer from '../../components/Footer.astro';
+
+export async function getStaticPaths() {
+  const { getCollection } = await import('astro:content');
+  const albums = await getCollection('albums');
+
+  return albums.map(album => ({
+    params: { path: album.id.replace('/index.md', '') },
+    props: { album }
+  }));
+}
+
+const { path } = Astro.params;
+const { album } = Astro.props;
+
+// Get token from query parameter
+const url = new URL(Astro.request.url);
+const providedToken = url.searchParams.get('token');
+
+// Get ancestors for password inheritance checking
+const ancestors = await getAncestors(path!);
+
+// Note: In SSG mode, we can't access sessionStorage here
+// Access control will be enforced client-side in the script below
+const subAlbums = await getSubAlbums(path!);
+const allMedia = await getPhotosForAlbum(path!);
+const breadcrumbs = buildBreadcrumbs(path!);
+
+// Get body content from body.md and render description as markdown
+const bodyHtml = await getAlbumBody(path!);
+const descriptionHtml = parseInlineMarkdown(album.data.description || '');
+
+// Separate photos and videos for counts
+const photos = allMedia; // Keep all media for display
+const photoCount = allMedia.filter(m => !m.isVideo).length;
+const videoCount = allMedia.filter(m => m.isVideo).length;
+const hasVideos = videoCount > 0;
+
+const isCollection = album.data.isCollection || subAlbums.length > 0;
+
+// Check if album or any ancestor has password
+const hasPassword = !!album.data.password || ancestors.some(a => !!a.data.password);
+
+// Fetch cover photos for sub-albums
+const subAlbumsWithCovers = await Promise.all(
+  subAlbums.map(async (subAlbum) => {
+    const subAlbumPath = subAlbum.id.replace('/index.md', '');
+    const coverPhotoUrl = await getAlbumCoverPhoto(subAlbumPath, subAlbum.data.thumbnail);
+    return {
+      album: subAlbum,
+      coverPhotoUrl
+    };
+  })
+);
+---
+
+<Layout title={album.data.title}>
+  <div class="container">
+    <Breadcrumbs items={breadcrumbs} />
+
+    <div class="album-header">
+      <h1>{album.data.title}</h1>
+      {descriptionHtml && (
+        <p class="album-description" set:html={descriptionHtml} />
+      )}
+      {album.data.date && (
+        <p class="date">
+          {new Date(album.data.date).toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+          })}
+        </p>
+      )}
+      {album.data.tags && album.data.tags.length > 0 && (
+        <div class="tags">
+          {album.data.tags.map(tag => (
+            <span class="tag">{tag}</span>
+          ))}
+        </div>
+      )}
+      {bodyHtml && (
+        <article class="album-body prose" set:html={bodyHtml} />
+      )}
+    </div>
+
+    <div class="album-content" id="album-content"
+         data-has-password={hasPassword}
+         data-album-path={path}
+         data-album-token={album.data.token}
+         data-provided-token={providedToken}
+         data-allow-anonymous={album.data.allowAnonymous !== false}
+         data-album-has-password={!!album.data.password}
+         data-ancestors={JSON.stringify(ancestors.map(a => ({
+           path: a.id.replace('/index.md', ''),
+           token: a.data.token,
+           hasPassword: !!a.data.password,
+           title: a.data.title
+         })))}>
+      {hasPassword && (
+        <PasswordProtection albumPath={path!} />
+      )}
+      <div class="protected-content" style={hasPassword ? 'display: none;' : ''}>
+        {isCollection && subAlbums.length > 0 && (
+          <div class="section">
+            <h2>Albums</h2>
+            <AlbumGrid albums={subAlbumsWithCovers} />
+          </div>
+        )}
+
+        {photos.length > 0 && (
+          <div class="section">
+            <div class="section-header">
+              <div class="section-title-wrapper">
+                <h2>({photoCount}/{videoCount})</h2>
+                <div class="gallery-controls">
+                  <select id="sort-select" class="control-select" title="Sort photos" data-album-sort={album.data.sort}>
+                    <option value="date-oldest">Date (Oldest)</option>
+                    <option value="date-newest">Date (Newest)</option>
+                    <option value="exif-oldest">EXIF Date (Oldest)</option>
+                    <option value="exif-newest">EXIF Date (Newest)</option>
+                    <option value="name-asc">Name (A-Z)</option>
+                    <option value="name-desc">Name (Z-A)</option>
+                    <option value="size-largest">Size (Largest)</option>
+                    <option value="size-smallest">Size (Smallest)</option>
+                  </select>
+                  <select id="style-select" class="control-select" title="Display style" data-album-style={album.data.style}>
+                    <option value="grid">Grid</option>
+                    <option value="masonry">Masonry</option>
+                    <option value="single-column">Single Column</option>
+                  </select>
+                  {hasVideos && (
+                    <div class="media-filter" role="radiogroup" aria-label="Filter media type" data-video-count={videoCount}>
+                      <div class="media-filter-track">
+                        <div class="media-filter-indicator"></div>
+                      </div>
+                      <button class="media-filter-option active" role="radio" aria-checked="true" data-filter="photos">
+                        <span class="media-filter-label">Photos</span>
+                        <span class="media-filter-count" data-count="photos">{photoCount}</span>
+                      </button>
+                      <button class="media-filter-option" role="radio" aria-checked="false" data-filter="videos">
+                        <span class="media-filter-label">Videos</span>
+                        <span class="media-filter-count" data-count="videos">{videoCount}</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <button class="download-all" data-album-path={path}>
+                Download Album
+              </button>
+            </div>
+            <PhotoGrid photos={photos} style={album.data.style} albumPath={path!} />
+          </div>
+        )}
+
+        {subAlbums.length === 0 && photos.length === 0 && (
+          <p class="empty">This album is empty. Add photos to the folder: src/content/albums/{path}</p>
+        )}
+      </div>
+    </div>
+
+    <Footer />
+  </div>
+</Layout>
+
+<style>
+  .container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+  }
+
+  .album-header {
+    margin-bottom: 2rem;
+  }
+
+  h1 {
+    font-size: 2.5rem;
+    margin-bottom: 0.5rem;
+    color: #333;
+  }
+
+  /* Album Description: short, inline markdown */
+  .album-description {
+    margin: 0.75rem 0 1rem;
+    color: var(--color-text-secondary, #666);
+    font-size: 1.05rem;
+    line-height: 1.6;
+  }
+
+  .album-description :global(strong) {
+    font-weight: 600;
+    color: var(--color-text, #333);
+  }
+
+  .album-description :global(em) {
+    font-style: italic;
+  }
+
+  .album-description :global(a) {
+    color: var(--color-primary, #2563eb);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .album-description :global(a:hover) {
+    color: var(--color-hover, #1d4ed8);
+  }
+
+  /* Album Body: full article from body.md */
+  .album-body {
+    margin: 1.5rem 0 0;
+    padding: 1.5rem 0;
+    border-top: 1px solid var(--color-border, #e5e5e5);
+  }
+
+  /* Prose styles for markdown content */
+  .prose {
+    color: var(--color-text, #333);
+    line-height: 1.8;
+    max-width: 75ch;
+  }
+
+  .prose :global(h1),
+  .prose :global(h2),
+  .prose :global(h3),
+  .prose :global(h4) {
+    font-family: var(--font-heading, 'Syne', sans-serif);
+    font-weight: 600;
+    margin: 1.5em 0 0.75em;
+    color: var(--color-text, #333);
+  }
+
+  .prose :global(h1) { font-size: 1.75rem; }
+  .prose :global(h2) { font-size: 1.5rem; }
+  .prose :global(h3) { font-size: 1.25rem; }
+  .prose :global(h4) { font-size: 1.1rem; }
+
+  .prose :global(p) {
+    margin: 1em 0;
+  }
+
+  .prose :global(a) {
+    color: var(--color-primary, #2563eb);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .prose :global(a:hover) {
+    color: var(--color-hover, #1d4ed8);
+  }
+
+  .prose :global(ul),
+  .prose :global(ol) {
+    margin: 1em 0;
+    padding-left: 1.5em;
+  }
+
+  .prose :global(li) {
+    margin: 0.5em 0;
+  }
+
+  .prose :global(blockquote) {
+    border-left: 4px solid var(--color-primary, #2563eb);
+    padding: 0.5em 0 0.5em 1.5em;
+    margin: 1.5em 0;
+    background: rgba(0, 0, 0, 0.02);
+    font-style: italic;
+    color: var(--color-text-secondary, #666);
+  }
+
+  .prose :global(code) {
+    background: rgba(0, 0, 0, 0.05);
+    padding: 0.2em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+
+  .prose :global(pre) {
+    background: #f5f5f5;
+    padding: 1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 1.5em 0;
+  }
+
+  .prose :global(pre code) {
+    background: none;
+    padding: 0;
+  }
+
+  .prose :global(img) {
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    margin: 1em 0;
+  }
+
+  .prose :global(hr) {
+    border: none;
+    border-top: 1px solid var(--color-border, #e5e5e5);
+    margin: 2em 0;
+  }
+
+  .prose :global(strong) {
+    font-weight: 600;
+  }
+
+  .prose :global(em) {
+    font-style: italic;
+  }
+
+  .date {
+    color: #999;
+    font-size: 0.95rem;
+    margin-bottom: 1rem;
+  }
+
+  .tags {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .tag {
+    background: #e3f2fd;
+    color: #1976d2;
+    padding: 0.25rem 0.75rem;
+    border-radius: 16px;
+    font-size: 0.85rem;
+  }
+
+  .section {
+    margin-top: 3rem;
+  }
+
+  .section h2 {
+    font-size: 1.75rem;
+    margin-bottom: 1rem;
+    color: #444;
+  }
+
+  .section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+
+  .section-title-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 2rem;
+    flex-wrap: wrap;
+  }
+
+  .section-title-wrapper h2 {
+    margin: 0;
+  }
+
+  .gallery-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .control-select {
+    padding: 0.5rem 2rem 0.5rem 0.75rem;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background: white;
+    font-size: 0.9rem;
+    color: #333;
+    cursor: pointer;
+    transition: border-color 0.2s;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L6 6L11 1' stroke='%23666' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.5rem center;
+  }
+
+  .control-select:hover {
+    border-color: #999;
+  }
+
+  .control-select:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px rgba(25, 118, 210, 0.1);
+  }
+
+  /* Media Filter Toggle */
+  .media-filter {
+    --filter-height: 36px;
+    --filter-radius: 6px;
+    --filter-bg: #f5f5f5;
+    --filter-active-bg: #ffffff;
+    --filter-text: #666666;
+    --filter-text-active: #1a1a1a;
+    --filter-count: #999999;
+    --filter-count-active: #666666;
+    --filter-border: rgba(0, 0, 0, 0.08);
+    --filter-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.06);
+    --transition-duration: 0.25s;
+    --transition-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    height: var(--filter-height);
+    padding: 3px;
+    background: var(--filter-bg);
+    border-radius: var(--filter-radius);
+    gap: 2px;
+  }
+
+  .media-filter-track {
+    position: absolute;
+    inset: 3px;
+    pointer-events: none;
+    overflow: hidden;
+    border-radius: calc(var(--filter-radius) - 2px);
+  }
+
+  .media-filter-indicator {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: calc(100% / 2);
+    background: var(--filter-active-bg);
+    border-radius: calc(var(--filter-radius) - 2px);
+    box-shadow: var(--filter-shadow);
+    border: 1px solid var(--filter-border);
+    transition: transform var(--transition-duration) var(--transition-ease);
+    will-change: transform;
+  }
+
+  /* Photos is at position 0, no transform needed (default) */
+
+  .media-filter:has([data-filter="videos"].active) .media-filter-indicator {
+    transform: translateX(100%);
+  }
+
+  .media-filter-option {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35em;
+    height: 100%;
+    padding: 0 12px;
+    background: transparent;
+    border: none;
+    border-radius: calc(var(--filter-radius) - 2px);
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: var(--filter-text);
+    cursor: pointer;
+    transition: color var(--transition-duration) var(--transition-ease);
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+    min-width: 44px;
+  }
+
+  .media-filter-option:hover:not(.active) {
+    color: var(--filter-text-active);
+  }
+
+  .media-filter-option.active {
+    color: var(--filter-text-active);
+  }
+
+  .media-filter-option:focus-visible {
+    outline: 2px solid var(--color-primary, #2563eb);
+    outline-offset: 1px;
+  }
+
+  .media-filter-label {
+    transition: transform var(--transition-duration) var(--transition-ease);
+  }
+
+  .media-filter-option:active .media-filter-label {
+    transform: scale(0.97);
+  }
+
+  .media-filter-count {
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--filter-count);
+    opacity: 0.9;
+    transition: color var(--transition-duration) var(--transition-ease),
+                opacity var(--transition-duration) var(--transition-ease);
+  }
+
+  .media-filter-option.active .media-filter-count {
+    color: var(--filter-count-active);
+    opacity: 1;
+  }
+
+  .download-all {
+    background: var(--color-primary);
+    color: white;
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 6px;
+    font-size: 0.95rem;
+    transition: background 0.2s;
+  }
+
+  .download-all:hover {
+    background: var(--color-hover);
+  }
+
+  .empty {
+    padding: 3rem;
+    text-align: center;
+    color: #999;
+    background: #f5f5f5;
+    border-radius: 8px;
+  }
+
+  @media (max-width: 768px) {
+    h1 {
+      font-size: 1.75rem;
+    }
+
+    .section h2 {
+      font-size: 1.5rem;
+    }
+
+    .section-header {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+
+    .section-title-wrapper {
+      width: 100%;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+
+    .gallery-controls {
+      width: 100%;
+      gap: 0.5rem;
+    }
+
+    .control-select {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .gallery-controls {
+      flex-wrap: wrap;
+    }
+
+    .media-filter {
+      --filter-height: 40px;
+      width: 100%;
+      justify-content: center;
+    }
+
+    .media-filter-option {
+      flex: 1;
+      padding: 0 8px;
+      font-size: 0.8rem;
+    }
+
+    .media-filter-count {
+      font-size: 0.7rem;
+    }
+
+    .download-all {
+      width: 100%;
+    }
+  }
+
+  @media (max-width: 400px) {
+    .media-filter-count {
+      display: none;
+    }
+  }
+</style>
+
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    console.log('[AlbumPage] DOM loaded');
+
+    const albumContent = document.getElementById('album-content');
+    const hasPassword = albumContent?.dataset.hasPassword === 'true';
+    const albumPath = albumContent?.dataset.albumPath;
+    const albumToken = albumContent?.dataset.albumToken;
+    // Read token from URL (since page is prerendered, data attribute won't have it)
+    const urlParams = new URLSearchParams(window.location.search);
+    const providedToken = urlParams.get('token');
+    const allowAnonymous = albumContent?.dataset.allowAnonymous === 'true';
+    const albumHasPassword = albumContent?.dataset.albumHasPassword === 'true';
+    const ancestors = JSON.parse(albumContent?.dataset.ancestors || '[]');
+
+    console.log('[AlbumPage] Album:', albumPath, 'HasPassword:', hasPassword, 'AlbumHasPassword:', albumHasPassword, 'Token:', albumToken, 'ProvidedToken:', providedToken, 'AllowAnonymous:', allowAnonymous);
+
+    // Get unlocked tokens from session storage
+    const unlockedTokensJson = sessionStorage.getItem('unlocked-albums');
+    const unlockedTokens = unlockedTokensJson ? JSON.parse(unlockedTokensJson) : [];
+
+    console.log('[AlbumPage] Unlocked tokens:', unlockedTokens);
+
+    // Check if token-based access granted (either this album's token or any ancestor's token)
+    if (providedToken) {
+      // Check if token matches this album
+      if (providedToken === albumToken && allowAnonymous) {
+        console.log('[AlbumPage] Valid token provided for this album - granting access');
+        if (!unlockedTokens.includes(albumToken)) {
+          unlockedTokens.push(albumToken);
+          sessionStorage.setItem('unlocked-albums', JSON.stringify(unlockedTokens));
+        }
+        showProtectedContent();
+        return;
+      }
+
+      // Check if token matches any ancestor (parent token grants access to children)
+      for (const ancestor of ancestors) {
+        if (providedToken === ancestor.token) {
+          console.log('[AlbumPage] Valid ancestor token provided:', ancestor.title, '- granting access');
+          if (!unlockedTokens.includes(ancestor.token)) {
+            unlockedTokens.push(ancestor.token);
+            sessionStorage.setItem('unlocked-albums', JSON.stringify(unlockedTokens));
+          }
+          showProtectedContent();
+          return;
+        }
+      }
+    }
+
+    if (hasPassword && albumPath) {
+      // Check if current album token is unlocked
+      if (unlockedTokens.includes(albumToken)) {
+        console.log('[AlbumPage] Album token already unlocked');
+        showProtectedContent();
+        return;
+      }
+
+      // Check access: first this album, then ancestors
+      let hasBlockingAncestor = false;
+
+      // First: check if THIS album has a password that's not unlocked
+      if (albumHasPassword && !unlockedTokens.includes(albumToken)) {
+        hasBlockingAncestor = true;
+        console.log('[AlbumPage] Album has password, not unlocked');
+      } else {
+        // Then: check ancestors - stop at first unlocked one
+        for (const ancestor of ancestors) {
+          if (unlockedTokens.includes(ancestor.token)) {
+            console.log('[AlbumPage] Ancestor unlocked:', ancestor.title);
+            break;
+          }
+          if (ancestor.hasPassword) {
+            hasBlockingAncestor = true;
+            console.log('[AlbumPage] Blocked by ancestor:', ancestor.title);
+            break;
+          }
+        }
+      }
+
+      if (!hasBlockingAncestor) {
+        console.log('[AlbumPage] Access granted, showing content');
+        showProtectedContent();
+        return;
+      }
+    } else {
+      // No password protection
+      showProtectedContent();
+    }
+
+    function showProtectedContent() {
+      const passwordProtection = document.querySelector('.password-protection');
+      const protectedContent = document.querySelector('.protected-content');
+
+      if (passwordProtection) {
+        passwordProtection.remove();
+      }
+      if (protectedContent) {
+        protectedContent.style.display = 'block';
+      }
+
+      // Initialize sorting after content is visible
+      initializeSorting();
+    }
+
+    // Initialize sorting and display style functionality
+    function initializeSorting() {
+      const sortSelect = document.getElementById('sort-select') as HTMLSelectElement;
+      const styleSelect = document.getElementById('style-select') as HTMLSelectElement;
+      const photoGallery = document.getElementById('photo-gallery');
+
+      console.log('[AlbumPage] Initializing controls. Sort:', !!sortSelect, 'Style:', !!styleSelect, 'Gallery:', !!photoGallery);
+
+      if (sortSelect && photoGallery) {
+        // Map schema sort values to frontend sort values
+        const sortMapping: Record<string, string> = {
+          'date-desc': 'date-newest',
+          'date-asc': 'date-oldest',
+          'exif-desc': 'exif-newest',
+          'exif-asc': 'exif-oldest',
+          'name': 'name-asc',
+          'custom': 'name-asc'
+        };
+
+        // Get album's default sort from data attribute
+        const albumSort = sortSelect.dataset.albumSort || 'date-desc';
+        const defaultSort = sortMapping[albumSort] || 'date-oldest';
+
+        // Load saved sort preference or use album's default
+        const savedSort = localStorage.getItem('photo-sort-preference');
+
+        if (savedSort) {
+          sortSelect.value = savedSort;
+          console.log('[AlbumPage] Applying saved sort:', savedSort);
+          sortPhotos(savedSort);
+        } else {
+          sortSelect.value = defaultSort;
+          console.log('[AlbumPage] Applying album default sort:', defaultSort, '(from schema:', albumSort, ')');
+          sortPhotos(defaultSort);
+        }
+
+        sortSelect.addEventListener('change', (e) => {
+          const sortValue = (e.target as HTMLSelectElement).value;
+          console.log('[AlbumPage] Sort changed to:', sortValue);
+          localStorage.setItem('photo-sort-preference', sortValue);
+          sortPhotos(sortValue);
+        });
+
+        function sortPhotos(sortBy: string) {
+          const photoItems = Array.from(photoGallery.querySelectorAll('.photo-item'));
+          console.log('[AlbumPage] Sorting', photoItems.length, 'photos by:', sortBy);
+
+          if (photoItems.length === 0) {
+            console.warn('[AlbumPage] No photo items found to sort');
+            return;
+          }
+
+          photoItems.sort((a, b) => {
+            const filenameA = a.getAttribute('data-photo-filename') || '';
+            const filenameB = b.getAttribute('data-photo-filename') || '';
+
+            switch (sortBy) {
+              case 'name-asc':
+                return filenameA.localeCompare(filenameB);
+
+              case 'name-desc':
+                return filenameB.localeCompare(filenameA);
+
+              case 'date-newest':
+              case 'date-oldest': {
+                const dateA = parseInt(a.getAttribute('data-photo-mtime') || '0');
+                const dateB = parseInt(b.getAttribute('data-photo-mtime') || '0');
+                console.log('[AlbumPage] Comparing dates:', dateA, 'vs', dateB);
+                return sortBy === 'date-newest' ? dateB - dateA : dateA - dateB;
+              }
+
+              case 'exif-newest':
+              case 'exif-oldest': {
+                const exifA = parseInt(a.getAttribute('data-photo-exif-date') || '0');
+                const exifB = parseInt(b.getAttribute('data-photo-exif-date') || '0');
+                // Photos without EXIF date (0) should sort to the end
+                if (exifA === 0 && exifB === 0) return 0;
+                if (exifA === 0) return 1;  // a has no EXIF, sort to end
+                if (exifB === 0) return -1; // b has no EXIF, sort to end
+                console.log('[AlbumPage] Comparing EXIF dates:', exifA, 'vs', exifB);
+                return sortBy === 'exif-newest' ? exifB - exifA : exifA - exifB;
+              }
+
+              case 'size-largest':
+              case 'size-smallest': {
+                const sizeA = parseInt(a.getAttribute('data-photo-size') || '0');
+                const sizeB = parseInt(b.getAttribute('data-photo-size') || '0');
+                console.log('[AlbumPage] Comparing sizes:', sizeA, 'vs', sizeB);
+                return sortBy === 'size-largest' ? sizeB - sizeA : sizeA - sizeB;
+              }
+
+              default:
+                return 0;
+            }
+          });
+
+          // Reorder DOM elements
+          photoItems.forEach(item => photoGallery.appendChild(item));
+
+          console.log('[AlbumPage] Photos sorted successfully');
+        }
+      }
+
+      // Initialize display style
+      if (styleSelect && photoGallery) {
+        const albumStyle = styleSelect.dataset.albumStyle || 'grid';
+        const savedStyle = localStorage.getItem('photo-display-style');
+
+        // Use saved style or fall back to album's configured style
+        const currentStyle = savedStyle || albumStyle;
+        styleSelect.value = currentStyle;
+        applyDisplayStyle(currentStyle);
+
+        console.log('[AlbumPage] Display style initialized:', currentStyle);
+
+        styleSelect.addEventListener('change', (e) => {
+          const styleValue = (e.target as HTMLSelectElement).value;
+          console.log('[AlbumPage] Display style changed to:', styleValue);
+          localStorage.setItem('photo-display-style', styleValue);
+          applyDisplayStyle(styleValue);
+        });
+
+        function applyDisplayStyle(style: string) {
+          // Remove all style classes
+          photoGallery.classList.remove('photo-grid-grid', 'photo-grid-masonry', 'photo-grid-slideshow', 'photo-grid-single-column');
+          // Add the new style class
+          photoGallery.classList.add(`photo-grid-${style}`);
+          console.log('[AlbumPage] Applied display style:', style);
+        }
+      }
+
+      // Initialize media filter
+      initMediaFilter();
+    }
+
+    // Media Filter Toggle
+    function initMediaFilter() {
+      const filter = document.querySelector('.media-filter') as HTMLElement;
+      if (!filter) return;
+
+      const options = filter.querySelectorAll('.media-filter-option');
+      const gallery = document.getElementById('photo-gallery');
+      const styleSelect = document.getElementById('style-select') as HTMLSelectElement;
+
+      console.log('[MediaFilter] Initializing media filter');
+
+      // Filter items (photos or videos only, no 'all' option)
+      function filterItems(filterType: string) {
+        const items = gallery?.querySelectorAll('.photo-item') || [];
+
+        items.forEach(item => {
+          const isVideo = (item as HTMLElement).dataset.isVideo === 'true';
+
+          if (filterType === 'videos') {
+            (item as HTMLElement).style.display = isVideo ? '' : 'none';
+          } else {
+            // Default to photos filter
+            (item as HTMLElement).style.display = isVideo ? 'none' : '';
+          }
+        });
+
+        // Auto-switch to single-column for videos only
+        if (filterType === 'videos' && styleSelect) {
+          styleSelect.value = 'single-column';
+          styleSelect.dispatchEvent(new Event('change'));
+        }
+      }
+
+      // Handle option clicks
+      options.forEach(option => {
+        option.addEventListener('click', () => {
+          // Update active states
+          options.forEach(opt => {
+            opt.classList.remove('active');
+            opt.setAttribute('aria-checked', 'false');
+          });
+          option.classList.add('active');
+          option.setAttribute('aria-checked', 'true');
+
+          // Apply filter
+          const filterType = (option as HTMLElement).dataset.filter || 'all';
+          filterItems(filterType);
+
+          // Store preference
+          localStorage.setItem('photo-media-filter', filterType);
+
+          console.log('[MediaFilter] Filter changed to:', filterType);
+        });
+      });
+
+      // Keyboard navigation
+      filter.addEventListener('keydown', (e) => {
+        const currentOption = filter.querySelector('.media-filter-option.active');
+        const optionsArray = Array.from(options);
+        const currentIndex = currentOption ? optionsArray.indexOf(currentOption) : 0;
+
+        let newIndex = currentIndex;
+
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          newIndex = (currentIndex + 1) % optionsArray.length;
+        } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          newIndex = (currentIndex - 1 + optionsArray.length) % optionsArray.length;
+        }
+
+        if (newIndex !== currentIndex) {
+          (optionsArray[newIndex] as HTMLElement).click();
+          (optionsArray[newIndex] as HTMLElement).focus();
+        }
+      });
+
+      // Restore saved filter or default to 'photos'
+      const savedFilter = localStorage.getItem('photo-media-filter');
+      // Only restore 'videos' filter; otherwise default to 'photos'
+      if (savedFilter === 'videos') {
+        const savedOption = filter.querySelector(`[data-filter="videos"]`) as HTMLElement;
+        if (savedOption) {
+          savedOption.click();
+        }
+      } else {
+        // Apply photos filter on page load (hide videos by default)
+        filterItems('photos');
+        localStorage.setItem('photo-media-filter', 'photos');
+      }
+
+      console.log('[MediaFilter] Media filter initialized');
+    }
+
+    // If no password protection, initialize sorting immediately
+    if (!hasPassword) {
+      initializeSorting();
+    }
+
+    const downloadBtn = document.querySelector('.download-all');
+
+    downloadBtn?.addEventListener('click', async (e) => {
+      const albumPath = (e.target as HTMLElement).dataset.albumPath;
+      const btn = e.target as HTMLButtonElement;
+      const originalText = btn.textContent;
+
+      btn.disabled = true;
+      btn.textContent = 'Preparing download...';
+
+      try {
+        // Build headers - include token for password-protected albums
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (albumToken) {
+          headers['X-Album-Token'] = albumToken;
+        }
+
+        const response = await fetch('/api/download-album', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ albumPath })
+        });
+
+        if (!response.ok) {
+          throw new Error('Download failed');
+        }
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${albumPath?.split('/').pop() || 'album'}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+
+        btn.textContent = originalText;
+        btn.disabled = false;
+      } catch (error) {
+        console.error('Download error:', error);
+        btn.textContent = 'Download failed';
+        setTimeout(() => {
+          btn.textContent = originalText;
+          btn.disabled = false;
+        }, 2000);
+      }
+    });
+  });
+</script>

@@ -2,6 +2,7 @@ import type { APIRoute } from 'astro';
 import JSZip from 'jszip';
 import fs from 'fs/promises';
 import path from 'path';
+import { getAlbumByPath } from '../../lib/albums';
 
 export const prerender = false;
 
@@ -24,12 +25,32 @@ export const POST: APIRoute = async ({ request }) => {
       });
     }
 
+    // SECURITY: Check album access control
+    const album = await getAlbumByPath(albumPath);
+    if (!album) {
+      return new Response(JSON.stringify({ error: 'Album not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // If album is password-protected, require valid token
+    if (album.data.password) {
+      const providedToken = request.headers.get('X-Album-Token');
+      if (providedToken !== album.data.token) {
+        return new Response(JSON.stringify({ error: 'Unauthorized - album is password protected' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
     const albumDir = path.join(process.cwd(), 'src/content/albums', albumPath);
 
     try {
       await fs.access(albumDir);
     } catch {
-      return new Response(JSON.stringify({ error: 'Album not found' }), {
+      return new Response(JSON.stringify({ error: 'Album directory not found' }), {
         status: 404,
         headers: { 'Content-Type': 'application/json' }
       });
