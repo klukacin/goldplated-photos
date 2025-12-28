@@ -5,9 +5,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development Commands
 
 ```bash
-npm run dev      # Start dev server (port 4321, or 4322/4323 if in use)
-npm run build    # Build production site to ./dist/
-npm run preview  # Preview production build locally
+# Development
+npm run dev          # Start dev server (foreground, port 4321)
+npm run dev:bg       # Start dev server in background
+npm run stop:dev     # Stop background dev server
+
+# Admin Panel (local content management)
+npm run admin        # Start admin panel (foreground, port 4444)
+npm run admin:bg     # Start admin panel in background
+npm run stop:admin   # Stop background admin panel
+
+# Build & Deploy
+npm run build        # Build production site to ./dist/
+npm run preview      # Preview production build locally
+npm run deploy       # Full deployment to production server
+
+# Maintenance
+npm run update       # Normalize album structure (auto-create index.md)
+```
+
+### Recommended Development Setup
+
+```bash
+# Start both servers
+npm run dev:bg
+npm run admin:bg
+
+# Work in browser
+# Admin: http://localhost:4444
+# Gallery: http://localhost:4321
+
+# Stop when done
+npm run stop:dev
+npm run stop:admin
 ```
 
 ## Site Structure
@@ -307,6 +337,78 @@ CSS Grid with `grid-template-columns: repeat(3, 1fr)` ensures true left-to-right
 - All interactive elements ≥44x44px (WCAG requirement)
 - Slider dots use `::before` pseudo-element for expanded tap area
 
+## Admin Panel
+
+A local-only web-based CMS for content management. **Never deployed to production.**
+
+**Location:** `admin/` directory
+**Server:** Express.js on port 4444
+**Frontend:** Vanilla JS + CodeMirror markdown editor
+
+### Tabs
+
+| Tab | Purpose |
+|-----|---------|
+| **Albums** | Create/edit albums, upload photos/videos, manage settings |
+| **Home** | Edit landing background, hero slider, intro text, content cards |
+| **Tools** | Thumbnail cache management, quick links |
+
+### Admin API Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/api/albums`, `/api/albums/*path` | Album CRUD |
+| `/api/photos/*path` | Photo upload/delete |
+| `/api/videos/*path` | Video upload/delete |
+| `/api/home/intro` | Intro text |
+| `/api/home/cards` | Content cards CRUD |
+| `/api/assets/hero`, `/api/assets/cards` | Asset management |
+| `/api/cache/stats`, `/api/cache/thumbnails` | Cache management |
+
+### Data Flow
+
+```
+Admin Panel (browser) → Admin API (:4444) → File System → Dev Server (:4321)
+```
+
+Changes made in admin are saved directly to `src/content/` and `public/`, then auto-reloaded by dev server.
+
+## Deployment Workflow
+
+**Workflow:** Develop locally with admin panel → `npm run deploy` → Production server
+
+```
+LOCAL                           PRODUCTION
+┌─────────────┐                ┌─────────────┐
+│ Admin :4444 │                │             │
+│     ↓       │  npm deploy    │ Node.js +   │
+│ Dev :4321   │ ──────────────→│ PM2         │
+└─────────────┘                └─────────────┘
+```
+
+**Key Points:**
+- Admin panel is LOCAL ONLY (never deployed)
+- Local content is source of truth (rsync uses `--delete`)
+- `npm run deploy` handles: build → fix paths → rsync → PM2 restart
+
+### Deploy Script (scripts/deploy.sh)
+
+1. `npm run build` - Build production site
+2. Fix paths for production server
+3. rsync files to remote (with `--delete` for albums)
+4. Create symlinks on server
+5. `npm install --production` on remote
+6. `pm2 restart` on remote
+
+### Configuration
+
+Edit `scripts/deploy.sh`:
+```bash
+REMOTE_USER="username"
+REMOTE_HOST="server.com"
+REMOTE_ROOT="/path/to/public_html"
+```
+
 ## Key Files
 
 **Pages:**
@@ -340,6 +442,18 @@ CSS Grid with `grid-template-columns: repeat(3, 1fr)` ensures true left-to-right
 - `public/sounds/shutter.mp3` - Shutter button sound
 - `public/home/hero/*.jpg` - Hero slider images
 - `public/home/cards/*.jpg` - Content card images
+
+**Admin Panel:**
+- `admin/server.js` - Express.js admin API server
+- `admin/index.html` - Admin panel frontend (single page)
+- `admin/js/` - Admin panel JavaScript modules
+
+**Scripts:**
+- `scripts/deploy.sh` - Production deployment script
+- `scripts/start-dev.sh` / `stop-dev.sh` - Dev server background control
+- `scripts/start-admin.sh` / `stop-admin.sh` - Admin server background control
+- `scripts/update-albums.mjs` - Album structure normalization
+- `scripts/fix-server-paths.mjs` - Production path fixer
 
 ## Important Patterns
 
@@ -439,3 +553,9 @@ const renderedCards = await Promise.all(
 **Protected album showing content unexpectedly:** Clear `album-access` cookie. Verify `prerender = false` in `[...path].astro`. Check that access verification runs before content fetch in frontmatter.
 
 **Download album failing on protected content:** Ensure `X-Album-Token` header is sent with the request. Check browser DevTools Network tab for 401 errors.
+
+**Admin panel won't start:** Check if port 4444 is in use (`lsof -i :4444`). Run `npm run admin` in foreground to see errors.
+
+**Admin changes not showing in gallery:** Ensure dev server is running (`npm run dev`). Hard refresh browser (Cmd+Shift+R).
+
+**Deploy failing:** Check SSH key access to server. Verify `REMOTE_USER`, `REMOTE_HOST`, `REMOTE_ROOT` in `scripts/deploy.sh`. Ensure PM2 and Node.js are installed on server.
