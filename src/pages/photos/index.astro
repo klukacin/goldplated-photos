@@ -1,0 +1,442 @@
+---
+export const prerender = true;
+
+import { getSubAlbums, getAlbumCoverPhoto } from '../../lib/albums';
+import Layout from '../../layouts/Layout.astro';
+import SEO from '../../components/SEO.astro';
+import AlbumGrid from '../../components/AlbumGrid.astro';
+import Footer from '../../components/Footer.astro';
+import { siteConfig } from '../../config';
+
+const rootAlbums = await getSubAlbums('');
+
+// Separate public (no password) and locked (has password) albums
+const publicAlbums = rootAlbums.filter(a => !a.data.password);
+const lockedAlbums = rootAlbums.filter(a => !!a.data.password);
+
+// Fetch cover photos for public albums
+const publicAlbumsWithCovers = await Promise.all(
+  publicAlbums.map(async (album) => {
+    const albumPath = album.id.replace('/index.md', '');
+    const coverPhotoUrl = await getAlbumCoverPhoto(albumPath, album.data.thumbnail);
+    return {
+      album,
+      coverPhotoUrl
+    };
+  })
+);
+
+// Fetch cover photos for locked albums
+const lockedAlbumsWithCovers = await Promise.all(
+  lockedAlbums.map(async (album) => {
+    const albumPath = album.id.replace('/index.md', '');
+    const coverPhotoUrl = await getAlbumCoverPhoto(albumPath, album.data.thumbnail);
+    return {
+      album,
+      coverPhotoUrl
+    };
+  })
+);
+
+// Count for toggle labels
+const publicCount = publicAlbums.length;
+const lockedCount = lockedAlbums.length;
+
+// OG image: use first public album's cover photo
+let ogImage = siteConfig.defaultOgImage;
+if (publicAlbumsWithCovers.length > 0 && publicAlbumsWithCovers[0].coverPhotoUrl) {
+  const coverPath = publicAlbumsWithCovers[0].coverPhotoUrl.replace('/albums/', '');
+  ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+}
+---
+
+<Layout title="Photo Gallery">
+  <SEO
+    slot="head"
+    title="Photo Gallery"
+    description="Browse photography collections by Kristijan Lukačin"
+    image={ogImage}
+    imageWidth={1920}
+    imageHeight={1280}
+  />
+  <div class="container">
+    <!-- Breadcrumb row with filter toggle -->
+    <div class="nav-row">
+      <nav class="breadcrumbs" aria-label="Breadcrumb">
+        <ol>
+          <li>
+            <a href="/home">Home</a>
+            <span class="separator">/</span>
+          </li>
+          <li>
+            <span class="current">Photos</span>
+          </li>
+        </ol>
+      </nav>
+
+      {lockedCount > 0 && (
+        <div class="visibility-toggle" role="tablist" aria-label="Album visibility">
+          <button
+            class="toggle-btn active"
+            data-filter="public"
+            role="tab"
+            aria-selected="true"
+          >
+            Public
+            <span class="count">{publicCount}</span>
+          </button>
+          <button
+            class="toggle-btn"
+            data-filter="locked"
+            role="tab"
+            aria-selected="false"
+          >
+            Locked
+            <span class="count">{lockedCount}</span>
+          </button>
+        </div>
+      )}
+    </div>
+
+    <div class="gallery-header">
+      <h1>Photo Gallery</h1>
+      <select id="album-sort" class="control-select" title="Sort albums">
+        <option value="custom">Custom Order</option>
+        <option value="name-asc">Name (A-Z)</option>
+        <option value="name-desc">Name (Z-A)</option>
+        <option value="date-newest">Date (Newest)</option>
+        <option value="date-oldest">Date (Oldest)</option>
+      </select>
+    </div>
+
+    <div id="album-grid" data-view="public">
+      <AlbumGrid albums={publicAlbumsWithCovers} />
+    </div>
+
+    {lockedCount > 0 && (
+      <div id="locked-grid" data-view="locked" style="display: none;">
+        <AlbumGrid albums={lockedAlbumsWithCovers} />
+      </div>
+    )}
+
+    <Footer />
+  </div>
+</Layout>
+
+<style>
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+  }
+
+  /* Navigation row with breadcrumbs and toggle */
+  .nav-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--color-border, #e5e5e5);
+    margin-bottom: 1.5rem;
+    gap: 1rem;
+  }
+
+  /* Breadcrumbs - matching existing style */
+  .breadcrumbs ol {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin: 0;
+    padding: 0;
+  }
+
+  .breadcrumbs li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .breadcrumbs a {
+    color: var(--color-primary, #333);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+
+  .breadcrumbs a:hover {
+    color: var(--color-hover, #000);
+    text-decoration: underline;
+  }
+
+  .breadcrumbs .separator {
+    color: #999;
+    user-select: none;
+  }
+
+  .breadcrumbs .current {
+    color: #666;
+    font-weight: 500;
+  }
+
+  /* Visibility toggle - refined minimalist */
+  .visibility-toggle {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    background: transparent;
+    border: 1px solid var(--color-border, #ddd);
+    border-radius: 6px;
+    padding: 3px;
+  }
+
+  .toggle-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.75rem;
+    border: none;
+    background: transparent;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    color: #888;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    min-height: 36px;
+    font-weight: 450;
+    letter-spacing: -0.01em;
+  }
+
+  .toggle-btn:hover {
+    color: #555;
+    background: rgba(0,0,0,0.03);
+  }
+
+  .toggle-btn.active {
+    background: #333;
+    color: #fff;
+  }
+
+  .toggle-btn.active:hover {
+    background: #222;
+    color: #fff;
+  }
+
+  .toggle-btn .count {
+    font-size: 0.75rem;
+    font-weight: 500;
+    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .toggle-btn.active .count {
+    opacity: 0.85;
+  }
+
+  /* Gallery header */
+  .gallery-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    gap: 1rem;
+  }
+
+  .gallery-header h1 {
+    font-size: 2rem;
+    font-weight: 600;
+    color: #1a1a1a;
+    letter-spacing: -0.02em;
+  }
+
+  /* Sort dropdown */
+  .control-select {
+    padding: 0.5rem 2rem 0.5rem 0.75rem;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background: white;
+    font-size: 0.9rem;
+    color: #333;
+    cursor: pointer;
+    transition: border-color 0.2s;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L6 6L11 1' stroke='%23666' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.5rem center;
+  }
+
+  .control-select:hover {
+    border-color: #999;
+  }
+
+  .control-select:focus {
+    outline: none;
+    border-color: var(--color-primary, #2563eb);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+  }
+
+  /* Grid transitions */
+  #album-grid,
+  #locked-grid {
+    opacity: 1;
+    transition: opacity 0.15s ease;
+  }
+
+  #album-grid.hidden,
+  #locked-grid.hidden {
+    display: none;
+  }
+
+  @media (max-width: 768px) {
+    .nav-row {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 0.75rem;
+    }
+
+    .visibility-toggle {
+      align-self: flex-start;
+    }
+
+    .toggle-btn {
+      min-height: 44px;
+      padding: 0.5rem 1rem;
+    }
+
+    .breadcrumbs {
+      font-size: 0.9rem;
+    }
+
+    .gallery-header {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .gallery-header h1 {
+      font-size: 1.5rem;
+    }
+
+    .control-select {
+      width: 100%;
+      min-height: 44px;
+    }
+  }
+</style>
+
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const toggleBtns = document.querySelectorAll('.toggle-btn');
+    const publicGrid = document.getElementById('album-grid');
+    const lockedGrid = document.getElementById('locked-grid');
+    const sortSelect = document.getElementById('album-sort') as HTMLSelectElement;
+
+    // ============ Visibility Toggle ============
+    if (toggleBtns.length > 0) {
+      // Load saved preference
+      const savedFilter = localStorage.getItem('photoGallery_viewFilter') || 'public';
+      applyFilter(savedFilter);
+
+      // Set initial active state
+      toggleBtns.forEach(btn => {
+        if (btn.getAttribute('data-filter') === savedFilter) {
+          btn.classList.add('active');
+          btn.setAttribute('aria-selected', 'true');
+        } else {
+          btn.classList.remove('active');
+          btn.setAttribute('aria-selected', 'false');
+        }
+      });
+
+      toggleBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          const filter = btn.getAttribute('data-filter');
+
+          // Update active states
+          toggleBtns.forEach(b => {
+            b.classList.remove('active');
+            b.setAttribute('aria-selected', 'false');
+          });
+          btn.classList.add('active');
+          btn.setAttribute('aria-selected', 'true');
+
+          // Apply filter
+          applyFilter(filter);
+
+          // Save preference
+          localStorage.setItem('photoGallery_viewFilter', filter);
+        });
+      });
+    }
+
+    function applyFilter(filter: string | null) {
+      if (filter === 'public') {
+        if (publicGrid) publicGrid.style.display = '';
+        if (lockedGrid) lockedGrid.style.display = 'none';
+      } else {
+        if (publicGrid) publicGrid.style.display = 'none';
+        if (lockedGrid) lockedGrid.style.display = '';
+      }
+    }
+
+    // ============ Album Sorting ============
+    if (sortSelect) {
+      // Load saved sort preference
+      const savedSort = localStorage.getItem('photoGallery_albumSort') || 'custom';
+      sortSelect.value = savedSort;
+      applySorting(savedSort);
+
+      sortSelect.addEventListener('change', () => {
+        const sortValue = sortSelect.value;
+        applySorting(sortValue);
+        localStorage.setItem('photoGallery_albumSort', sortValue);
+      });
+    }
+
+    function applySorting(sortBy: string) {
+      // Sort both grids
+      [publicGrid, lockedGrid].forEach(grid => {
+        if (!grid) return;
+        const albumGrid = grid.querySelector('.album-grid');
+        if (!albumGrid) return;
+
+        const cards = Array.from(albumGrid.querySelectorAll('.album-card')) as HTMLElement[];
+
+        cards.sort((a, b) => {
+          const titleA = a.dataset.title || '';
+          const titleB = b.dataset.title || '';
+          const dateA = parseInt(a.dataset.date || '0', 10);
+          const dateB = parseInt(b.dataset.date || '0', 10);
+          const orderA = parseInt(a.dataset.order || '999', 10);
+          const orderB = parseInt(b.dataset.order || '999', 10);
+
+          switch (sortBy) {
+            case 'name-asc':
+              return titleA.localeCompare(titleB);
+            case 'name-desc':
+              return titleB.localeCompare(titleA);
+            case 'date-newest':
+              // Albums without dates go to the end
+              if (!dateA && !dateB) return 0;
+              if (!dateA) return 1;
+              if (!dateB) return -1;
+              return dateB - dateA;
+            case 'date-oldest':
+              // Albums without dates go to the end
+              if (!dateA && !dateB) return 0;
+              if (!dateA) return 1;
+              if (!dateB) return -1;
+              return dateA - dateB;
+            case 'custom':
+            default:
+              // Sort by order field, then by title
+              if (orderA !== orderB) return orderA - orderB;
+              return titleA.localeCompare(titleB);
+          }
+        });
+
+        // Re-append in sorted order
+        cards.forEach(card => albumGrid.appendChild(card));
+      });
+    }
+  });
+</script>

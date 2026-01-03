@@ -10,12 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 **Core Features**
-- Photo grid with multiple view modes (grid, masonry, single-column)
+- Photo grid with multiple view modes (grid, masonry, single-column, slideshow)
 - PhotoSwipe lightbox integration with touch gestures
 - Server-side password protection using SSR
 - EXIF metadata display for photos
 - Video playback support with metadata extraction
 - Thumbnail generation system with three size presets (400px, 1200px, 1920px)
+- Landing page with animated shutter button and sound effect
+- Digital home with hero slider and content cards
 
 **Gallery Experience**
 - Keyboard navigation with spatial awareness
@@ -42,12 +44,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Custom cover photo selection
 - Album ordering and visibility controls
 - Home page with hero slider and content cards
+- Local admin panel (web-based CMS on port 4444)
+- Album download as ZIP files
+
+**Social Sharing**
+- Open Graph meta tags for rich social previews
+- Twitter Card meta tags
+- Individual photo sharing via URL parameter
+
+**Deployment**
+- One-command production deployment (`npm run deploy`)
+- rsync-based file synchronization
+- PM2 process management integration
+- Background server scripts
 
 **Documentation**
 - Comprehensive MkDocs documentation
 - API endpoint reference
 - Keyboard shortcuts reference
 - Troubleshooting guide
+- CLAUDE.md for AI-assisted development
 
 ### Security Notes
 
@@ -61,9 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Features planned for future releases:
 
-- [ ] Image upload interface
+- [ ] Search functionality across albums
 - [ ] Bulk album operations
-- [ ] Search functionality
-- [ ] Social sharing integration
 - [ ] Print-ready exports
-- [ ] Multi-language support
+- [ ] Multi-language support (i18n)
+- [ ] Guest book / comments
+- [ ] Photo watermarking

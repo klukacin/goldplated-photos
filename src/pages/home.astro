@@ -1,0 +1,636 @@
+---
+export const prerender = true;
+
+import { getCollection } from 'astro:content';
+import Layout from '../layouts/Layout.astro';
+import SEO from '../components/SEO.astro';
+import Footer from '../components/Footer.astro';
+import { readdirSync, existsSync } from 'fs';
+import { join } from 'path';
+
+// Get home page content
+const homeContent = await getCollection('home');
+const introBlock = homeContent.find(item => item.data.type === 'intro');
+const cardBlocks = homeContent
+  .filter(item => item.data.type === 'card')
+  .sort((a, b) => (a.data.order || 0) - (b.data.order || 0));
+
+// Pre-render card content
+const renderedCards = await Promise.all(
+  cardBlocks.map(async (card) => ({
+    ...card,
+    RenderedContent: (await card.render()).Content
+  }))
+);
+
+// Pre-render intro content
+const IntroContent = introBlock ? (await introBlock.render()).Content : null;
+
+// Hero images - dynamically load from public/home/hero/
+const heroDir = join(process.cwd(), 'public/home/hero');
+const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+let heroImages: string[] = [];
+
+if (existsSync(heroDir)) {
+  heroImages = readdirSync(heroDir)
+    .filter(f => imageExtensions.some(ext => f.toLowerCase().endsWith(ext)))
+    .map(f => `/home/hero/${f}`);
+}
+
+const totalSlides = heroImages.length;
+
+// OG image: use first hero image, fallback to landing background
+const ogImage = heroImages.length > 0 ? heroImages[0] : '/images/landing-bg.jpg';
+---
+
+<Layout title="Digital Home - Kristijan Lukačin">
+  <SEO
+    slot="head"
+    title="Digital Home"
+    description="Welcome to my digital archives - Photography portfolio by Kristijan Lukačin"
+    image={ogImage}
+    imageWidth={1920}
+    imageHeight={1080}
+  />
+
+  <!-- Skip Link for Accessibility -->
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+
+  <div class="digital-home">
+    <!-- Page Header -->
+    <header class="page-header">
+      <div class="header-content">
+        <div class="title-block">
+          <h1 class="title">
+            <span class="title-line">Digital</span>
+            <span class="title-line">Home</span>
+          </h1>
+          <span class="signature">by Kristijan Lukačin</span>
+        </div>
+        <p class="tagline">Welcome to my digital archives</p>
+      </div>
+    </header>
+
+    <!-- Hero Slider - Accessible Carousel -->
+    {heroImages.length > 0 && (
+      <section
+        class="hero-slider"
+        role="region"
+        aria-roledescription="carousel"
+        aria-label="Featured photographs"
+      >
+        <div class="slider-viewport" id="slider">
+          {heroImages.map((img, index) => (
+            <div
+              class:list={['slide', index === 0 && 'active']}
+              role="group"
+              aria-roledescription="slide"
+              aria-label={`Photo ${index + 1} of ${totalSlides}`}
+              aria-hidden={index !== 0 ? 'true' : 'false'}
+            >
+              <img src={img} alt="" loading={index === 0 ? 'eager' : 'lazy'} />
+            </div>
+          ))}
+        </div>
+
+        {heroImages.length > 1 && (
+          <>
+            <div class="slider-dots" role="tablist" aria-label="Slide navigation">
+              {heroImages.map((_, index) => (
+                <button
+                  class:list={['dot', index === 0 && 'active']}
+                  role="tab"
+                  aria-selected={index === 0 ? 'true' : 'false'}
+                  aria-label={`Go to slide ${index + 1}`}
+                  data-index={index}
+                  tabindex={index === 0 ? 0 : -1}
+                  type="button"
+                ></button>
+              ))}
+            </div>
+
+            <!-- Live region for screen reader announcements -->
+            <div aria-live="polite" aria-atomic="true" class="sr-only" id="slide-announcement">
+              Slide 1 of {totalSlides}
+            </div>
+          </>
+        )}
+      </section>
+    )}
+
+    <!-- Main Content -->
+    <main id="main-content">
+      <!-- Intro Text Block -->
+      {IntroContent && (
+        <section class="intro-block" aria-labelledby="intro-heading">
+          <h2 id="intro-heading" class="sr-only">About</h2>
+          <div class="container-narrow">
+            <div class="intro-content">
+              <IntroContent />
+            </div>
+          </div>
+        </section>
+      )}
+
+      <!-- Card Blocks -->
+      <section class="cards-section" aria-labelledby="portfolio-heading">
+        <h2 id="portfolio-heading" class="sr-only">Photography Portfolio</h2>
+        <div class="container-wide">
+          {renderedCards.map((card, index) => (
+            <article
+              class:list={['card-block', `image-${card.data.imagePosition || 'left'}`]}
+              style={`--animation-delay: ${index * 100}ms`}
+            >
+              <div class="card-image">
+                {card.data.image && (
+                  <img
+                    src={card.data.image}
+                    alt={card.data.title ? `Preview of ${card.data.title} collection` : ''}
+                    loading="lazy"
+                  />
+                )}
+              </div>
+              <div class="card-content">
+                <h3 class="card-title">{card.data.title}</h3>
+                <div class="card-body">
+                  <card.RenderedContent />
+                </div>
+                {card.data.link && (
+                  <a href={card.data.link} class="card-link">
+                    <span>View Album</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                      <line x1="5" y1="12" x2="19" y2="12"></line>
+                      <polyline points="12 5 19 12 12 19"></polyline>
+                    </svg>
+                  </a>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+    </main>
+
+    <Footer />
+  </div>
+
+  <script>
+    // Accessible Hero Slider
+    class AccessibleSlider {
+      private element: HTMLElement;
+      private slides: NodeListOf<Element>;
+      private dots: NodeListOf<HTMLButtonElement>;
+      private announcement: HTMLElement | null;
+      private currentSlide: number = 0;
+      private autoAdvanceTimer: ReturnType<typeof setInterval> | null = null;
+      private reducedMotion: boolean;
+      private totalSlides: number;
+
+      constructor(element: HTMLElement) {
+        this.element = element;
+        this.slides = element.querySelectorAll('.slide');
+        this.dots = element.querySelectorAll('.dot');
+        this.announcement = document.getElementById('slide-announcement');
+        this.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        this.totalSlides = this.slides.length;
+
+        if (this.totalSlides > 1) {
+          this.init();
+        }
+      }
+
+      private init(): void {
+
+        // Dot navigation
+        this.dots.forEach((dot, index) => {
+          dot.addEventListener('click', () => this.goToSlide(index));
+        });
+
+        // Keyboard navigation
+        this.element.addEventListener('keydown', (e: KeyboardEvent) => {
+          switch (e.key) {
+            case 'ArrowLeft':
+              e.preventDefault();
+              this.prev();
+              break;
+            case 'ArrowRight':
+              e.preventDefault();
+              this.next();
+              break;
+          }
+        });
+
+        // Pause on hover
+        this.element.addEventListener('mouseenter', () => {
+          this.clearAutoAdvance();
+        });
+        this.element.addEventListener('mouseleave', () => {
+          this.startAutoAdvance();
+        });
+
+        // Pause on focus within
+        this.element.addEventListener('focusin', () => {
+          this.clearAutoAdvance();
+        });
+        this.element.addEventListener('focusout', (e: FocusEvent) => {
+          if (!this.element.contains(e.relatedTarget as Node)) {
+            this.startAutoAdvance();
+          }
+        });
+
+        // Start auto-advance (unless reduced motion is preferred)
+        if (!this.reducedMotion) {
+          this.startAutoAdvance();
+        }
+      }
+
+      private goToSlide(index: number): void {
+        // Update slides
+        this.slides.forEach((slide, i) => {
+          slide.classList.toggle('active', i === index);
+          slide.setAttribute('aria-hidden', i !== index ? 'true' : 'false');
+        });
+
+        // Update dots
+        this.dots.forEach((dot, i) => {
+          dot.classList.toggle('active', i === index);
+          dot.setAttribute('aria-selected', i === index ? 'true' : 'false');
+          dot.setAttribute('tabindex', i === index ? '0' : '-1');
+        });
+
+        // Announce to screen readers
+        if (this.announcement) {
+          this.announcement.textContent = `Slide ${index + 1} of ${this.totalSlides}`;
+        }
+
+        this.currentSlide = index;
+      }
+
+      private prev(): void {
+        const newIndex = (this.currentSlide - 1 + this.totalSlides) % this.totalSlides;
+        this.goToSlide(newIndex);
+      }
+
+      private next(): void {
+        const newIndex = (this.currentSlide + 1) % this.totalSlides;
+        this.goToSlide(newIndex);
+      }
+
+      private startAutoAdvance(): void {
+        this.clearAutoAdvance();
+        this.autoAdvanceTimer = setInterval(() => {
+          this.next();
+        }, 5000);
+      }
+
+      private clearAutoAdvance(): void {
+        if (this.autoAdvanceTimer) {
+          clearInterval(this.autoAdvanceTimer);
+          this.autoAdvanceTimer = null;
+        }
+      }
+    }
+
+    // Initialize slider
+    const sliderElement = document.querySelector('.hero-slider');
+    if (sliderElement instanceof HTMLElement) {
+      new AccessibleSlider(sliderElement);
+    }
+
+    // Intersection Observer for card animations
+    const observerOptions: IntersectionObserverInit = {
+      threshold: 0.1,
+      rootMargin: '0px 0px -50px 0px'
+    };
+
+    const cardObserver = new IntersectionObserver((entries) => {
+      const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          if (reducedMotion) {
+            // Instant visibility for reduced motion
+            (entry.target as HTMLElement).style.opacity = '1';
+            (entry.target as HTMLElement).style.transform = 'none';
+          } else {
+            entry.target.classList.add('visible');
+          }
+          cardObserver.unobserve(entry.target);
+        }
+      });
+    }, observerOptions);
+
+    // Observe all card blocks
+    document.querySelectorAll('.card-block').forEach(card => {
+      cardObserver.observe(card);
+    });
+  </script>
+
+  <style>
+    .digital-home {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Page Header */
+    .page-header {
+      padding: var(--space-3xl) var(--space-lg) var(--space-md);
+      text-align: left;
+    }
+
+    .header-content {
+      max-width: var(--container-wide);
+      margin: 0 auto;
+    }
+
+    .title {
+      font-size: var(--text-4xl);
+      font-weight: 800;
+      line-height: 0.95;
+      letter-spacing: -0.03em;
+      color: var(--color-text);
+    }
+
+    .title-line {
+      display: block;
+    }
+
+    .title-block {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    .signature {
+      font-family: var(--font-signature);
+      font-size: clamp(1.25rem, 1rem + 1vw, 1.75rem);
+      color: var(--color-text-muted);
+      font-weight: 400;
+      letter-spacing: 0.02em;
+    }
+
+    .tagline {
+      margin-top: var(--space-md);
+      font-size: var(--text-sm);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      color: var(--color-text-muted);
+    }
+
+    /* Hero Slider */
+    .hero-slider {
+      position: relative;
+      width: 100%;
+      background: var(--color-text);
+    }
+
+    .slider-viewport {
+      position: relative;
+      width: 100%;
+      height: 25vh;
+      overflow: hidden;
+    }
+
+    .slide {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      transition: opacity 0.8s ease-in-out;
+    }
+
+    .slide.active {
+      opacity: 1;
+    }
+
+    .slide img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* Slider Dots */
+    .slider-dots {
+      position: absolute;
+      bottom: var(--space-lg);
+      right: var(--space-lg);
+      display: flex;
+      gap: var(--space-sm);
+      z-index: 10;
+    }
+
+    .dot {
+      position: relative;
+      width: 12px;
+      height: 12px;
+      background: rgba(255, 255, 255, 0.4);
+      border: none;
+      border-radius: 0;
+      cursor: pointer;
+      transition: background var(--transition-fast);
+      padding: 0;
+    }
+
+    /* Touch target expansion */
+    .dot::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 44px;
+      height: 44px;
+    }
+
+    .dot.active,
+    .dot:hover {
+      background: rgba(255, 255, 255, 1);
+    }
+
+    /* Intro Block */
+    .intro-block {
+      padding: var(--space-3xl) var(--space-lg);
+      background: var(--color-bg-alt);
+    }
+
+    .container-narrow {
+      max-width: var(--container-narrow);
+      margin: 0 auto;
+    }
+
+    .intro-content {
+      text-align: center;
+    }
+
+    .intro-content :global(p) {
+      font-size: var(--text-xl);
+      line-height: 1.8;
+      color: var(--color-text-secondary);
+    }
+
+    /* Cards Section */
+    .cards-section {
+      padding: var(--space-3xl) var(--space-lg);
+    }
+
+    .container-wide {
+      max-width: var(--container-wide);
+      margin: 0 auto;
+    }
+
+    .card-block {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-lg);
+      margin-bottom: var(--space-3xl);
+      align-items: center;
+      opacity: 0;
+      transform: translateY(40px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+      transition-delay: var(--animation-delay, 0ms);
+    }
+
+    .card-block.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .card-block:last-child {
+      margin-bottom: 0;
+    }
+
+    /* Card layout with CSS Grid order (no RTL hack) */
+    .card-block .card-image {
+      order: 1;
+    }
+
+    .card-block .card-content {
+      order: 2;
+    }
+
+    .card-image {
+      position: relative;
+      overflow: hidden;
+      background: var(--color-bg-alt);
+    }
+
+    .card-image img {
+      width: 100%;
+      height: auto;
+      display: block;
+      transition: transform 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .card-block:hover .card-image img {
+      transform: scale(1.03);
+    }
+
+    .card-content {
+      padding: var(--space-md) 0;
+    }
+
+    .card-title {
+      font-size: var(--text-2xl);
+      font-weight: 700;
+      color: var(--color-text);
+      margin-bottom: var(--space-sm);
+      letter-spacing: -0.02em;
+    }
+
+    .card-body :global(p) {
+      font-size: var(--text-base);
+      line-height: 1.7;
+      color: var(--color-text-secondary);
+      margin-bottom: var(--space-sm);
+    }
+
+    .card-link {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-xs);
+      margin-top: var(--space-sm);
+      font-size: var(--text-sm);
+      font-weight: 600;
+      color: var(--color-accent);
+      text-decoration: none;
+      transition: gap var(--transition-base);
+    }
+
+    .card-link:hover {
+      gap: var(--space-sm);
+    }
+
+    .card-link svg {
+      transition: transform var(--transition-base);
+    }
+
+    .card-link:hover svg {
+      transform: translateX(4px);
+    }
+
+    /* Responsive - Tablet and up */
+    @media (min-width: 768px) {
+      .page-header {
+        padding: var(--space-3xl) var(--space-xl);
+      }
+
+      .cards-section {
+        padding: var(--space-3xl) var(--space-xl);
+      }
+    }
+
+    /* Responsive - Desktop */
+    @media (min-width: 1024px) {
+      .page-header {
+        padding: var(--space-3xl) var(--space-2xl);
+      }
+
+      .card-block {
+        grid-template-columns: 1fr 1fr;
+        gap: var(--space-2xl);
+      }
+
+      /* Image on right - swap order */
+      .card-block.image-right .card-image {
+        order: 2;
+      }
+
+      .card-block.image-right .card-content {
+        order: 1;
+      }
+
+      .card-content {
+        padding: var(--space-lg);
+      }
+
+      .cards-section {
+        padding: var(--space-3xl) var(--space-2xl);
+      }
+    }
+
+    /* Reduced motion */
+    @media (prefers-reduced-motion: reduce) {
+      .slide {
+        transition: none;
+      }
+
+      .card-block {
+        opacity: 1;
+        transform: none;
+        transition: none;
+      }
+
+      .card-image img {
+        transition: none;
+      }
+
+      .card-block:hover .card-image img {
+        transform: none;
+      }
+    }
+  </style>
+</Layout>

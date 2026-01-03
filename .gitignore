@@ -1,0 +1,63 @@
+# build output
+dist/
+# generated types
+.astro/
+
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+firebase-debug.log
+
+
+# environment variables
+.env
+.env.production
+
+# macOS-specific files
+.DS_Store
+._*
+
+# jetbrains setting folder
+.idea/
+
+# thumbnail cache
+.meta/
+
+# server PID files
+.dev.pid
+.admin.pid
+
+# Marketing website (separate project, not in git)
+marketing_website/
+
+# Album content (personal photos - excluded from repo)
+src/content/albums/
+
+# Home page content (personal)
+src/content/home/
+
+# Meta files
+*.meta.yaml
+*~
+
+# Images and Videos
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.tiff
+*.bmp
+*.heic
+*.heif
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v

@@ -3,12 +3,14 @@
 // Photos are only fetched and rendered AFTER access is verified
 export const prerender = false;
 
-import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, buildBreadcrumbs, getAncestors, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown } from '../../lib/albums';
+import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, getArchiveFiles, buildBreadcrumbs, getAncestors, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown, type ArchiveFile } from '../../lib/albums';
 import Layout from '../../layouts/Layout.astro';
+import SEO from '../../components/SEO.astro';
 import AlbumGrid from '../../components/AlbumGrid.astro';
 import PhotoGrid from '../../components/PhotoGrid.astro';
 import Breadcrumbs from '../../components/Breadcrumbs.astro';
 import Footer from '../../components/Footer.astro';
+import { siteConfig } from '../../config';
 // Note: PasswordProtection component no longer used - SSR form is inline
 
 const { path } = Astro.params;
@@ -25,6 +27,9 @@ const url = new URL(Astro.request.url);
 const providedToken = url.searchParams.get('token');
 const errorParam = url.searchParams.get('error');
 const remainingAttempts = url.searchParams.get('remaining');
+
+// Get photo parameter for individual photo sharing
+const photoParam = url.searchParams.get('photo');
 
 // Get ancestors for password inheritance checking
 const ancestors = await getAncestors(path!);
@@ -128,10 +133,12 @@ if (!hasPasswordProtection) {
 let subAlbums: Awaited<ReturnType<typeof getSubAlbums>> = [];
 let allMedia: Awaited<ReturnType<typeof getPhotosForAlbum>> = [];
 let subAlbumsWithCovers: { album: typeof subAlbums[0]; coverPhotoUrl: string | null }[] = [];
+let archiveFiles: ArchiveFile[] = [];
 
 if (hasAccess) {
   subAlbums = await getSubAlbums(path!);
   allMedia = await getPhotosForAlbum(path!);
+  archiveFiles = await getArchiveFiles(path!);
 
   // Fetch cover photos for sub-albums
   subAlbumsWithCovers = await Promise.all(
@@ -153,9 +160,70 @@ const photoCount = allMedia.filter(m => !m.isVideo).length;
 const videoCount = allMedia.filter(m => m.isVideo).length;
 const hasVideos = videoCount > 0;
 const isCollection = album.data.isCollection || subAlbums.length > 0;
+
+// ============ SEO / Social Sharing Meta Tags ============
+let ogImage = siteConfig.defaultOgImage;
+let ogTitle = album.data.title;
+let ogDescription = album.data.description || `Photo album: ${album.data.title}`;
+let noIndex = false;
+
+if (!hasAccess) {
+  // Protected album without access - don't expose any content
+  noIndex = true;
+  ogImage = '/images/og-locked.jpg';
+  ogDescription = 'This album is password protected';
+} else {
+  // User has access - determine appropriate OG image
+
+  // Check for individual photo sharing via ?photo= parameter
+  if (photoParam && siteConfig.features.enablePhotoSharing) {
+    const sharedMedia = allMedia.find(m => m.filename === photoParam);
+    if (sharedMedia) {
+      if (sharedMedia.isVideo) {
+        // Videos use album cover as fallback
+        ogTitle = `Video: ${sharedMedia.filename}`;
+        ogDescription = `Video from ${album.data.title}`;
+        const albumCover = await getAlbumCoverPhoto(path!, album.data.thumbnail);
+        if (albumCover) {
+          const coverPath = albumCover.replace('/albums/', '');
+          ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+        }
+      } else {
+        // Photo - use that specific photo as OG image
+        ogTitle = `Photo from ${album.data.title}`;
+        ogDescription = sharedMedia.filename;
+        ogImage = `/api/thumbnail?path=${encodeURIComponent(`${path}/${sharedMedia.filename}`)}&size=large`;
+      }
+    }
+  } else if (isCollection && subAlbumsWithCovers.length > 0) {
+    // Collection: use first sub-album's cover photo
+    const firstCover = subAlbumsWithCovers[0].coverPhotoUrl;
+    if (firstCover) {
+      const coverPath = firstCover.replace('/albums/', '');
+      ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+    }
+  } else {
+    // Regular album: use album's cover photo
+    const albumCover = await getAlbumCoverPhoto(path!, album.data.thumbnail);
+    if (albumCover) {
+      const coverPath = albumCover.replace('/albums/', '');
+      ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+    }
+  }
+}
 ---
 
 <Layout title={album.data.title}>
+  <SEO
+    slot="head"
+    title={ogTitle}
+    description={ogDescription}
+    image={ogImage}
+    imageWidth={1920}
+    imageHeight={1280}
+    noIndex={noIndex}
+  />
+
   <div class="container">
     <Breadcrumbs items={breadcrumbs} />
 
@@ -166,11 +234,13 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
       )}
       {album.data.date && (
         <p class="date">
-          {new Date(album.data.date).toLocaleDateString('en-US', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric'
-          })}
+          {(() => {
+            const d = new Date(album.data.date);
+            const day = d.getDate().toString().padStart(2, '0');
+            const month = (d.getMonth() + 1).toString().padStart(2, '0');
+            const year = d.getFullYear();
+            return `${day}.${month}.${year}`;
+          })()}
         </p>
       )}
       {album.data.tags && album.data.tags.length > 0 && (
@@ -188,7 +258,8 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
     <div class="album-content" id="album-content"
          data-album-path={path}
          data-album-token={album.data.token}
-         data-has-access={hasAccess}>
+         data-has-access={hasAccess}
+         data-shared-photo={photoParam || ''}>
 
       {/* SECURITY: Show password form only when access is denied */}
       {!hasAccess && hasPasswordProtection && (
@@ -239,7 +310,16 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
         <div class="protected-content">
         {isCollection && subAlbums.length > 0 && (
           <div class="section">
-            <h2>Albums</h2>
+            <div class="section-header albums-header">
+              <h2>Albums</h2>
+              <select id="album-sort" class="control-select" title="Sort albums">
+                <option value="custom">Custom Order</option>
+                <option value="name-asc">Name (A-Z)</option>
+                <option value="name-desc">Name (Z-A)</option>
+                <option value="date-newest">Date (Newest)</option>
+                <option value="date-oldest">Date (Oldest)</option>
+              </select>
+            </div>
             <AlbumGrid albums={subAlbumsWithCovers} />
           </div>
         )}
@@ -282,15 +362,45 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
                   )}
                 </div>
               </div>
-              <button class="download-all" data-album-path={path}>
-                Download Album
-              </button>
+              {album.data.allowDownload && (
+                <button class="download-all" data-album-path={path}>
+                  Download Album
+                </button>
+              )}
             </div>
             <PhotoGrid photos={photos} style={album.data.style} albumPath={path!} />
           </div>
         )}
 
-        {subAlbums.length === 0 && photos.length === 0 && (
+        {archiveFiles.length > 0 && (
+          <div class="section downloads-section">
+            <h2>Downloads</h2>
+            <div class="downloads-list">
+              {archiveFiles.map(file => (
+                <a href={file.url} download class="download-item">
+                  <span class="download-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                      <polyline points="7,10 12,15 17,10"/>
+                      <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                  </span>
+                  <span class="download-name">{file.filename}</span>
+                  <span class="download-size">
+                    {file.size < 1024 * 1024
+                      ? `${(file.size / 1024).toFixed(0)} KB`
+                      : file.size < 1024 * 1024 * 1024
+                        ? `${(file.size / (1024 * 1024)).toFixed(1)} MB`
+                        : `${(file.size / (1024 * 1024 * 1024)).toFixed(2)} GB`
+                    }
+                  </span>
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {subAlbums.length === 0 && photos.length === 0 && archiveFiles.length === 0 && (
           <p class="empty">This album is empty. Add photos to the folder: src/content/albums/{path}</p>
         )}
         </div>
@@ -479,6 +589,10 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
     color: #444;
   }
 
+  .albums-header h2 {
+    margin-bottom: 0;
+  }
+
   .section-header {
     display: flex;
     justify-content: space-between;
@@ -654,6 +768,63 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
 
   .download-all:hover {
     background: var(--color-hover);
+  }
+
+  /* Downloads Section */
+  .downloads-section {
+    margin-top: 2rem;
+  }
+
+  .downloads-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 1rem;
+  }
+
+  .download-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.875rem 1rem;
+    background: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 8px;
+    text-decoration: none;
+    color: var(--color-text, #333);
+    transition: all 0.2s ease;
+  }
+
+  .download-item:hover {
+    background: #e9ecef;
+    border-color: #dee2e6;
+    transform: translateX(4px);
+  }
+
+  .download-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    background: var(--color-primary, #2563eb);
+    color: white;
+    border-radius: 6px;
+    flex-shrink: 0;
+  }
+
+  .download-name {
+    flex: 1;
+    font-weight: 500;
+    font-size: 0.95rem;
+    word-break: break-word;
+  }
+
+  .download-size {
+    font-size: 0.85rem;
+    color: #6c757d;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .empty {
@@ -1045,6 +1216,84 @@ const isCollection = album.data.isCollection || subAlbums.length > 0;
 
     // Initialize UI controls (access already verified server-side)
     initializeSorting();
+
+    // Auto-open lightbox if ?photo= parameter is present (shared photo link)
+    const sharedPhoto = albumContent?.dataset.sharedPhoto;
+    if (sharedPhoto) {
+      // Wait for PhotoSwipe to initialize, then open to the specific photo
+      setTimeout(() => {
+        const photoItems = document.querySelectorAll('.photo-item');
+        const photoIndex = Array.from(photoItems).findIndex(
+          item => (item as HTMLElement).dataset.photoFilename === sharedPhoto
+        );
+
+        if (photoIndex >= 0) {
+          // Find the lightbox trigger and simulate a click
+          const photoLink = photoItems[photoIndex].querySelector('a[data-pswp-src]');
+          if (photoLink) {
+            (photoLink as HTMLElement).click();
+          }
+        }
+      }, 500);
+    }
+
+    // Initialize album sorting (for sub-albums in collections)
+    function initializeAlbumSorting() {
+      const albumSortSelect = document.getElementById('album-sort') as HTMLSelectElement;
+      if (!albumSortSelect) return;
+
+      const albumGrid = document.querySelector('.album-grid');
+      if (!albumGrid) return;
+
+      // Load saved sort preference
+      const savedSort = localStorage.getItem('photoGallery_albumSort') || 'custom';
+      albumSortSelect.value = savedSort;
+      sortAlbums(savedSort);
+
+      albumSortSelect.addEventListener('change', () => {
+        const sortValue = albumSortSelect.value;
+        sortAlbums(sortValue);
+        localStorage.setItem('photoGallery_albumSort', sortValue);
+      });
+
+      function sortAlbums(sortBy: string) {
+        const cards = Array.from(albumGrid.querySelectorAll('.album-card')) as HTMLElement[];
+
+        cards.sort((a, b) => {
+          const titleA = a.dataset.title || '';
+          const titleB = b.dataset.title || '';
+          const dateA = parseInt(a.dataset.date || '0', 10);
+          const dateB = parseInt(b.dataset.date || '0', 10);
+          const orderA = parseInt(a.dataset.order || '999', 10);
+          const orderB = parseInt(b.dataset.order || '999', 10);
+
+          switch (sortBy) {
+            case 'name-asc':
+              return titleA.localeCompare(titleB);
+            case 'name-desc':
+              return titleB.localeCompare(titleA);
+            case 'date-newest':
+              if (!dateA && !dateB) return 0;
+              if (!dateA) return 1;
+              if (!dateB) return -1;
+              return dateB - dateA;
+            case 'date-oldest':
+              if (!dateA && !dateB) return 0;
+              if (!dateA) return 1;
+              if (!dateB) return -1;
+              return dateA - dateB;
+            case 'custom':
+            default:
+              if (orderA !== orderB) return orderA - orderB;
+              return titleA.localeCompare(titleB);
+          }
+        });
+
+        cards.forEach(card => albumGrid.appendChild(card));
+      }
+    }
+
+    initializeAlbumSorting();
 
     // Download album button
     const downloadBtn = document.querySelector('.download-all');

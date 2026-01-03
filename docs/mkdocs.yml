@@ -1,7 +1,7 @@
 site_name: Goldplated Photos
-site_description: A beautiful photo gallery for photographers and enthusiasts
+site_description: A beautiful, secure, self-hosted photo gallery for photographers and enthusiasts
 site_author: Kristijan Lukačin
-site_url: https://klukacin.github.io/goldplated-photos
+site_url: https://docs.goldplated.photos
 
 repo_name: klukacin/goldplated-photos
 repo_url: https://github.com/klukacin/goldplated-photos
@@ -49,6 +49,7 @@ nav:
     - Customization: guides/customization.md
     - Deployment: guides/deployment.md
     - Assets Setup: guides/assets-setup.md
+    - Using Claude AI: guides/using-claude.md
   - Reference:
     - Architecture: reference/architecture.md
     - API Endpoints: reference/api-endpoints.md
@@ -56,6 +57,7 @@ nav:
     - UI Components: reference/ui-components.md
   - Troubleshooting: troubleshooting.md
   - Changelog: changelog.md
+  - About: about.md
 
 markdown_extensions:
   - admonition

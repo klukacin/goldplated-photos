@@ -1,0 +1,93 @@
+---
+/**
+ * SEO Component
+ *
+ * Renders Open Graph, Twitter Card, and standard meta tags for social sharing.
+ * Use in the <head> section via Layout's head slot.
+ *
+ * Usage:
+ *   <Layout title="Page Title">
+ *     <SEO
+ *       slot="head"
+ *       title="Page Title"
+ *       description="Page description"
+ *       image="/path/to/image.jpg"
+ *     />
+ *   </Layout>
+ */
+
+import { siteConfig, absoluteUrl } from '../config';
+
+interface Props {
+  title?: string;
+  description?: string;
+  image?: string;
+  imageWidth?: number;
+  imageHeight?: number;
+  imageAlt?: string;
+  type?: 'website' | 'article';
+  noIndex?: boolean;
+  canonicalUrl?: string;
+}
+
+const {
+  title,
+  description = siteConfig.description,
+  image = siteConfig.defaultOgImage,
+  imageWidth = 1200,
+  imageHeight = 630,
+  imageAlt = title || siteConfig.name,
+  type = 'website',
+  noIndex = false,
+  canonicalUrl
+} = Astro.props;
+
+// Build full title with site name suffix
+const fullTitle = title
+  ? `${title} | ${siteConfig.name}`
+  : siteConfig.name;
+
+// Build absolute image URL
+// Handle different image URL formats:
+// - Already absolute URL (starts with http) -> use as-is
+// - API thumbnail URL (starts with /api/) -> make absolute
+// - Static path (starts with /) -> make absolute
+const imageUrl = image.startsWith('http')
+  ? image
+  : absoluteUrl(image);
+
+// Canonical URL - defaults to current page
+const canonical = canonicalUrl || absoluteUrl(Astro.url.pathname);
+---
+
+<!-- Primary Meta Tags -->
+<title>{fullTitle}</title>
+<meta name="title" content={fullTitle} />
+<meta name="description" content={description} />
+<link rel="canonical" href={canonical} />
+
+{noIndex && <meta name="robots" content="noindex, nofollow" />}
+
+<!-- Open Graph / Facebook -->
+<meta property="og:type" content={type} />
+<meta property="og:url" content={canonical} />
+<meta property="og:title" content={fullTitle} />
+<meta property="og:description" content={description} />
+<meta property="og:image" content={imageUrl} />
+<meta property="og:image:width" content={imageWidth.toString()} />
+<meta property="og:image:height" content={imageHeight.toString()} />
+<meta property="og:image:alt" content={imageAlt} />
+<meta property="og:site_name" content={siteConfig.name} />
+<meta property="og:locale" content="en_US" />
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:url" content={canonical} />
+<meta name="twitter:title" content={fullTitle} />
+<meta name="twitter:description" content={description} />
+<meta name="twitter:image" content={imageUrl} />
+<meta name="twitter:image:alt" content={imageAlt} />
+{siteConfig.twitterHandle && (
+  <meta name="twitter:site" content={`@${siteConfig.twitterHandle}`} />
+)}
+<meta name="twitter:creator" content={siteConfig.twitterCreator} />

@@ -1,0 +1,21 @@
+DirectoryIndex index.html
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # 1. Security: Block access to index.md (contains passwords) and .meta folders
+  RewriteRule (^|/)index\.md$ - [F,L]
+  RewriteRule (^|/)\.meta/ - [F,L]
+
+  # 2. Force HTTPS
+  RewriteCond %{HTTPS} off
+  RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+  # 3. Serve existing files/dirs directly (Static Assets, Images)
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # 4. Proxy everything else to Node.js App
+  RewriteRule ^(.*)$ http://127.0.0.1:4321/$1 [P,L]
+</IfModule>

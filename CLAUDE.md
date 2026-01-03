@@ -1,6 +1,20 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+> **What is this file?**
+> This file provides comprehensive project context for [Claude Code](https://claude.ai/code) (Anthropic's AI coding assistant). When you open this project with Claude Code, it automatically reads this file to understand the codebase architecture, patterns, and conventions.
+
+## For Contributors
+
+**This project was built by Kristijan Lukacin with Claude AI assistance.** We encourage contributors to use Claude Code for development:
+
+1. Install [Claude Code](https://claude.ai/code) CLI
+2. Navigate to the project directory
+3. Run `claude` to start an AI-assisted session
+4. Claude will automatically read this file for context
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full contribution guidelines.
+
+---
 
 ## Development Commands
 
@@ -68,6 +82,7 @@ The site has three main sections:
 | PhotoGrid | `src/components/PhotoGrid.astro` | Photo/video grid, lightbox, EXIF/video info, keyboard nav, sorting, inline video players |
 | AlbumGrid | `src/components/AlbumGrid.astro` | Sub-album grid with cover photo thumbnails |
 | Breadcrumbs | `src/components/Breadcrumbs.astro` | Hierarchical navigation path |
+| SEO | `src/components/SEO.astro` | Open Graph and Twitter Card meta tags for social sharing |
 | PasswordProtection | `src/components/PasswordProtection.astro` | Password entry form (DEPRECATED - now inline in SSR) |
 | Footer | `src/components/Footer.astro` | Site footer with email contact and copyright |
 
@@ -293,6 +308,34 @@ CSS Grid with `grid-template-columns: repeat(3, 1fr)` ensures true left-to-right
 - Desktop: 3 columns
 - Mobile: 2 columns
 
+### Social Sharing
+
+All pages include Open Graph and Twitter Card meta tags for rich social sharing previews.
+
+**Meta tags included:**
+- Open Graph: `og:title`, `og:description`, `og:image`, `og:url`, `og:type`, `og:site_name`
+- Twitter: `twitter:card`, `twitter:title`, `twitter:description`, `twitter:image`, `twitter:creator`
+
+**OG Image selection by page:**
+| Page | OG Image |
+|------|----------|
+| Landing (`/`) | Landing background image |
+| Home (`/home`) | First hero slider image |
+| Gallery (`/photos`) | First public album's cover photo |
+| Album (`/photos/*`) | Album's cover photo |
+| Collection (`/photos/*`) | First sub-album's cover photo |
+| Protected (no access) | Generic locked image, `noindex` meta |
+
+**Individual Photo Sharing:**
+Share specific photos using URL parameter: `/photos/album-path?photo=filename.jpg`
+- SSR generates meta tags with that photo as `og:image`
+- Lightbox auto-opens to the shared photo
+- Works for public albums only
+
+**Configuration:**
+Edit `src/config.ts` to change site name, URL, Twitter handle, and default OG image.
+Environment variables (`.env`) can override site URL for different environments.
+
 ### Design System (Layout.astro)
 
 **Typography:**
@@ -420,6 +463,7 @@ REMOTE_ROOT="/path/to/public_html"
 **Components:**
 - `src/components/PhotoGrid.astro` - Photo display, lightbox, EXIF, keyboard nav, sorting
 - `src/components/AlbumGrid.astro` - Sub-album grid with cover photos
+- `src/components/SEO.astro` - Open Graph and Twitter Card meta tags for social sharing
 - `src/components/PasswordProtection.astro` - Password entry form
 - `src/components/Breadcrumbs.astro` - Hierarchical navigation
 - `src/components/Footer.astro` - Site footer with email contact and copyright
@@ -432,6 +476,10 @@ REMOTE_ROOT="/path/to/public_html"
 - `src/pages/api/unlock.ts` - SSR password verification (sets HttpOnly cookie)
 - `src/pages/api/check-password.ts` - Validate album passwords (legacy)
 - `src/pages/api/download-album.ts` - Create ZIP of album photos
+
+**Configuration:**
+- `src/config.ts` - Centralized site configuration (URL, name, social defaults)
+- `.env.example` - Environment variables template for deployment
 
 **Utilities:**
 - `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos, password checking

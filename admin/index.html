@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Photo Gallery Admin</title>
+  <!-- CodeMirror -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/monokai.min.css">
+  <!-- Admin styles (must be after CodeMirror CSS for overrides to work) -->
+  <link rel="stylesheet" href="css/admin.css">
+</head>
+<body>
+  <header class="header">
+    <h1>Photo Gallery Admin</h1>
+    <nav class="tabs">
+      <button class="tab active" data-tab="albums">Albums</button>
+      <button class="tab" data-tab="home">Home</button>
+      <button class="tab" data-tab="tools">Tools</button>
+    </nav>
+  </header>
+
+  <main class="main">
+    <!-- Albums Tab -->
+    <section id="albums-tab" class="tab-content active">
+      <div class="split-view">
+        <aside class="sidebar">
+          <div class="sidebar-header">
+            <h2>Albums</h2>
+            <button id="new-album-btn" class="btn btn-primary btn-sm">+ New</button>
+          </div>
+          <div id="album-tree" class="tree"></div>
+        </aside>
+        <div class="editor-panel">
+          <div id="album-editor" class="editor hidden">
+            <div class="editor-header">
+              <h2 id="album-editor-title">Edit Album</h2>
+              <div class="editor-actions">
+                <button id="save-album-btn" class="btn btn-primary">Save</button>
+                <button id="delete-album-btn" class="btn btn-danger">Delete</button>
+              </div>
+            </div>
+
+            <!-- Album Editor Tabs -->
+            <div class="editor-tabs">
+              <button class="editor-tab active" data-editor-tab="settings">Settings</button>
+              <button class="editor-tab" data-editor-tab="photos">Photos <span id="photo-count-badge" class="badge">0</span></button>
+              <button class="editor-tab" data-editor-tab="videos">Videos <span id="video-count-badge" class="badge">0</span></button>
+              <button class="editor-tab" data-editor-tab="cache">Cache</button>
+            </div>
+
+            <!-- Settings Tab -->
+            <div id="settings-panel" class="editor-tab-content active">
+            <form id="album-form" class="form">
+              <input type="hidden" id="album-path" name="path">
+
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="album-title">Title *</label>
+                  <input type="text" id="album-title" name="title" required>
+                </div>
+                <div class="form-group">
+                  <label for="album-date">Date</label>
+                  <input type="date" id="album-date" name="date">
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="album-description">Description</label>
+                <input type="text" id="album-description" name="description">
+              </div>
+
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="album-password">Password</label>
+                  <div class="input-with-toggle">
+                    <input type="password" id="album-password" name="password">
+                    <button type="button" class="toggle-password">Show</button>
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label for="album-token">Token</label>
+                  <div class="input-with-button">
+                    <input type="text" id="album-token" name="token" readonly>
+                    <button type="button" id="generate-token-btn" class="btn btn-sm">Generate</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group" style="flex: 1;">
+                  <label for="album-share-link">Shareable Link (with token)</label>
+                  <div class="input-with-button">
+                    <input type="text" id="album-share-link" readonly style="flex: 1;">
+                    <button type="button" id="copy-link-btn" class="btn btn-sm">Copy</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="album-sort">Sort Order</label>
+                  <select id="album-sort" name="sort">
+                    <option value="date-desc">Date (Newest First)</option>
+                    <option value="date-asc">Date (Oldest First)</option>
+                    <option value="exif-desc">EXIF Date (Newest First)</option>
+                    <option value="exif-asc">EXIF Date (Oldest First)</option>
+                    <option value="name">Name</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="album-style">Display Style</label>
+                  <select id="album-style" name="style">
+                    <option value="grid">Grid</option>
+                    <option value="masonry">Masonry</option>
+                    <option value="slideshow">Slideshow</option>
+                    <option value="single-column">Single Column</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="album-thumbnail">Cover Photo</label>
+                  <select id="album-thumbnail" name="thumbnail">
+                    <option value="">Auto (first photo)</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="album-tags">Tags (comma-separated)</label>
+                  <input type="text" id="album-tags" name="tags">
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group">
+                  <label for="album-order">Display Order</label>
+                  <input type="number" id="album-order" name="order" min="0" placeholder="Auto">
+                  <small>Lower numbers appear first in album listings</small>
+                </div>
+              </div>
+
+              <div class="form-row checkboxes">
+                <label class="checkbox">
+                  <input type="checkbox" id="album-isCollection" name="isCollection">
+                  <span>Is Collection (folder of sub-albums)</span>
+                </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="album-allowAnonymous" name="allowAnonymous" checked>
+                  <span>Allow Anonymous Access (token bypasses parent password)</span>
+                </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="album-hidden" name="hidden">
+                  <span>Hidden (only accessible via direct link)</span>
+                </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="album-allowDownload" name="allowDownload">
+                  <span>Allow Download (enable Download Album button)</span>
+                </label>
+              </div>
+
+              <div class="form-group">
+                <label for="album-body">
+                  Body Content (Markdown)
+                  <span class="markdown-hint">**bold** *italic* [link](url) # heading - list > quote</span>
+                </label>
+                <textarea id="album-body" name="body"></textarea>
+              </div>
+            </form>
+            </div>
+
+            <!-- Photos Tab -->
+            <div id="photos-panel" class="editor-tab-content">
+              <div class="photos-header">
+                <h3>Photos</h3>
+                <div class="photos-actions">
+                  <label class="btn btn-primary">
+                    Upload Photos
+                    <input type="file" id="photo-upload" multiple accept="image/*" hidden>
+                  </label>
+                </div>
+              </div>
+              <div id="upload-zone" class="upload-zone">
+                <p>Drag & drop photos here or click Upload</p>
+              </div>
+              <div id="photo-grid" class="photo-grid"></div>
+            </div>
+
+            <!-- Videos Tab -->
+            <div id="videos-panel" class="editor-tab-content">
+              <div class="photos-header">
+                <h3>Videos</h3>
+                <div class="photos-actions">
+                  <label class="btn btn-primary">
+                    Upload Videos
+                    <input type="file" id="video-upload" multiple accept="video/*" hidden>
+                  </label>
+                </div>
+              </div>
+              <div id="video-upload-zone" class="upload-zone">
+                <p>Drag & drop videos here or click Upload</p>
+              </div>
+              <div id="video-grid" class="video-grid"></div>
+            </div>
+
+            <!-- Cache Tab -->
+            <div id="cache-panel" class="editor-tab-content">
+              <div class="album-cache-stats">
+                <h3>Thumbnail Cache for this Album</h3>
+                <div class="cache-stats" style="margin: 1rem 0;">
+                  <div class="stat-row"><span>Small (400px):</span> <span id="album-stat-small">-</span></div>
+                  <div class="stat-row"><span>Medium (1200px):</span> <span id="album-stat-medium">-</span></div>
+                  <div class="stat-row"><span>Large (1920px):</span> <span id="album-stat-large">-</span></div>
+                  <div class="stat-row stat-total"><span>Total:</span> <span id="album-stat-total">-</span></div>
+                </div>
+                <div class="button-group">
+                  <button id="refresh-album-cache-btn" class="btn">Refresh Stats</button>
+                  <button id="clear-album-cache-btn" class="btn btn-warning">Clear Album Thumbnails</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="album-placeholder" class="placeholder">
+            <p>Select an album from the tree to edit, or create a new one.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Home Tab -->
+    <section id="home-tab" class="tab-content">
+      <div class="home-editor">
+        <!-- Landing Background -->
+        <div class="section-card">
+          <div class="section-header">
+            <h2>Landing Background</h2>
+            <label class="btn btn-primary btn-sm">
+              Replace
+              <input type="file" id="landing-upload" accept="image/*" hidden>
+            </label>
+          </div>
+          <div id="landing-preview" class="landing-preview"></div>
+          <p style="color: var(--text-secondary); margin-top: 0.5rem; font-size: 0.875rem;">
+            Full-screen background on the landing page (/).
+          </p>
+        </div>
+
+        <!-- Hero Images Section -->
+        <div class="section-card">
+          <div class="section-header">
+            <h2>Hero Slider Images</h2>
+            <label class="btn btn-primary btn-sm">
+              Upload
+              <input type="file" id="home-hero-upload" accept="image/*" hidden>
+            </label>
+          </div>
+          <div id="home-hero-images" class="image-grid"></div>
+        </div>
+
+        <!-- Intro Section -->
+        <div class="section-card">
+          <div class="section-header">
+            <h2>Introduction</h2>
+            <button id="save-intro-btn" class="btn btn-primary">Save</button>
+          </div>
+          <div class="form-group">
+            <textarea id="intro-body"></textarea>
+          </div>
+        </div>
+
+        <!-- Cards Section -->
+        <div class="section-card">
+          <div class="section-header">
+            <h2>Content Cards</h2>
+            <button id="new-card-btn" class="btn btn-primary btn-sm">+ Add Card</button>
+          </div>
+          <div id="cards-list" class="cards-list"></div>
+        </div>
+      </div>
+
+      <!-- Card Edit Modal -->
+      <div id="card-modal" class="modal hidden">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h2 id="card-modal-title">Edit Card</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <form id="card-form" class="form">
+            <input type="hidden" id="card-id" name="id">
+
+            <div class="form-group">
+              <label for="card-title">Title *</label>
+              <input type="text" id="card-title" name="title" required>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group" style="flex: 2;">
+                <label for="card-image">Image</label>
+                <div class="input-with-button">
+                  <input type="text" id="card-image" name="image" placeholder="/home/cards/image.jpg">
+                  <label class="btn btn-sm" style="cursor: pointer;">
+                    Upload
+                    <input type="file" id="card-image-upload-modal" accept="image/*" hidden>
+                  </label>
+                </div>
+                <div id="card-image-preview" class="card-image-preview"></div>
+              </div>
+              <div class="form-group">
+                <label for="card-imagePosition">Image Position</label>
+                <select id="card-imagePosition" name="imagePosition">
+                  <option value="left">Left</option>
+                  <option value="right">Right</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label for="card-link">Link</label>
+                <input type="text" id="card-link" name="link" placeholder="/photos/album-path">
+              </div>
+              <div class="form-group">
+                <label for="card-order">Order</label>
+                <input type="number" id="card-order" name="order" min="1">
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="card-body">Content (Markdown)</label>
+              <textarea id="card-body" name="body"></textarea>
+            </div>
+
+            <div class="modal-actions">
+              <button type="submit" class="btn btn-primary">Save Card</button>
+              <button type="button" id="delete-card-btn" class="btn btn-danger">Delete</button>
+              <button type="button" class="btn modal-cancel">Cancel</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tools Tab -->
+    <section id="tools-tab" class="tab-content">
+      <div class="tools-grid">
+        <div class="section-card">
+          <h2>Thumbnail Cache</h2>
+          <div id="cache-stats" class="cache-stats">
+            <div class="stat-row"><span>Small (400px):</span> <span id="stat-small">-</span></div>
+            <div class="stat-row"><span>Medium (1200px):</span> <span id="stat-medium">-</span></div>
+            <div class="stat-row"><span>Large (1920px):</span> <span id="stat-large">-</span></div>
+            <div class="stat-row stat-total"><span>Total:</span> <span id="stat-total">-</span></div>
+          </div>
+          <div class="button-group" style="margin-top: 1rem;">
+            <button id="refresh-stats-btn" class="btn">Refresh Stats</button>
+            <button id="clear-cache-btn" class="btn btn-warning">Clear All</button>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h2>Site Actions</h2>
+          <p>Run build commands or open the development server.</p>
+          <div class="button-group">
+            <a href="http://localhost:4321" target="_blank" class="btn">Open Dev Site</a>
+            <a href="http://localhost:4321/photos" target="_blank" class="btn">Open Gallery</a>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h2>Quick Links</h2>
+          <ul class="link-list">
+            <li><a href="http://localhost:4321" target="_blank">Landing Page (/)</a></li>
+            <li><a href="http://localhost:4321/home" target="_blank">Digital Home (/home)</a></li>
+            <li><a href="http://localhost:4321/photos" target="_blank">Photo Gallery (/photos)</a></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Notifications -->
+  <div id="notifications" class="notifications"></div>
+
+  <!-- New Album Modal -->
+  <div id="new-album-modal" class="modal hidden">
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h2>Create New Album</h2>
+        <button class="modal-close">&times;</button>
+      </div>
+      <form id="new-album-form" class="form">
+        <div class="form-group">
+          <label for="new-album-path">Path *</label>
+          <input type="text" id="new-album-path" name="path" required placeholder="2025/Events/My-Album">
+          <small>Use forward slashes. Example: 2025/Birthdays/Party</small>
+        </div>
+        <div class="form-group">
+          <label for="new-album-title">Title</label>
+          <input type="text" id="new-album-title" name="title" placeholder="My Album">
+          <small>Leave empty to auto-generate from path</small>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="new-album-isCollection" name="isCollection">
+          <span>This is a collection (folder of sub-albums)</span>
+        </label>
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Create Album</button>
+          <button type="button" class="btn modal-cancel">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Confirm Modal -->
+  <div id="confirm-modal" class="modal hidden">
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h2 id="confirm-title">Confirm</h2>
+      </div>
+      <p id="confirm-message"></p>
+      <div class="modal-actions">
+        <button id="confirm-yes" class="btn btn-danger">Delete</button>
+        <button id="confirm-no" class="btn">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/utils.js"></script>
+  <script src="js/albums.js"></script>
+  <script src="js/photos.js"></script>
+  <script src="js/home.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

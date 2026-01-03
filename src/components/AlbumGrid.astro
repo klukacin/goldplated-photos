@@ -1,0 +1,371 @@
+---
+import type { Album } from '../lib/albums';
+import { parseInlineMarkdown } from '../lib/albums';
+
+interface AlbumWithCover {
+  album: Album;
+  coverPhotoUrl: string | null;
+}
+
+interface Props {
+  albums: AlbumWithCover[];
+}
+
+const { albums } = Astro.props;
+
+// Cache version - increment to bust browser cache after thumbnail changes
+const THUMBNAIL_VERSION = 2;
+
+// Helper function to generate thumbnail URL
+function getThumbnailUrl(photoUrl: string, size: 'small' | 'medium' | 'large' = 'small'): string {
+  const path = photoUrl.replace('/albums/', '');
+  return `/api/thumbnail?path=${encodeURIComponent(path)}&size=${size}&v=${THUMBNAIL_VERSION}`;
+}
+
+// Format date in Croatian format (DD.MM.YYYY)
+function formatCroatianDate(date: Date): string {
+  const day = date.getDate().toString().padStart(2, '0');
+  const month = (date.getMonth() + 1).toString().padStart(2, '0');
+  const year = date.getFullYear();
+  return `${day}.${month}.${year}`;
+}
+---
+
+<div class="album-grid">
+  {albums.map(({ album, coverPhotoUrl }) => {
+    const albumPath = album.id.replace('/index.md', '');
+    const displayTitle = album.data.title;
+    const isProtected = !!album.data.password;
+    const hasCoverPhoto = !!coverPhotoUrl;
+    const isCollection = album.data.isCollection;
+
+    return (
+      <a
+        href={`/photos/${albumPath}`}
+        class="album-card"
+        data-protected={isProtected ? "true" : undefined}
+        data-title={displayTitle}
+        data-date={album.data.date ? new Date(album.data.date).getTime().toString() : ""}
+        data-order={album.data.order?.toString() ?? "999"}
+      >
+        <div class="album-thumbnail">
+          {hasCoverPhoto ? (
+            <>
+              <img
+                src={getThumbnailUrl(coverPhotoUrl, 'large')}
+                alt={displayTitle}
+                class="cover-image"
+              />
+              {isProtected && <span class="lock-icon">🔒</span>}
+              {album.data.date && (
+                <span class="date-badge">{formatCroatianDate(new Date(album.data.date))}</span>
+              )}
+            </>
+          ) : (
+            <div class="placeholder">
+              {isProtected && <span class="lock-icon">🔒</span>}
+              {album.data.date && (
+                <span class="date-badge">{formatCroatianDate(new Date(album.data.date))}</span>
+              )}
+              <span class="folder-icon">{isCollection ? '📁' : '🖼️'}</span>
+            </div>
+          )}
+          <button
+            class="album-share-btn"
+            data-album-path={albumPath}
+            data-album-title={displayTitle}
+            title="Share album"
+            aria-label="Share album"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="18" cy="5" r="3"></circle>
+              <circle cx="6" cy="12" r="3"></circle>
+              <circle cx="18" cy="19" r="3"></circle>
+              <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+              <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+            </svg>
+          </button>
+        </div>
+        <div class="album-info">
+          <h3>{displayTitle}</h3>
+          {album.data.description && (
+            <p class="description" set:html={parseInlineMarkdown(album.data.description)} />
+          )}
+        </div>
+      </a>
+    );
+  })}
+</div>
+
+<style>
+  .album-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1.5rem;
+    margin-top: 2rem;
+  }
+
+  .album-card {
+    display: block;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+    background: white;
+  }
+
+  .album-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    text-decoration: none;
+  }
+
+  .album-thumbnail {
+    position: relative;
+    width: 100%;
+    padding-top: 66.67%; /* 3:2 aspect ratio */
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    overflow: hidden;
+  }
+
+  .cover-image {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .placeholder {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 4rem;
+  }
+
+  .lock-icon {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    font-size: 1.5rem;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+  }
+
+  .date-badge {
+    position: absolute;
+    bottom: 0.75rem;
+    left: 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: white;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    letter-spacing: 0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .folder-icon {
+    opacity: 0.8;
+  }
+
+  .album-info {
+    padding: 1rem;
+  }
+
+  .album-info h3 {
+    font-size: 1.25rem;
+    margin-bottom: 0.5rem;
+    color: var(--color-text);
+  }
+
+  .description {
+    font-size: 0.9rem;
+    color: #666;
+    margin-bottom: 0.25rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  .description :global(strong) {
+    font-weight: 600;
+    color: var(--color-text);
+  }
+
+  .description :global(em) {
+    font-style: italic;
+  }
+
+  .description :global(a) {
+    color: var(--color-primary, #2563eb);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .description :global(a:hover) {
+    color: var(--color-hover, #1d4ed8);
+  }
+
+  /* Album share button */
+  .album-share-btn {
+    position: absolute;
+    bottom: 0.5rem;
+    right: 0.5rem;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s, transform 0.2s, background 0.2s;
+    z-index: 10;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+
+  .album-share-btn svg {
+    color: #333;
+    transition: color 0.2s;
+  }
+
+  .album-card:hover .album-share-btn {
+    opacity: 1;
+  }
+
+  .album-share-btn:hover {
+    transform: scale(1.1);
+    background: white;
+  }
+
+  .album-share-btn:hover svg {
+    color: #000;
+  }
+
+  .album-share-btn:active {
+    transform: scale(0.95);
+  }
+
+  /* Toast notification for album share */
+  .album-share-toast {
+    position: fixed;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: #333;
+    color: white;
+    padding: 0.75rem 1.5rem;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    z-index: 10000;
+    opacity: 0;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+    pointer-events: none;
+  }
+
+  .album-share-toast.active {
+    transform: translateX(-50%) translateY(0);
+    opacity: 1;
+  }
+
+  @media (max-width: 768px) {
+    .album-grid {
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 1rem;
+    }
+
+    .album-info h3 {
+      font-size: 1rem;
+    }
+
+    .description {
+      font-size: 0.85rem;
+    }
+
+    /* Always show share button on mobile */
+    .album-share-btn {
+      opacity: 1;
+    }
+
+    .album-share-btn:hover {
+      transform: none;
+    }
+  }
+</style>
+
+<!-- Toast notification -->
+<div id="album-share-toast" class="album-share-toast" aria-live="polite">
+  Link copied to clipboard
+</div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const toast = document.getElementById('album-share-toast');
+    let toastTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    function showToast(message: string) {
+      if (!toast) return;
+      toast.textContent = message;
+      toast.classList.add('active');
+
+      if (toastTimeout) clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => {
+        toast.classList.remove('active');
+      }, 2500);
+    }
+
+    async function shareAlbum(albumPath: string, albumTitle: string) {
+      const baseUrl = window.location.origin;
+      const url = `${baseUrl}/photos/${albumPath}`;
+
+      try {
+        if (navigator.share) {
+          await navigator.share({
+            title: albumTitle,
+            url: url
+          });
+        } else {
+          await navigator.clipboard.writeText(url);
+          showToast('Link copied to clipboard');
+        }
+      } catch (err: unknown) {
+        // User cancelled share or error occurred
+        if (err instanceof Error && err.name !== 'AbortError') {
+          // Fallback to clipboard
+          try {
+            await navigator.clipboard.writeText(url);
+            showToast('Link copied to clipboard');
+          } catch {
+            showToast('Could not share');
+          }
+        }
+      }
+    }
+
+    // Add click handlers to all share buttons
+    document.querySelectorAll('.album-share-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const albumPath = (btn as HTMLElement).dataset.albumPath || '';
+        const albumTitle = (btn as HTMLElement).dataset.albumTitle || 'Album';
+        shareAlbum(albumPath, albumTitle);
+      });
+    });
+  });
+</script>
