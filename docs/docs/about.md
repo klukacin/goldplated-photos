@@ -103,6 +103,15 @@ The only requirement is to include the original license and copyright notice.
 - **GitHub Issues** - Report bugs or request features on [GitHub](https://github.com/klukacin/goldplated-photos/issues)
 - **Discussions** - Ask questions in [GitHub Discussions](https://github.com/klukacin/goldplated-photos/discussions)
 
+### Support the Project
+
+If you find Goldplated Photos useful, consider supporting its development:
+
+[:material-coffee: Buy me a coffee on Ko-fi](https://ko-fi.com/klukacin){ .md-button .md-button--primary }
+[:material-bank-transfer: Send a tip via Wise](https://wise.com/pay/me/kristijanl10){ .md-button }
+
+Your support helps maintain and improve this project!
+
 ### Contributing
 
 We welcome contributions! See the [Contributing Guide](https://github.com/klukacin/goldplated-photos/blob/main/CONTRIBUTING.md) for details.

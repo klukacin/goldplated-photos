@@ -196,6 +196,17 @@ This project demonstrates human-AI collaboration in software development. Both t
 
 ---
 
+## Support
+
+If you find Goldplated Photos useful, consider supporting its development:
+
+- [Buy me a coffee on Ko-fi](https://ko-fi.com/klukacin)
+- [Send a tip via Wise](https://wise.com/pay/me/kristijanl10)
+
+Your support helps maintain and improve this project!
+
+---
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.

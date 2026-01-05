@@ -61,3 +61,4 @@ src/content/home/
 *.mkv
 *.webm
 *.m4v
+.private/

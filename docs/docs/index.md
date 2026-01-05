@@ -9,6 +9,17 @@ A beautiful, secure, self-hosted photo gallery for photographers and enthusiasts
 
 ---
 
+## Simple Workflow
+
+| Step | Action | Description |
+|------|--------|-------------|
+| **1. Organize** | Create folders | Organize images locally in nested folders |
+| **2. Generate** | `npm run update` | Auto-generate metadata locally for preview |
+| **3. Refine** | `npm run admin` | Use local admin securely, set passwords, get share links |
+| **4. Deploy** | `npm run deploy` | Sync to your server |
+
+---
+
 ## Why Goldplated Photos?
 
 <div class="grid cards" markdown>
@@ -167,6 +178,15 @@ See [Admin Panel Guide](guides/admin-panel.md) for full documentation.
 - [API Endpoints](reference/api-endpoints.md) - All API routes
 - [Keyboard Shortcuts](reference/keyboard-shortcuts.md) - Navigation keys
 - [UI Components](reference/ui-components.md) - Component documentation
+
+---
+
+## Support the Project
+
+If you find Goldplated Photos useful, consider supporting its development:
+
+[:material-coffee: Buy me a coffee on Ko-fi](https://ko-fi.com/klukacin){ .md-button .md-button--primary }
+[:material-bank-transfer: Send a tip via Wise](https://wise.com/pay/me/kristijanl10){ .md-button }
 
 ---
 

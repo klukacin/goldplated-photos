@@ -5,6 +5,23 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-01-05
+
+### Added
+
+- Support/donation links throughout documentation (Ko-fi, Wise)
+- "Support the Project" section on docs homepage
+- Ko-fi link in documentation footer
+- Workflow section on docs homepage with 4-step process table
+
+### Changed
+
+- Improved marketing website with compact workflow infographic bar
+- Enhanced features page with workflow descriptions
+- Updated About page with donation options
+
+---
+
 ## [0.1.0] - 2025-12-28
 
 ### Added

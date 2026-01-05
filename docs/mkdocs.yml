@@ -44,6 +44,7 @@ nav:
     - Password Protection: features/password-protection.md
     - Thumbnails: features/thumbnails.md
   - Guides:
+    - Workflow: guides/workflow.md
     - Adding Albums: guides/adding-albums.md
     - Admin Panel: guides/admin-panel.md
     - Customization: guides/customization.md
@@ -91,6 +92,8 @@ extra:
       link: https://github.com/klukacin/goldplated-photos
     - icon: fontawesome/brands/x-twitter
       link: https://x.com/klukacin
+    - icon: simple/kofi
+      link: https://ko-fi.com/klukacin
   generator: false
 
 copyright: Copyright &copy; 2025 Kristijan Lukačin
