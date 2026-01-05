@@ -5,6 +5,37 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-01-05
+
+### Added
+
+- **Mobile Hamburger Menu** - Marketing site now has mobile navigation menu
+  - Slide-down menu with close-on-click behavior
+  - Accessible with aria-expanded state
+- **Swipeable Workflow Section** - Workflow steps are now swipeable cards on mobile
+  - CSS scroll-snap for native swipe feel
+  - Full descriptions visible on mobile
+- **Hero Carousel Swipe** - Screenshot carousel now supports touch swipe on mobile
+  - Pause auto-rotate during interaction
+  - Left/right swipe navigation
+
+### Fixed
+
+- **Lightbox Share Button** - Share modal now displays correctly when triggered from lightbox
+  - Fixed z-index to be higher than PhotoSwipe (100002 vs 100000)
+- **Album/Folder Share** - Share buttons on album cards now use new share modal
+  - Replaced old clipboard-only share with full modal
+  - Copy Link, Facebook, LinkedIn options (no Instagram for albums)
+  - Protection context passed for proper token handling
+
+### Changed
+
+- GitHub Discussions links replaced with Ko-fi donation links on marketing site
+- Album share modal shows warning for protected content with token
+- Nested albums inherit parent protection context for share links
+
+---
+
 ## [0.3.0] - 2026-01-05
 
 ### Added

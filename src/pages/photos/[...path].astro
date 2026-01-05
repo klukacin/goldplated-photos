@@ -320,7 +320,13 @@ if (!hasAccess) {
                 <option value="date-oldest">Date (Oldest)</option>
               </select>
             </div>
-            <AlbumGrid albums={subAlbumsWithCovers} />
+            <AlbumGrid
+              albums={subAlbumsWithCovers}
+              parentPath={path}
+              parentToken={album.data.token}
+              isParentProtected={hasPasswordProtection}
+              hasParentAccess={hasAccess}
+            />
           </div>
         )}
 

@@ -1,6 +1,7 @@
 ---
 import type { Album } from '../lib/albums';
 import { parseInlineMarkdown } from '../lib/albums';
+import { siteConfig } from '../config';
 
 interface AlbumWithCover {
   album: Album;
@@ -9,9 +10,14 @@ interface AlbumWithCover {
 
 interface Props {
   albums: AlbumWithCover[];
+  parentPath?: string;
+  parentToken?: string;
+  isParentProtected?: boolean;
+  hasParentAccess?: boolean;
 }
 
-const { albums } = Astro.props;
+const { albums, parentPath, parentToken, isParentProtected = false, hasParentAccess = true } = Astro.props;
+const siteUrl = siteConfig.siteUrl;
 
 // Cache version - increment to bust browser cache after thumbnail changes
 const THUMBNAIL_VERSION = 2;
@@ -35,9 +41,12 @@ function formatCroatianDate(date: Date): string {
   {albums.map(({ album, coverPhotoUrl }) => {
     const albumPath = album.id.replace('/index.md', '');
     const displayTitle = album.data.title;
-    const isProtected = !!album.data.password;
+    const albumHasPassword = !!album.data.password;
+    const isProtected = albumHasPassword || isParentProtected;
     const hasCoverPhoto = !!coverPhotoUrl;
     const isCollection = album.data.isCollection;
+    // For albums inside protected parent, use parent token if album has no password
+    const effectiveToken = albumHasPassword ? album.data.token : parentToken;
 
     return (
       <a
@@ -74,6 +83,10 @@ function formatCroatianDate(date: Date): string {
             class="album-share-btn"
             data-album-path={albumPath}
             data-album-title={displayTitle}
+            data-album-token={effectiveToken || ''}
+            data-is-protected={isProtected.toString()}
+            data-album-has-password={albumHasPassword.toString()}
+            data-has-access={hasParentAccess.toString()}
             title="Share album"
             aria-label="Share album"
           >
@@ -95,6 +108,66 @@ function formatCroatianDate(date: Date): string {
       </a>
     );
   })}
+</div>
+
+<!-- Share Modal -->
+<div id="album-share-modal" class="share-modal-overlay" data-site-url={siteUrl}>
+  <div class="share-modal">
+    <div class="share-modal-header">
+      <span>Share</span>
+      <button class="share-modal-close" aria-label="Close">&times;</button>
+    </div>
+
+    <!-- Warning for protected content -->
+    <div class="share-modal-warning" id="album-share-warning">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+        <line x1="12" y1="9" x2="12" y2="13"></line>
+        <line x1="12" y1="17" x2="12.01" y2="17"></line>
+      </svg>
+      <div>
+        <strong>Protected Content</strong>
+        <p>Share link includes access token. Anyone with this link can view it.</p>
+      </div>
+    </div>
+
+    <!-- Preview section -->
+    <div class="share-modal-preview">
+      <span class="share-preview-name" id="album-share-name"></span>
+    </div>
+
+    <!-- Share buttons (no Instagram for albums) -->
+    <div class="share-modal-buttons">
+      <button class="share-btn share-btn-copy" id="album-copy-link">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+        </svg>
+        Copy Link
+      </button>
+      <div class="share-social-row">
+        <button class="share-btn share-btn-facebook" id="album-share-facebook">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"></path>
+          </svg>
+          Facebook
+        </button>
+        <button class="share-btn share-btn-linkedin" id="album-share-linkedin">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M16 8a6 6 0 0 1 6 6v7h-4v-7a2 2 0 0 0-2-2 2 2 0 0 0-2 2v7h-4v-7a6 6 0 0 1 6-6z"></path>
+            <rect x="2" y="9" width="4" height="12"></rect>
+            <circle cx="4" cy="4" r="2"></circle>
+          </svg>
+          LinkedIn
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast notification -->
+<div id="album-share-toast" class="album-share-toast" aria-live="polite">
+  Link copied to clipboard
 </div>
 
 <style>
@@ -260,7 +333,179 @@ function formatCroatianDate(date: Date): string {
     transform: scale(0.95);
   }
 
-  /* Toast notification for album share */
+  /* Share Modal */
+  .share-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 100002;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s ease, visibility 0.2s ease;
+  }
+
+  .share-modal-overlay.visible {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .share-modal {
+    background: #1a1a1a;
+    border-radius: 12px;
+    width: 90%;
+    max-width: 380px;
+    max-height: 90vh;
+    overflow: hidden;
+    transform: scale(0.95);
+    transition: transform 0.2s ease;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  .share-modal-overlay.visible .share-modal {
+    transform: scale(1);
+  }
+
+  .share-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid #333;
+  }
+
+  .share-modal-header span {
+    font-weight: 600;
+    font-size: 1.1rem;
+    color: #fff;
+  }
+
+  .share-modal-close {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    transition: color 0.2s;
+  }
+
+  .share-modal-close:hover {
+    color: #fff;
+  }
+
+  .share-modal-warning {
+    display: none;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: rgba(234, 179, 8, 0.15);
+    border-bottom: 1px solid rgba(234, 179, 8, 0.3);
+  }
+
+  .share-modal-warning.visible {
+    display: flex;
+  }
+
+  .share-modal-warning svg {
+    flex-shrink: 0;
+    color: #eab308;
+    margin-top: 2px;
+  }
+
+  .share-modal-warning strong {
+    display: block;
+    color: #eab308;
+    font-size: 0.85rem;
+    margin-bottom: 2px;
+  }
+
+  .share-modal-warning p {
+    color: #a3a3a3;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    margin: 0;
+  }
+
+  .share-modal-preview {
+    padding: 1rem 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    border-bottom: 1px solid #333;
+  }
+
+  .share-preview-name {
+    font-size: 0.9rem;
+    color: #e5e5e5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .share-modal-buttons {
+    padding: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .share-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .share-btn svg {
+    flex-shrink: 0;
+  }
+
+  .share-btn-copy {
+    background: #fff;
+    color: #1a1a1a;
+  }
+
+  .share-btn-copy:hover {
+    background: #e5e5e5;
+  }
+
+  .share-social-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+
+  .share-btn-facebook {
+    background: #1877f2;
+    color: #fff;
+  }
+
+  .share-btn-facebook:hover {
+    background: #166fe5;
+  }
+
+  .share-btn-linkedin {
+    background: #0a66c2;
+    color: #fff;
+  }
+
+  .share-btn-linkedin:hover {
+    background: #004182;
+  }
+
+  /* Toast notification */
   .album-share-toast {
     position: fixed;
     bottom: 2rem;
@@ -271,13 +516,13 @@ function formatCroatianDate(date: Date): string {
     padding: 0.75rem 1.5rem;
     border-radius: 8px;
     font-size: 0.9rem;
-    z-index: 10000;
+    z-index: 100003;
     opacity: 0;
     transition: transform 0.3s ease, opacity 0.3s ease;
     pointer-events: none;
   }
 
-  .album-share-toast.active {
+  .album-share-toast.visible {
     transform: translateX(-50%) translateY(0);
     opacity: 1;
   }
@@ -304,57 +549,138 @@ function formatCroatianDate(date: Date): string {
     .album-share-btn:hover {
       transform: none;
     }
+
+    .share-social-row {
+      grid-template-columns: 1fr;
+    }
   }
 </style>
 
-<!-- Toast notification -->
-<div id="album-share-toast" class="album-share-toast" aria-live="polite">
-  Link copied to clipboard
-</div>
-
 <script>
   document.addEventListener('DOMContentLoaded', () => {
+    const modal = document.getElementById('album-share-modal') as HTMLElement;
+    const closeBtn = modal?.querySelector('.share-modal-close');
+    const warning = document.getElementById('album-share-warning');
+    const nameDisplay = document.getElementById('album-share-name');
+    const copyBtn = document.getElementById('album-copy-link');
+    const facebookBtn = document.getElementById('album-share-facebook');
+    const linkedinBtn = document.getElementById('album-share-linkedin');
     const toast = document.getElementById('album-share-toast');
+
+    let currentAlbumPath = '';
+    let currentToken = '';
+    let currentIsProtected = false;
     let toastTimeout: ReturnType<typeof setTimeout> | null = null;
 
     function showToast(message: string) {
       if (!toast) return;
       toast.textContent = message;
-      toast.classList.add('active');
-
+      toast.classList.add('visible');
       if (toastTimeout) clearTimeout(toastTimeout);
       toastTimeout = setTimeout(() => {
-        toast.classList.remove('active');
+        toast.classList.remove('visible');
       }, 2500);
     }
 
-    async function shareAlbum(albumPath: string, albumTitle: string) {
-      const baseUrl = window.location.origin;
-      const url = `${baseUrl}/photos/${albumPath}`;
+    function openShareModal(
+      albumPath: string,
+      albumTitle: string,
+      token: string,
+      isProtected: boolean,
+      hasAccess: boolean
+    ) {
+      if (!modal) return;
 
-      try {
-        if (navigator.share) {
-          await navigator.share({
-            title: albumTitle,
-            url: url
-          });
+      currentAlbumPath = albumPath;
+      currentToken = token;
+      currentIsProtected = isProtected;
+
+      // Set preview name
+      if (nameDisplay) {
+        nameDisplay.textContent = albumTitle;
+      }
+
+      // Show/hide warning
+      if (warning) {
+        if (isProtected && hasAccess && token) {
+          warning.classList.add('visible');
         } else {
-          await navigator.clipboard.writeText(url);
-          showToast('Link copied to clipboard');
-        }
-      } catch (err: unknown) {
-        // User cancelled share or error occurred
-        if (err instanceof Error && err.name !== 'AbortError') {
-          // Fallback to clipboard
-          try {
-            await navigator.clipboard.writeText(url);
-            showToast('Link copied to clipboard');
-          } catch {
-            showToast('Could not share');
-          }
+          warning.classList.remove('visible');
         }
       }
+
+      modal.classList.add('visible');
+      document.body.style.overflow = 'hidden';
     }
+
+    function closeShareModal() {
+      if (!modal) return;
+      modal.classList.remove('visible');
+      document.body.style.overflow = '';
+    }
+
+    function getShareUrl(): string {
+      const siteUrl = modal?.dataset.siteUrl || window.location.origin;
+      let url = `${siteUrl}/photos/${currentAlbumPath}`;
+
+      // Add token for protected content
+      if (currentIsProtected && currentToken) {
+        url += `?token=${currentToken}`;
+      }
+
+      return url;
+    }
+
+    // Copy link handler
+    copyBtn?.addEventListener('click', async () => {
+      const url = getShareUrl();
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast('Link copied to clipboard');
+        closeShareModal();
+      } catch {
+        showToast('Could not copy link');
+      }
+    });
+
+    // Facebook share
+    facebookBtn?.addEventListener('click', () => {
+      const url = getShareUrl();
+      window.open(
+        `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`,
+        '_blank',
+        'width=600,height=400'
+      );
+      closeShareModal();
+    });
+
+    // LinkedIn share
+    linkedinBtn?.addEventListener('click', () => {
+      const url = getShareUrl();
+      window.open(
+        `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(url)}`,
+        '_blank',
+        'width=600,height=400'
+      );
+      closeShareModal();
+    });
+
+    // Close button handler
+    closeBtn?.addEventListener('click', closeShareModal);
+
+    // Close on overlay click
+    modal?.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        closeShareModal();
+      }
+    });
+
+    // Close on Escape
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && modal?.classList.contains('visible')) {
+        closeShareModal();
+      }
+    });
 
     // Add click handlers to all share buttons
     document.querySelectorAll('.album-share-btn').forEach(btn => {
@@ -362,9 +688,14 @@ function formatCroatianDate(date: Date): string {
         e.preventDefault();
         e.stopPropagation();
 
-        const albumPath = (btn as HTMLElement).dataset.albumPath || '';
-        const albumTitle = (btn as HTMLElement).dataset.albumTitle || 'Album';
-        shareAlbum(albumPath, albumTitle);
+        const el = btn as HTMLElement;
+        const albumPath = el.dataset.albumPath || '';
+        const albumTitle = el.dataset.albumTitle || 'Album';
+        const token = el.dataset.albumToken || '';
+        const isProtected = el.dataset.isProtected === 'true';
+        const hasAccess = el.dataset.hasAccess === 'true';
+
+        openShareModal(albumPath, albumTitle, token, isProtected, hasAccess);
       });
     });
   });

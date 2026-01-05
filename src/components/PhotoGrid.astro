@@ -915,7 +915,7 @@ function getVideoMimeType(filename: string): string {
     background: rgba(0, 0, 0, 0.8);
     backdrop-filter: blur(4px);
     -webkit-backdrop-filter: blur(4px);
-    z-index: 10001;
+    z-index: 100002; /* Higher than PhotoSwipe's 100000 */
     display: flex;
     align-items: center;
     justify-content: center;
