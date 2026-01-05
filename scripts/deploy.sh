@@ -378,12 +378,14 @@ echo -e "  ${GREEN}✓ All $TOTAL_TASKS sync tasks completed${NC}"
 echo ""
 
 # Sequential syncs for small files (no fancy display needed)
+# Use --checksum for code files to ensure content changes are detected
+# (timestamps can be unreliable after builds)
 echo -e "  ${DIM}Syncing small files...${NC}"
-sync_simple "dist/server/" "${REMOTE_ROOT}/server/" "--delete"
-sync_simple "dist/client/" "${REMOTE_ROOT}/"
-sync_simple "package.json" "${REMOTE_ROOT}/"
-sync_simple "ecosystem.config.cjs" "${REMOTE_ROOT}/"
-sync_simple "scripts/" "${REMOTE_ROOT}/scripts/"
+sync_simple "dist/server/" "${REMOTE_ROOT}/server/" "--delete --checksum"
+sync_simple "dist/client/" "${REMOTE_ROOT}/" "--checksum"
+sync_simple "package.json" "${REMOTE_ROOT}/" "--checksum"
+sync_simple "ecosystem.config.cjs" "${REMOTE_ROOT}/" "--checksum"
+sync_simple "scripts/" "${REMOTE_ROOT}/scripts/" "--checksum"
 
 # 6. Post-Deployment Setup
 echo -e "${YELLOW}[6/7] Configuring remote environment...${NC}"
