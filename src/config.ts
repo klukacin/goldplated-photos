@@ -25,6 +25,13 @@ export interface SiteConfig {
     email?: string;
   };
 
+  // Watermark Settings
+  watermark: {
+    text: string;        // Text to display (defaults to site URL hostname)
+    opacity: number;     // 0-1 (0.5 = 50%)
+    position: 'bottom-right' | 'bottom-left' | 'bottom-center';
+  };
+
   // Feature Flags
   features: {
     enablePhotoSharing: boolean;
@@ -47,6 +54,13 @@ export const siteConfig: SiteConfig = {
   author: {
     name: "Kristijan Lukačin",
     email: "photo@kristijan.lukacin.com"
+  },
+
+  // Watermark Settings (for Instagram sharing)
+  watermark: {
+    text: "kristijan.lukacin.com",  // Text shown on watermarked images
+    opacity: 0.5,                    // 50% opacity (subtle)
+    position: 'bottom-right'         // Bottom-right corner
   },
 
   // Feature Flags

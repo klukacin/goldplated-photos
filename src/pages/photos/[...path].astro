@@ -368,7 +368,14 @@ if (!hasAccess) {
                 </button>
               )}
             </div>
-            <PhotoGrid photos={photos} style={album.data.style} albumPath={path!} />
+            <PhotoGrid
+              photos={photos}
+              style={album.data.style}
+              albumPath={path!}
+              albumToken={album.data.token}
+              isProtected={hasPasswordProtection}
+              hasAccess={hasAccess}
+            />
           </div>
         )}
 

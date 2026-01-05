@@ -607,3 +607,9 @@ const renderedCards = await Promise.all(
 **Admin changes not showing in gallery:** Ensure dev server is running (`npm run dev`). Hard refresh browser (Cmd+Shift+R).
 
 **Deploy failing:** Check SSH key access to server. Verify `REMOTE_USER`, `REMOTE_HOST`, `REMOTE_ROOT` in `scripts/deploy.sh`. Ensure PM2 and Node.js are installed on server.
+
+**403 Forbidden after deploy:** File permissions may be wrong (rsync can set 700). Fix with:
+```bash
+chmod -R 755 public_html && find public_html -type f -exec chmod 644 {} \;
+```
+Required permissions: directories `755`, files `644`, `.htaccess` files `644`.

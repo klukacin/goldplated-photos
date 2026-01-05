@@ -1,13 +1,20 @@
 ---
 import type { Photo } from '../lib/albums';
+import { siteConfig } from '../config';
 
 interface Props {
   photos: Photo[];
   style: 'grid' | 'masonry' | 'slideshow' | 'single-column';
   albumPath: string;
+  albumToken?: string;
+  isProtected?: boolean;
+  hasAccess?: boolean;
 }
 
-const { photos, style, albumPath } = Astro.props;
+const { photos, style, albumPath, albumToken = '', isProtected = false, hasAccess = true } = Astro.props;
+
+// Get site URL for share links
+const siteUrl = siteConfig.url;
 
 // Cache version - increment to bust browser cache after thumbnail changes
 const THUMBNAIL_VERSION = 2;
@@ -183,6 +190,71 @@ function getVideoMimeType(filename: string): string {
 <!-- Toast Notification -->
 <div id="share-toast" class="share-toast" aria-live="polite">
   Link copied to clipboard
+</div>
+
+<!-- Share Modal -->
+<div id="share-modal" class="share-modal-overlay" data-album-path={albumPath} data-album-token={albumToken} data-is-protected={isProtected.toString()} data-has-access={hasAccess.toString()} data-site-url={siteUrl}>
+  <div class="share-modal">
+    <div class="share-modal-header">
+      <h3>Share</h3>
+      <button class="share-modal-close" aria-label="Close">&times;</button>
+    </div>
+
+    {isProtected && (
+      <div class="share-modal-warning">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+          <line x1="12" y1="9" x2="12" y2="13"></line>
+          <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+        <div>
+          <strong>Protected Content</strong>
+          <p>Share link includes access token. Anyone with this link can view without password.</p>
+        </div>
+      </div>
+    )}
+
+    <div class="share-modal-content">
+      <div class="share-modal-preview">
+        <img id="share-modal-thumb" src="" alt="Preview" />
+        <span id="share-modal-filename"></span>
+      </div>
+
+      <div class="share-modal-buttons">
+        <button class="share-btn share-btn-copy" data-action="copy">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+          </svg>
+          Copy Link
+        </button>
+
+        <div class="share-btn-row">
+          <button class="share-btn share-btn-facebook" data-action="facebook">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
+            </svg>
+            Facebook
+          </button>
+
+          <button class="share-btn share-btn-linkedin" data-action="linkedin">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
+            </svg>
+            LinkedIn
+          </button>
+        </div>
+
+        <button class="share-btn share-btn-instagram" data-action="instagram">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zM12 0C8.741 0 8.333.014 7.053.072 2.695.272.273 2.69.073 7.052.014 8.333 0 8.741 0 12c0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98C8.333 23.986 8.741 24 12 24c3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98C15.668.014 15.259 0 12 0zm0 5.838a6.162 6.162 0 100 12.324 6.162 6.162 0 000-12.324zM12 16a4 4 0 110-8 4 4 0 010 8zm6.406-11.845a1.44 1.44 0 100 2.881 1.44 1.44 0 000-2.881z"/>
+          </svg>
+          Instagram
+          <span class="share-btn-hint">Downloads watermarked image</span>
+        </button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <style>
@@ -835,6 +907,222 @@ function getVideoMimeType(filename: string): string {
       transition: none;
     }
   }
+
+  /* Share Modal */
+  .share-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 10001;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s ease, visibility 0.2s ease;
+  }
+
+  .share-modal-overlay.visible {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .share-modal {
+    background: #1a1a1a;
+    border-radius: 12px;
+    width: 90%;
+    max-width: 380px;
+    max-height: 90vh;
+    overflow: hidden;
+    transform: scale(0.95);
+    transition: transform 0.2s ease;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  .share-modal-overlay.visible .share-modal {
+    transform: scale(1);
+  }
+
+  .share-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid #333;
+  }
+
+  .share-modal-header h3 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #fff;
+  }
+
+  .share-modal-close {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    transition: color 0.15s ease;
+  }
+
+  .share-modal-close:hover {
+    color: #fff;
+  }
+
+  .share-modal-warning {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.875rem 1.25rem;
+    background: rgba(234, 179, 8, 0.15);
+    border-bottom: 1px solid rgba(234, 179, 8, 0.3);
+  }
+
+  .share-modal-warning svg {
+    flex-shrink: 0;
+    color: #eab308;
+    margin-top: 2px;
+  }
+
+  .share-modal-warning strong {
+    display: block;
+    color: #eab308;
+    font-size: 0.85rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .share-modal-warning p {
+    margin: 0;
+    color: #a3a3a3;
+    font-size: 0.8rem;
+    line-height: 1.4;
+  }
+
+  .share-modal-content {
+    padding: 1.25rem;
+  }
+
+  .share-modal-preview {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid #333;
+  }
+
+  .share-modal-preview img {
+    width: 48px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 6px;
+    background: #333;
+  }
+
+  .share-modal-preview span {
+    color: #e5e5e5;
+    font-size: 0.9rem;
+    word-break: break-all;
+    flex: 1;
+  }
+
+  .share-modal-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .share-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.875rem 1rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    position: relative;
+  }
+
+  .share-btn-copy {
+    background: #fff;
+    color: #0a0a0a;
+  }
+
+  .share-btn-copy:hover {
+    background: #e5e5e5;
+  }
+
+  .share-btn-row {
+    display: flex;
+    gap: 0.75rem;
+  }
+
+  .share-btn-row .share-btn {
+    flex: 1;
+  }
+
+  .share-btn-facebook {
+    background: #1877f2;
+    color: #fff;
+  }
+
+  .share-btn-facebook:hover {
+    background: #166fe5;
+  }
+
+  .share-btn-linkedin {
+    background: #0a66c2;
+    color: #fff;
+  }
+
+  .share-btn-linkedin:hover {
+    background: #0958a8;
+  }
+
+  .share-btn-instagram {
+    background: linear-gradient(45deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%);
+    color: #fff;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .share-btn-instagram:hover {
+    filter: brightness(1.1);
+  }
+
+  .share-btn-hint {
+    font-size: 0.75rem;
+    opacity: 0.8;
+    font-weight: 400;
+  }
+
+  @media (max-width: 480px) {
+    .share-modal {
+      width: 95%;
+      max-width: none;
+      margin: 1rem;
+    }
+
+    .share-btn-row {
+      flex-direction: column;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .share-modal-overlay,
+    .share-modal {
+      transition: none;
+    }
+  }
 </style>
 
 <script>
@@ -881,8 +1169,24 @@ function getVideoMimeType(filename: string): string {
   // Video info cache
   const videoInfoCache = new Map();
 
-  // ============ Share Functionality ============
+  // ============ Share Modal Functionality ============
   const shareToast = document.getElementById('share-toast');
+  const shareModal = document.getElementById('share-modal');
+  const shareModalThumb = document.getElementById('share-modal-thumb') as HTMLImageElement;
+  const shareModalFilename = document.getElementById('share-modal-filename');
+
+  // Get share config from modal data attributes
+  const shareConfig = {
+    albumPath: shareModal?.dataset.albumPath || '',
+    albumToken: shareModal?.dataset.albumToken || '',
+    isProtected: shareModal?.dataset.isProtected === 'true',
+    hasAccess: shareModal?.dataset.hasAccess === 'true',
+    siteUrl: shareModal?.dataset.siteUrl || window.location.origin
+  };
+
+  // Current photo being shared
+  let currentShareFilename = '';
+  let currentSharePhotoUrl = '';
 
   function showToast(message: string) {
     if (!shareToast) return;
@@ -893,43 +1197,157 @@ function getVideoMimeType(filename: string): string {
     }, 2000);
   }
 
-  async function shareContent(title: string, url: string) {
+  function openShareModal(filename: string, thumbnailUrl: string) {
+    if (!shareModal) return;
+
+    currentShareFilename = filename;
+    currentSharePhotoUrl = thumbnailUrl;
+
+    // Update modal preview
+    if (shareModalThumb) {
+      shareModalThumb.src = thumbnailUrl;
+    }
+    if (shareModalFilename) {
+      shareModalFilename.textContent = filename;
+    }
+
+    // Show modal
+    shareModal.classList.add('visible');
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeShareModal() {
+    if (!shareModal) return;
+    shareModal.classList.remove('visible');
+    document.body.style.overflow = '';
+  }
+
+  // Build share URL with optional token for protected albums
+  function getPhotoShareUrl(filename: string): string {
+    let url = `${shareConfig.siteUrl}/photos/${shareConfig.albumPath}`;
+
+    if (filename) {
+      url += `?photo=${encodeURIComponent(filename)}`;
+    }
+
+    // Add token for protected albums
+    if (shareConfig.isProtected && shareConfig.albumToken) {
+      url += (filename ? '&' : '?') + `token=${shareConfig.albumToken}`;
+    }
+
+    return url;
+  }
+
+  // Copy link to clipboard
+  async function copyShareLink() {
+    const url = getPhotoShareUrl(currentShareFilename);
     try {
-      if (navigator.share) {
-        await navigator.share({ title, url });
-      } else {
-        // Fallback: copy to clipboard
-        await navigator.clipboard.writeText(url);
-        showToast('Link copied to clipboard');
-      }
-    } catch (err) {
-      // User cancelled share or error occurred
-      if ((err as Error).name !== 'AbortError') {
-        // Try clipboard fallback
-        try {
-          await navigator.clipboard.writeText(url);
-          showToast('Link copied to clipboard');
-        } catch {
-          showToast('Could not share');
-        }
-      }
+      await navigator.clipboard.writeText(url);
+      showToast('Link copied to clipboard');
+      closeShareModal();
+    } catch {
+      showToast('Could not copy link');
     }
   }
 
-  function getPhotoShareUrl(filename: string): string {
-    const albumPath = document.querySelector('[data-album-path]')?.getAttribute('data-album-path') || '';
-    const baseUrl = window.location.origin;
-    return `${baseUrl}/photos/${albumPath}?photo=${encodeURIComponent(filename)}`;
+  // Share to Facebook
+  function shareToFacebook() {
+    const url = getPhotoShareUrl(currentShareFilename);
+    window.open(
+      `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`,
+      '_blank',
+      'width=600,height=400'
+    );
+    closeShareModal();
   }
 
-  // Share button click handlers (grid view)
+  // Share to LinkedIn
+  function shareToLinkedIn() {
+    const url = getPhotoShareUrl(currentShareFilename);
+    window.open(
+      `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(url)}`,
+      '_blank',
+      'width=600,height=400'
+    );
+    closeShareModal();
+  }
+
+  // Share to Instagram (download watermarked image)
+  async function shareToInstagram() {
+    if (!currentShareFilename) return;
+
+    showToast('Preparing watermarked image...');
+
+    try {
+      // Build the path for the watermark API
+      const imagePath = `${shareConfig.albumPath}/${currentShareFilename}`;
+      const watermarkUrl = `/api/watermark?path=${encodeURIComponent(imagePath)}`;
+
+      // Fetch watermarked image
+      const response = await fetch(watermarkUrl);
+      if (!response.ok) throw new Error('Failed to generate watermarked image');
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+
+      // Download the image
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${currentShareFilename.replace(/\.[^.]+$/, '')}-share.jpg`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      showToast('Image downloaded. Share from your gallery in Instagram.');
+      closeShareModal();
+    } catch (error) {
+      console.error('Instagram share error:', error);
+      showToast('Could not prepare image');
+    }
+  }
+
+  // Share modal event listeners
+  if (shareModal) {
+    // Close button
+    shareModal.querySelector('.share-modal-close')?.addEventListener('click', closeShareModal);
+
+    // Close on overlay click
+    shareModal.addEventListener('click', (e) => {
+      if (e.target === shareModal) closeShareModal();
+    });
+
+    // Close on Escape key
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && shareModal.classList.contains('visible')) {
+        closeShareModal();
+      }
+    });
+
+    // Share button actions
+    shareModal.querySelectorAll('.share-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const action = (btn as HTMLElement).dataset.action;
+        switch (action) {
+          case 'copy': copyShareLink(); break;
+          case 'facebook': shareToFacebook(); break;
+          case 'linkedin': shareToLinkedIn(); break;
+          case 'instagram': shareToInstagram(); break;
+        }
+      });
+    });
+  }
+
+  // Share button click handlers (grid view) - now opens modal
   document.querySelectorAll('.icon-share').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       e.preventDefault();
       e.stopPropagation();
       const filename = (btn as HTMLElement).dataset.photoFilename || '';
-      const url = getPhotoShareUrl(filename);
-      await shareContent(`Photo: ${filename}`, url);
+      const photoItem = (btn as HTMLElement).closest('.photo-item');
+      const photoLink = photoItem?.querySelector('.photo-link') as HTMLAnchorElement;
+      const thumbnailUrl = photoLink?.querySelector('img')?.src || '';
+      openShareModal(filename, thumbnailUrl);
     });
   });
 
@@ -1336,8 +1754,8 @@ function getVideoMimeType(filename: string): string {
     shareBtn.addEventListener('click', () => {
       const element = pswp.currSlide?.data?.element;
       const filename = element?.getAttribute('data-photo-filename') || '';
-      const url = getPhotoShareUrl(filename);
-      shareContent(`Photo: ${filename}`, url);
+      const thumbnailUrl = element?.querySelector('img')?.src || '';
+      openShareModal(filename, thumbnailUrl);
     });
     originalBtn.addEventListener('click', toggleOriginalMode);
     helpBtn.addEventListener('click', toggleHelp);
@@ -1403,8 +1821,8 @@ function getVideoMimeType(filename: string): string {
         event.preventDefault();
         const element = pswp.currSlide?.data?.element;
         const filename = element?.getAttribute('data-photo-filename') || '';
-        const url = getPhotoShareUrl(filename);
-        shareContent(`Photo: ${filename}`, url);
+        const thumbnailUrl = element?.querySelector('img')?.src || '';
+        openShareModal(filename, thumbnailUrl);
       }
 
       // Handle 'i' key to toggle EXIF
@@ -1665,8 +2083,8 @@ function getVideoMimeType(filename: string): string {
         link.click();
       } else if (action === 'share' && currentContextPhoto) {
         const filename = longPressTarget?.dataset.photoFilename || '';
-        const url = getPhotoShareUrl(filename);
-        shareContent(`Photo: ${filename}`, url);
+        const thumbnailUrl = longPressTarget?.querySelector('img')?.src || '';
+        openShareModal(filename, thumbnailUrl);
       }
 
       contextMenu?.classList.remove('active');

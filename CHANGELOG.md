@@ -5,6 +5,29 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-01-05
+
+### Added
+
+- **Enhanced Share Modal** - New share modal with multiple sharing options
+  - Copy Link button with automatic token inclusion for protected albums
+  - Facebook share integration
+  - LinkedIn share integration
+  - Instagram share with watermarked image download
+- **Watermark API** - Server-side image watermarking for Instagram shares
+  - Configurable watermark text (defaults to site URL)
+  - Bottom-right positioning with 50% opacity
+  - Clean sans-serif font with shadow for visibility
+- **Protected Content Warning** - Alerts users when sharing password-protected content
+- Share modal accessible from all locations: grid hover, lightbox toolbar, mobile long-press menu, and S keyboard shortcut
+
+### Changed
+
+- Share buttons now open modal instead of copying directly
+- Protected album shares automatically include access token in URL
+
+---
+
 ## [0.2.0] - 2026-01-05
 
 ### Added
