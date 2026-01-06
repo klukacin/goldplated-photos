@@ -62,3 +62,4 @@ src/content/home/
 *.webm
 *.m4v
 .private/
+docs/site/

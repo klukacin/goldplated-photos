@@ -3,9 +3,24 @@
 # Deployment script for Astro Photo Gallery
 # Syncs build artifacts, content, and admin interface to production.
 #
+# Usage:
+#   npm run deploy              # Normal deploy (checksum for code only)
+#   npm run deploy -- --checksum   # Force checksum for albums too (slower but thorough)
+#
 # Configuration:
 #   - Copy .env.example to .env and fill in your deployment settings
 #   - Supports SSH key (recommended) or password authentication
+
+# --- Parse Arguments ---
+FORCE_CHECKSUM=""
+for arg in "$@"; do
+    case $arg in
+        --checksum)
+            FORCE_CHECKSUM="--checksum"
+            shift
+            ;;
+    esac
+done
 
 # --- Load Environment Variables ---
 # Load from .env file if it exists (from project root)
@@ -90,6 +105,9 @@ echo -e "${GREEN}Starting Deployment to ${REMOTE_HOST}...${NC}"
 echo -e "${DIM}  User: ${REMOTE_USER}${NC}"
 echo -e "${DIM}  Path: ${REMOTE_ROOT}${NC}"
 echo -e "${DIM}  Auth: ${AUTH_METHOD}${NC}"
+if [[ -n "$FORCE_CHECKSUM" ]]; then
+    echo -e "${YELLOW}  Mode: Checksum sync for albums (slower but thorough)${NC}"
+fi
 echo ""
 
 # 1. Sanitize Folder Names (lowercase)
@@ -221,11 +239,11 @@ add_album_tasks() {
             # Recurse into subfolders first
             add_album_tasks "$dir" "$remote_base/$name" "$display_base/$name"
             # Also sync parent's root files (index.md, etc) without --delete
-            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|")
+            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|$FORCE_CHECKSUM")
             SYNC_NAMES+=("${display_base#/}/$name (root)")
         else
             # Leaf folder (actual album) - sync with --delete
-            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete")
+            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete $FORCE_CHECKSUM")
             SYNC_NAMES+=("${display_base#/}/$name")
         fi
     done
