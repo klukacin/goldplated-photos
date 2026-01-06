@@ -5,6 +5,17 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-01-06
+
+### Fixed
+
+- Deploy script now recursively expands album folders at any depth
+  - Previously only handled 2 levels (e.g., `neos/razno/` synced as one task)
+  - Now each leaf album syncs separately (e.g., `neos/razno/kraljevi-2026/`)
+  - Prevents partial syncs when connection drops on large folders
+
+---
+
 ## [0.4.1] - 2026-01-05
 
 ### Fixed

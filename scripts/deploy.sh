@@ -202,31 +202,37 @@ SYNC_NAMES+=("client")
 SYNC_TASKS+=("public/|${REMOTE_ROOT}/public/|--delete")
 SYNC_NAMES+=("public")
 
-# Add album directories - expand albums with subfolders into separate tasks
-for dir in src/content/albums/*/; do
-    name=$(basename "$dir")
+# Add album directories - recursively expand collections at any depth
+add_album_tasks() {
+    local base_path=$1
+    local remote_base=$2
+    local display_base=$3
 
-    # Check if album has subfolders (collections)
-    shopt -s nullglob
-    subdirs=("$dir"*/)
-    shopt -u nullglob
+    for dir in "$base_path"/*/; do
+        [[ ! -d "$dir" ]] && continue
+        local name=$(basename "$dir")
 
-    if [[ ${#subdirs[@]} -gt 0 ]]; then
-        # Queue each subfolder separately for better parallelism
-        for subdir in "${subdirs[@]}"; do
-            subname=$(basename "$subdir")
-            SYNC_TASKS+=("$subdir|${REMOTE_ROOT}/src/content/albums/$name/$subname/|--delete")
-            SYNC_NAMES+=("$name/$subname")
-        done
-        # Also sync the parent's index.md and any root files
-        SYNC_TASKS+=("$dir|${REMOTE_ROOT}/src/content/albums/$name/|")
-        SYNC_NAMES+=("$name (root)")
-    else
-        # No subfolders - queue as single task
-        SYNC_TASKS+=("$dir|${REMOTE_ROOT}/src/content/albums/$name/|--delete")
-        SYNC_NAMES+=("$name")
-    fi
-done
+        # Check if this folder has subfolders (is a collection)
+        shopt -s nullglob
+        local subdirs=("$dir"*/)
+        shopt -u nullglob
+
+        if [[ ${#subdirs[@]} -gt 0 ]]; then
+            # Recurse into subfolders first
+            add_album_tasks "$dir" "$remote_base/$name" "$display_base/$name"
+            # Also sync parent's root files (index.md, etc) without --delete
+            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|")
+            SYNC_NAMES+=("${display_base#/}/$name (root)")
+        else
+            # Leaf folder (actual album) - sync with --delete
+            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete")
+            SYNC_NAMES+=("${display_base#/}/$name")
+        fi
+    done
+}
+
+# Start recursive expansion from albums root
+add_album_tasks "src/content/albums" "src/content/albums" ""
 
 TOTAL_TASKS=${#SYNC_TASKS[@]}
 MAX_WORKERS=4
