@@ -5,6 +5,20 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-01-07
+
+### Added
+
+- **Configurable rsync permissions** via `.env` file
+  - `DEPLOY_CHMOD_DIRS` - Directory permissions (default: 775)
+  - `DEPLOY_CHMOD_FILES` - File permissions (default: 664)
+  - `DEPLOY_CHMOD_PRIVATE` - Private files like index.md, .htaccess (default: 660)
+  - `DEPLOY_CHOWN` - Optional ownership setting (e.g., `user:www-data`)
+- Deploy script now displays permission configuration at startup
+- Support for different server setups (shared hosting vs Apache/Nginx www-data)
+
+---
+
 ## [0.4.3] - 2026-01-06
 
 ### Added

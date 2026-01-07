@@ -44,6 +44,12 @@ SSH_PORT="${DEPLOY_SSH_PORT:-22}"
 SSH_KEY="${DEPLOY_SSH_KEY:-}"
 SSH_PASSWORD="${DEPLOY_SSH_PASSWORD:-}"
 
+# --- Permission Configuration ---
+CHMOD_DIRS="${DEPLOY_CHMOD_DIRS:-775}"
+CHMOD_FILES="${DEPLOY_CHMOD_FILES:-664}"
+CHMOD_PRIVATE="${DEPLOY_CHMOD_PRIVATE:-660}"
+CHOWN="${DEPLOY_CHOWN:-}"
+
 # SSH multiplexing - reuse single connection for all operations
 CONTROL_PATH="/tmp/deploy-ssh-$$"
 SSH_BASE_OPTS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=60"
@@ -105,6 +111,10 @@ echo -e "${GREEN}Starting Deployment to ${REMOTE_HOST}...${NC}"
 echo -e "${DIM}  User: ${REMOTE_USER}${NC}"
 echo -e "${DIM}  Path: ${REMOTE_ROOT}${NC}"
 echo -e "${DIM}  Auth: ${AUTH_METHOD}${NC}"
+echo -e "${DIM}  Chmod: dirs=${CHMOD_DIRS}, files=${CHMOD_FILES}, private=${CHMOD_PRIVATE}${NC}"
+if [[ -n "$CHOWN" ]]; then
+    echo -e "${DIM}  Chown: ${CHOWN}${NC}"
+fi
 if [[ -n "$FORCE_CHECKSUM" ]]; then
     echo -e "${YELLOW}  Mode: Checksum sync for albums (slower but thorough)${NC}"
 fi
@@ -176,8 +186,8 @@ sync_with_status() {
 
     # Run rsync with --progress to get speed info
     # Use process substitution to avoid subshell issues with "done" status
-    # Permissions: dirs=775, files=664 (public readable)
-    rsync -av --progress --partial --chmod=D775,F664 $opts \
+    # Permissions: configurable via DEPLOY_CHMOD_* env vars
+    rsync -av --progress --partial --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $opts \
         -e "ssh $SSH_OPTS -p $SSH_PORT" \
         "$src" "${REMOTE_USER}@${REMOTE_HOST}:${dest}" > >(
             while IFS= read -r line; do
@@ -204,7 +214,7 @@ sync_simple() {
     local dest=$2
     local opts=$3
     echo -e "  ${DIM}→ Syncing $src...${NC}"
-    rsync -av --partial --chmod=D775,F664 $opts -e "ssh $SSH_OPTS -p $SSH_PORT" "$src" "${REMOTE_USER}@${REMOTE_HOST}:${dest}" > /dev/null 2>&1
+    rsync -av --partial --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $opts -e "ssh $SSH_OPTS -p $SSH_PORT" "$src" "${REMOTE_USER}@${REMOTE_HOST}:${dest}" > /dev/null 2>&1
 }
 
 echo -e "${YELLOW}[5/7] Syncing files (parallel)...${NC}"
@@ -446,12 +456,18 @@ ssh $SSH_OPTS -p $SSH_PORT ${REMOTE_USER}@${REMOTE_HOST} "bash -s" <<EOF
         ln -s src/content/albums albums
     fi
 
-    # 3. Set sensitive files to 660 (not world-readable)
+    # 3. Set sensitive files to private permissions (not world-readable)
     # index.md files contain passwords, body.md may have private content
-    echo "  -> Setting private file permissions (660)..."
-    find src/content/albums -name "index.md" -exec chmod 660 {} \;
-    find src/content/albums -name "body.md" -exec chmod 660 {} \;
-    find . -name ".htaccess" -exec chmod 660 {} \;
+    echo "  -> Setting private file permissions (${CHMOD_PRIVATE})..."
+    find src/content/albums -name "index.md" -exec chmod ${CHMOD_PRIVATE} {} \;
+    find src/content/albums -name "body.md" -exec chmod ${CHMOD_PRIVATE} {} \;
+    find . -name ".htaccess" -exec chmod ${CHMOD_PRIVATE} {} \;
+
+    # 4. Optional: Set ownership if DEPLOY_CHOWN is configured
+    if [[ -n "${CHOWN}" ]]; then
+        echo "  -> Setting ownership to ${CHOWN}..."
+        chown -R ${CHOWN} src/content/albums public client server 2>/dev/null || echo "    (chown skipped - may require sudo)"
+    fi
 
     # Install Dependencies
     echo "  -> Installing dependencies..."

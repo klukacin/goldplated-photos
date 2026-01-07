@@ -445,12 +445,26 @@ LOCAL                           PRODUCTION
 
 ### Configuration
 
-Edit `scripts/deploy.sh`:
+Edit `.env` (copy from `.env.example`):
 ```bash
-REMOTE_USER="username"
-REMOTE_HOST="server.com"
-REMOTE_ROOT="/path/to/public_html"
+# Server connection
+DEPLOY_REMOTE_USER="username"
+DEPLOY_REMOTE_HOST="server.com"
+DEPLOY_REMOTE_ROOT="/path/to/public_html"
+
+# File permissions (adjust for your server setup)
+DEPLOY_CHMOD_DIRS=775      # Directory permissions
+DEPLOY_CHMOD_FILES=664     # File permissions
+DEPLOY_CHMOD_PRIVATE=660   # Private files (index.md, .htaccess)
+# DEPLOY_CHOWN=user:www-data  # Optional ownership
 ```
+
+**Permission Presets:**
+
+| Setup | Dirs | Files | Private |
+|-------|------|-------|---------|
+| Shared hosting (same user) | 775 | 664 | 660 |
+| Apache/Nginx (www-data) | 755 | 644 | 640 |
 
 ## Key Files
 
