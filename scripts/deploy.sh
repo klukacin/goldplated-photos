@@ -248,8 +248,8 @@ add_album_tasks() {
         if [[ ${#subdirs[@]} -gt 0 ]]; then
             # Recurse into subfolders first
             add_album_tasks "$dir" "$remote_base/$name" "$display_base/$name"
-            # Also sync parent's root files (index.md, etc) without --delete
-            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|$FORCE_CHECKSUM")
+            # Sync collection folder with --delete (subfolders already synced above)
+            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete $FORCE_CHECKSUM")
             SYNC_NAMES+=("${display_base#/}/$name (root)")
         else
             # Leaf folder (actual album) - sync with --delete
