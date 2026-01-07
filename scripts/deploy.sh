@@ -187,6 +187,7 @@ sync_with_status() {
     # Run rsync with --progress to get speed info
     # Use process substitution to avoid subshell issues with "done" status
     # Permissions: configurable via DEPLOY_CHMOD_* env vars
+    local rsync_exit=0
     rsync -av --progress --partial --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $opts \
         -e "ssh $SSH_OPTS -p $SSH_PORT" \
         "$src" "${REMOTE_USER}@${REMOTE_HOST}:${dest}" > >(
@@ -203,9 +204,16 @@ sync_with_status() {
                 fi
             done
         ) 2>&1
+    rsync_exit=$?
 
-    # This runs after rsync completes (not in a subshell)
-    echo "done|$name|||" > "$status_file"
+    # Check rsync exit code and report status
+    if [[ $rsync_exit -eq 0 ]]; then
+        echo "done|$name|||" > "$status_file"
+    else
+        echo "failed|$name|exit=$rsync_exit||" > "$status_file"
+        # Write error to a log file for later review
+        echo "$(date '+%H:%M:%S') FAILED: $name (src=$src, exit=$rsync_exit)" >> "$DEPLOY_TMP/errors.log"
+    fi
 }
 
 # Simple sync without live progress (for sequential syncs)
@@ -248,8 +256,9 @@ add_album_tasks() {
         if [[ ${#subdirs[@]} -gt 0 ]]; then
             # Recurse into subfolders first
             add_album_tasks "$dir" "$remote_base/$name" "$display_base/$name"
-            # Sync collection folder with --delete (subfolders already synced above)
-            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete $FORCE_CHECKSUM")
+            # Sync collection folder ROOT ONLY (exclude subfolders to avoid race condition)
+            # Subfolders are already synced above - only sync root files like index.md
+            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete --exclude='*/' $FORCE_CHECKSUM")
             SYNC_NAMES+=("${display_base#/}/$name (root)")
         else
             # Leaf folder (actual album) - sync with --delete
@@ -317,6 +326,8 @@ draw_status() {
             printf "\r${CLEAR_LINE}"
             if [[ "$state" == "done" ]]; then
                 printf "  ${GREEN}✓ %-20s done${NC}" "$name"
+            elif [[ "$state" == "failed" ]]; then
+                printf "  \033[1;31m✗ %-20s FAILED${NC}" "$name"
             elif [[ "$state" == "running" ]]; then
                 printf "  ${CYAN}● %-20s syncing...${NC}" "$name"
             else
@@ -408,7 +419,24 @@ draw_status
 
 printf "${SHOW_CURSOR}"
 echo ""
-echo -e "  ${GREEN}✓ All $TOTAL_TASKS sync tasks completed${NC}"
+
+# Check for failed tasks
+FAILED_COUNT=0
+if [[ -f "$DEPLOY_TMP/errors.log" ]]; then
+    FAILED_COUNT=$(wc -l < "$DEPLOY_TMP/errors.log" | tr -d ' ')
+fi
+
+if [[ $FAILED_COUNT -gt 0 ]]; then
+    echo -e "  \033[1;31m✗ $FAILED_COUNT sync tasks FAILED${NC}"
+    echo -e "  ${DIM}Failed tasks:${NC}"
+    cat "$DEPLOY_TMP/errors.log" | while read line; do
+        echo -e "    \033[1;31m$line${NC}"
+    done
+    echo ""
+    echo -e "  ${YELLOW}Warning: Some files may not have synced. Run deploy again or fix manually.${NC}"
+else
+    echo -e "  ${GREEN}✓ All $TOTAL_TASKS sync tasks completed${NC}"
+fi
 echo ""
 
 # Sequential syncs for small files (no fancy display needed)

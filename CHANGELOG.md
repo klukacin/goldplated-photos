@@ -5,6 +5,21 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-01-07
+
+### Fixed
+
+- **Critical: Deploy parallel sync race condition**
+  - Collection folders now exclude subfolders (`--exclude='*/'`) to prevent overlapping syncs
+  - Previously, parent and subfolder syncs ran in parallel on the SAME files
+  - This caused data corruption, missing folders, and orphaned files
+- **Deploy now reports rsync failures**
+  - Added exit code checking for rsync operations
+  - Failed tasks shown in red with error log
+  - Clear warning message when failures occur
+
+---
+
 ## [0.4.5] - 2026-01-07
 
 ### Fixed
