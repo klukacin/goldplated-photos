@@ -436,12 +436,22 @@ LOCAL                           PRODUCTION
 
 ### Deploy Script (scripts/deploy.sh)
 
+Uses a **three-phase sync** approach (industry best practice from [psuter.ch](https://wiki.psuter.ch/doku.php?id=parallel_rsync)):
+
 1. `npm run build` - Build production site
 2. Fix paths for production server
-3. rsync files to remote (with `--delete` for albums)
-4. Create symlinks on server
-5. `npm install --production` on remote
-6. `pm2 restart` on remote
+3. **Phase 1 (Parallel)**: Sync leaf albums with 4 workers (`--delete`)
+4. **Phase 2 (Sequential)**: Sync collection root files (`--exclude='*/'`)
+5. **Phase 3 (Verification)**: Final rsync of entire albums tree (`--delete`)
+6. Sync code files (server, scripts, config)
+7. Create symlinks on server
+8. `npm install --production` on remote
+9. `pm2 restart` on remote
+
+**Why three phases?**
+- **Leaf albums** (no subfolders): Safe to sync in parallel with `--delete`
+- **Collection folders** (have subfolders): Cannot use `--delete` in parallel (race condition)
+- **Verification pass**: Catches any missed files, cleans orphans safely
 
 ### Configuration
 

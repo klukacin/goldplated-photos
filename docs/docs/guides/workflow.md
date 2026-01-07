@@ -144,15 +144,16 @@ When you're satisfied with your changes, deploy to your server:
 npm run deploy
 ```
 
-This command:
+This command uses a **three-phase sync** for reliability:
 
-1. Builds the production site
-2. Syncs files to your server via rsync
-3. Restarts the server process
-4. Albums with `--delete` flag removes old files
+1. **Build** - Creates production site locally
+2. **Phase 1** - Parallel sync of leaf albums (4 workers, fast)
+3. **Phase 2** - Sequential sync of collection root files
+4. **Phase 3** - Verification rsync of entire albums tree
+5. **Restart** - Restarts server process via PM2
 
 !!! warning "Deploy Syncs Everything"
-    The deploy command syncs your local albums to the server. Albums deleted locally will be removed from the server too.
+    The deploy command syncs your local albums to the server. Albums deleted locally will be removed from the server too (cleaned up in Phase 3 verification pass).
 
 ### Verify Deployment
 

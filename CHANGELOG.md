@@ -7,16 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.6] - 2026-01-07
 
+### Changed
+
+- **Deploy script redesigned with three-phase sync** (industry best practice)
+  - **Phase 1 (Parallel)**: Leaf albums sync with 4 workers, `--delete` flag
+  - **Phase 2 (Sequential)**: Collection root files sync without `--delete`
+  - **Phase 3 (Verification)**: Final rsync of entire albums tree with `--delete`
+  - Based on research from [psuter.ch](https://wiki.psuter.ch/doku.php?id=parallel_rsync) parallel rsync
+
 ### Fixed
 
 - **Critical: Deploy parallel sync race condition**
-  - Collection folders now exclude subfolders (`--exclude='*/'`) to prevent overlapping syncs
-  - Previously, parent and subfolder syncs ran in parallel on the SAME files
-  - This caused data corruption, missing folders, and orphaned files
-- **Deploy now reports rsync failures**
-  - Added exit code checking for rsync operations
-  - Failed tasks shown in red with error log
-  - Clear warning message when failures occur
+  - Only leaf albums (folders without subfolders) sync in parallel now
+  - Collection folders tracked separately, synced sequentially
+  - Final verification pass catches any missed files or orphans
+- **Simplified collection sync** (removed complex `--filter` rules)
+  - Old: `--delete --filter='P */' --filter='- */'` (error-prone)
+  - New: `--exclude='*/'` only (simple, safe)
+- **Comprehensive error handling across all sync phases**
+  - Phase 1: Exit code checking (was already present)
+  - Phase 2: Added error tracking for collection root syncs
+  - Phase 3: Added error tracking for verification pass
+  - `sync_simple`: Added error tracking for code/config syncs
+  - All failures logged to error file with timestamps
 
 ---
 

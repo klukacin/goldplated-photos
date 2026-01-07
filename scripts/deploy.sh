@@ -222,7 +222,10 @@ sync_simple() {
     local dest=$2
     local opts=$3
     echo -e "  ${DIM}→ Syncing $src...${NC}"
-    rsync -av --partial --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $opts -e "ssh $SSH_OPTS -p $SSH_PORT" "$src" "${REMOTE_USER}@${REMOTE_HOST}:${dest}" > /dev/null 2>&1
+    if ! rsync -av --partial --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $opts -e "ssh $SSH_OPTS -p $SSH_PORT" "$src" "${REMOTE_USER}@${REMOTE_HOST}:${dest}" > /dev/null 2>&1; then
+        echo "$(date '+%H:%M:%S') FAILED: $src" >> "$DEPLOY_TMP/errors.log"
+        return 1
+    fi
 }
 
 echo -e "${YELLOW}[5/7] Syncing files (parallel)...${NC}"
@@ -231,6 +234,7 @@ echo ""
 # Collect all sync tasks
 declare -a SYNC_TASKS
 declare -a SYNC_NAMES
+declare -a COLLECTION_FOLDERS  # Collection folders to sync sequentially (root files only)
 
 # Add static directories
 SYNC_TASKS+=("dist/client/|${REMOTE_ROOT}/client/|--delete")
@@ -254,12 +258,11 @@ add_album_tasks() {
         shopt -u nullglob
 
         if [[ ${#subdirs[@]} -gt 0 ]]; then
-            # Recurse into subfolders first
+            # This is a collection folder (has subfolders)
+            # Recurse into subfolders first - they'll be synced in parallel
             add_album_tasks "$dir" "$remote_base/$name" "$display_base/$name"
-            # Sync collection folder ROOT ONLY (exclude subfolders to avoid race condition)
-            # Subfolders are already synced above - only sync root files like index.md
-            SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete --exclude='*/' $FORCE_CHECKSUM")
-            SYNC_NAMES+=("${display_base#/}/$name (root)")
+            # Track collection folder for sequential sync later (root files only)
+            COLLECTION_FOLDERS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/")
         else
             # Leaf folder (actual album) - sync with --delete
             SYNC_TASKS+=("$dir|${REMOTE_ROOT}/$remote_base/$name/|--delete $FORCE_CHECKSUM")
@@ -439,6 +442,27 @@ else
 fi
 echo ""
 
+# PHASE 2: Sync collection folder root files (index.md, body.md, .htaccess)
+# Simple approach: just sync root files, no --delete (can only ADD, never break)
+if [[ ${#COLLECTION_FOLDERS[@]} -gt 0 ]]; then
+    echo -e "  ${DIM}Syncing ${#COLLECTION_FOLDERS[@]} collection roots...${NC}"
+    PHASE2_ERRORS=0
+    for entry in "${COLLECTION_FOLDERS[@]}"; do
+        IFS='|' read -r src dest <<< "$entry"
+        # --exclude='*/' skips subdirectories, syncs only root files
+        # NO --delete here - orphans cleaned in Phase 3 verification
+        if ! rsync -av --exclude='*/' \
+            $SSH_OPTS -e "ssh -p $SSH_PORT" \
+            "$src" "${REMOTE_USER}@${REMOTE_HOST}:$dest" > /dev/null 2>&1; then
+            ((PHASE2_ERRORS++))
+            echo "$(date '+%H:%M:%S') FAILED: collection root $src" >> "$DEPLOY_TMP/errors.log"
+        fi
+    done
+    if [[ $PHASE2_ERRORS -gt 0 ]]; then
+        echo -e "  ${RED}✗ $PHASE2_ERRORS collection syncs failed${NC}"
+    fi
+fi
+
 # Sequential syncs for small files (no fancy display needed)
 # Use --checksum for code files to ensure content changes are detected
 # (timestamps can be unreliable after builds)
@@ -448,6 +472,24 @@ sync_simple "dist/client/" "${REMOTE_ROOT}/" "--checksum"
 sync_simple "package.json" "${REMOTE_ROOT}/" "--checksum"
 sync_simple "ecosystem.config.cjs" "${REMOTE_ROOT}/" "--checksum"
 sync_simple "scripts/" "${REMOTE_ROOT}/scripts/" "--checksum"
+
+# PHASE 3: Final verification pass
+# Single rsync of entire albums tree with --delete to catch:
+# - Any files missed by parallel sync
+# - Orphaned files in collection folders
+# - Any corruption or inconsistencies
+# This is fast because most files are already synced (timestamp match)
+echo -e "  ${DIM}Running verification pass...${NC}"
+if rsync -av --delete \
+    $SSH_OPTS -e "ssh -p $SSH_PORT" \
+    "src/content/albums/" \
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/src/content/albums/" \
+    > /dev/null 2>&1; then
+    echo -e "  ${GREEN}✓ Verification complete${NC}"
+else
+    echo -e "  ${RED}✗ Verification FAILED - server may be inconsistent${NC}"
+    echo "$(date '+%H:%M:%S') CRITICAL: Verification rsync failed" >> "$DEPLOY_TMP/errors.log"
+fi
 
 # 6. Post-Deployment Setup
 echo -e "${YELLOW}[6/7] Configuring remote environment...${NC}"

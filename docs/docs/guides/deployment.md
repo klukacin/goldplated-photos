@@ -52,10 +52,13 @@ This single command:
 
 1. Builds the production site locally
 2. Fixes paths for production server
-3. Syncs all files to remote via rsync
-4. Sets up symlinks on server
-5. Installs production dependencies
-6. Restarts PM2
+3. **Phase 1**: Parallel sync of leaf albums (4 workers)
+4. **Phase 2**: Sequential sync of collection root files
+5. **Phase 3**: Verification rsync of entire albums tree
+6. Syncs code files (server, scripts, config)
+7. Sets up symlinks on server
+8. Installs production dependencies
+9. Restarts PM2
 
 ---
 
@@ -75,16 +78,41 @@ Creates `dist/` folder with optimized site.
 
 Runs `fix-server-paths.mjs` to update paths for production.
 
-### Step 3: Sync Files
+### Step 3: Three-Phase Album Sync
 
-Uses rsync to transfer:
+The deploy script uses a **three-phase sync** approach based on [industry best practices](https://wiki.psuter.ch/doku.php?id=parallel_rsync):
+
+**Phase 1 - Parallel Sync (Fast)**
+
+- Syncs **leaf albums** (folders without subfolders) in parallel
+- Uses 4 concurrent rsync workers
+- `--delete` flag removes orphaned files
+- Safe because leaf folders don't overlap
+
+**Phase 2 - Sequential Sync**
+
+- Syncs **collection root files** (index.md, body.md) sequentially
+- Uses `--exclude='*/'` to skip subdirectories
+- No `--delete` flag (can only ADD files, never break)
+
+**Phase 3 - Verification Pass**
+
+- Single rsync of **entire albums tree**
+- `--delete` flag cleans up any orphaned files
+- Catches anything missed by parallel sync
+- Fast because most files already synced
+
+**Other files synced:**
 
 - `dist/client/` - Static assets
 - `dist/server/` - Server code
-- `src/content/albums/` - All albums (**with --delete**)
-- `public/` - Hero images, card images, etc.
-- `package.json` - Dependencies
-- `ecosystem.config.cjs` - PM2 configuration
+- `public/` - Hero images, card images
+- `package.json`, `ecosystem.config.cjs`, `scripts/`
+
+!!! tip "Why Three Phases?"
+    - **Leaf albums** can safely sync in parallel with `--delete`
+    - **Collection folders** cannot use `--delete` during parallel sync (race condition with subfolders)
+    - **Verification pass** safely cleans orphans after all parallel work completes
 
 ### Step 4: Configure Remote
 

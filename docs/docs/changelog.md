@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.6] - 2026-01-07
+
+### Changed
+
+- **Deploy script redesigned with three-phase sync** ([industry best practice](https://wiki.psuter.ch/doku.php?id=parallel_rsync))
+    - Phase 1: Leaf albums sync in parallel with 4 workers
+    - Phase 2: Collection root files sync sequentially
+    - Phase 3: Verification rsync of entire albums tree
+
+### Fixed
+
+- **Critical: Deploy parallel sync race condition** - Collection folders now handled separately
+- **Simplified collection sync** - Removed error-prone `--filter` rules
+
+---
+
+## [0.4.0] - 2026-01-05
+
+### Added
+
+- Mobile hamburger menu for marketing site
+- Swipeable workflow section on mobile
+- Hero carousel touch swipe support
+
+### Fixed
+
+- Lightbox share button z-index
+- Album/folder share buttons use new share modal
+
+---
+
+## [0.3.0] - 2026-01-05
+
+### Added
+
+- Enhanced share modal with Copy Link, Facebook, LinkedIn, Instagram
+- Watermark API for Instagram shares
+- Protected content sharing with automatic token inclusion
+
+---
+
+## [0.2.0] - 2026-01-05
+
+### Added
+
+- Support/donation links (Ko-fi, Wise)
+- Workflow section on docs homepage
+
+---
+
 ## [0.1.0] - 2025-12-28
 
 ### Added
