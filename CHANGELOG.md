@@ -5,6 +5,27 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-01-08
+
+### Added
+
+- **Parallel rsync deployment mode** (`--parallel` flag)
+  - Splits albums by top-level directories (ws, neos, friends, etc.)
+  - Runs up to 5 concurrent rsync workers
+  - Each worker handles complete subtree with `--delete`
+  - Final cleanup pass removes stale remote items
+  - ~2x faster on large syncs
+  - Usage: `npm run deploy:parallel` or `npm run deploy -- --parallel`
+
+### Changed
+
+- **Simplified deploy script** - replaced three-phase sync with cleaner approach
+  - Sequential mode: Single rsync for entire albums tree (default)
+  - Parallel mode: Top-level split with worker pool (opt-in)
+  - Removed complex collection folder handling
+
+---
+
 ## [0.4.6] - 2026-01-07
 
 ### Changed

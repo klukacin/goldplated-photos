@@ -1,7 +1,7 @@
 {
   "name": "goldplated-photos",
   "type": "module",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "A beautiful, secure photo gallery for photographers and enthusiasts",
   "author": "Kristijan Lukacin",
   "contributors": [
@@ -32,6 +32,7 @@
     "build": "astro build",
     "preview": "astro preview",
     "deploy": "./scripts/deploy.sh",
+    "deploy:parallel": "./scripts/deploy.sh --parallel",
     "update": "node scripts/update-albums.mjs",
     "sanitize": "node scripts/sanitize-folders.mjs",
     "sanitize:dry": "node scripts/sanitize-folders.mjs --dry-run",

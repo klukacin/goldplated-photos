@@ -436,22 +436,27 @@ LOCAL                           PRODUCTION
 
 ### Deploy Script (scripts/deploy.sh)
 
-Uses a **three-phase sync** approach (industry best practice from [psuter.ch](https://wiki.psuter.ch/doku.php?id=parallel_rsync)):
+Supports both sequential and parallel rsync deployment modes.
 
-1. `npm run build` - Build production site
-2. Fix paths for production server
-3. **Phase 1 (Parallel)**: Sync leaf albums with 4 workers (`--delete`)
-4. **Phase 2 (Sequential)**: Sync collection root files (`--exclude='*/'`)
-5. **Phase 3 (Verification)**: Final rsync of entire albums tree (`--delete`)
-6. Sync code files (server, scripts, config)
-7. Create symlinks on server
-8. `npm install --production` on remote
-9. `pm2 restart` on remote
+```bash
+npm run deploy                    # Sequential sync (default, simple)
+npm run deploy:parallel           # Parallel sync (5 workers, faster)
+npm run deploy -- --checksum      # Force checksum comparison (slower but thorough)
+npm run deploy -- --parallel --checksum  # Combine flags
+```
 
-**Why three phases?**
-- **Leaf albums** (no subfolders): Safe to sync in parallel with `--delete`
-- **Collection folders** (have subfolders): Cannot use `--delete` in parallel (race condition)
-- **Verification pass**: Catches any missed files, cleans orphans safely
+**Sequential mode (default):** Single rsync for entire albums tree. Zero redundancy, simple.
+
+**Parallel mode:** Splits by top-level directories (ws, neos, friends, etc.), runs up to 5 concurrent rsync processes. Each handles its complete subtree with `--delete`. Final cleanup pass removes stale remote items. ~2x faster on large syncs.
+
+**Steps:**
+1. Sanitize folder names (lowercase)
+2. `npm run build` - Build production site
+3. Fix paths for production server
+4. Sync client, public, albums, server files
+5. Create symlinks on server
+6. Set private file permissions
+7. `npm install --production` + `pm2 restart` on remote
 
 ### Configuration
 
