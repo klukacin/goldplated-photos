@@ -16,6 +16,150 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full contribution guidelines.
 
 ---
 
+## Platform Compatibility
+
+This project was developed on macOS but supports **macOS**, **Linux**, and **Windows**.
+
+### Compatibility Matrix
+
+| Feature | macOS | Linux | Windows | Windows + WSL |
+|---------|-------|-------|---------|---------------|
+| Dev server (`npm run dev`) | ✅ | ✅ | ✅ | ✅ |
+| Admin panel (`npm run admin`) | ✅ | ✅ | ✅ | ✅ |
+| Build (`npm run build`) | ✅ | ✅ | ✅ | ✅ |
+| Background scripts (`dev:bg`, `admin:bg`) | ✅ | ✅ | ❌ | ✅ |
+| Deploy script (`npm run deploy`) | ✅ | ✅ | ❌ | ✅ |
+
+### Windows Setup
+
+#### Option 1: WSL2 (Recommended - Full Compatibility)
+
+WSL2 provides a native Linux environment inside Windows with full compatibility.
+
+**Install WSL2:**
+```powershell
+# Run in PowerShell as Administrator
+wsl --install
+```
+
+**After restart, set up Ubuntu:**
+```bash
+# Update packages
+sudo apt update && sudo apt upgrade -y
+
+# Install Node.js (via nvm - recommended)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+source ~/.bashrc
+nvm install 20
+nvm use 20
+
+# Install ffmpeg (for video metadata)
+sudo apt install ffmpeg -y
+
+# Clone and run project
+git clone <repository-url>
+cd Photo-gallery
+npm install
+npm run dev
+```
+
+**Access from Windows:** Files are at `\\wsl$\Ubuntu\home\<username>\Photo-gallery`
+
+#### Option 2: Native Windows (Limited - No Deploy)
+
+For development only (no bash scripts or deployment).
+
+**Prerequisites:**
+1. **Node.js 20+**: Download from [nodejs.org](https://nodejs.org/)
+2. **Git**: Download from [git-scm.com](https://git-scm.com/)
+3. **FFmpeg** (optional, for video metadata):
+   - Download from [ffmpeg.org/download.html](https://ffmpeg.org/download.html)
+   - Add to PATH: `setx PATH "%PATH%;C:\path\to\ffmpeg\bin"`
+
+**Setup:**
+```powershell
+# Clone repository
+git clone <repository-url>
+cd Photo-gallery
+
+# Install dependencies
+npm install
+
+# Start dev server (foreground only)
+npm run dev
+
+# In another terminal, start admin panel
+npm run admin
+```
+
+**Limitations on native Windows:**
+- ❌ `npm run dev:bg` / `npm run admin:bg` (background scripts)
+- ❌ `npm run stop:dev` / `npm run stop:admin`
+- ❌ `npm run deploy` (requires bash + rsync)
+- ❌ `npm run deploy:parallel`
+
+**Workaround for background servers:** Open two terminal windows and run `npm run dev` and `npm run admin` in foreground.
+
+#### Option 3: Git Bash (Partial Compatibility)
+
+Git Bash provides a bash shell on Windows but with limitations.
+
+**Install:** Comes with [Git for Windows](https://git-scm.com/)
+
+**Works:**
+- Basic bash scripts
+- `npm run dev`, `npm run admin`, `npm run build`
+
+**Does NOT work:**
+- `rsync` (not included) - deploy will fail
+- Some Unix commands may behave differently
+
+### Linux Setup
+
+Linux has native compatibility. Install dependencies:
+
+**Ubuntu/Debian:**
+```bash
+# Install Node.js (via nvm)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+source ~/.bashrc
+nvm install 20
+
+# Install ffmpeg (for video metadata)
+sudo apt install ffmpeg -y
+
+# Install rsync (for deployment, usually pre-installed)
+sudo apt install rsync -y
+```
+
+**Fedora/RHEL:**
+```bash
+# Install Node.js
+sudo dnf install nodejs -y
+
+# Install ffmpeg and rsync
+sudo dnf install ffmpeg rsync -y
+```
+
+**Arch Linux:**
+```bash
+# Install Node.js, ffmpeg, rsync
+sudo pacman -S nodejs npm ffmpeg rsync
+```
+
+### Video Metadata Support
+
+The `/api/video-info` endpoint requires **FFmpeg** (specifically `ffprobe`) for extracting video metadata.
+
+**Verify installation:**
+```bash
+ffprobe -version
+```
+
+If FFmpeg is not installed, video info features will fail gracefully but videos will still play.
+
+---
+
 ## Development Commands
 
 ```bash

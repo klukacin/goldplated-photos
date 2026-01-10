@@ -12,6 +12,161 @@ Complete guide to setting up Goldplated Photos on your system.
 
 ---
 
+## Platform Compatibility
+
+Goldplated Photos works on **macOS**, **Linux**, and **Windows**.
+
+| Feature | macOS | Linux | Windows | Windows + WSL |
+|---------|:-----:|:-----:|:-------:|:-------------:|
+| Dev server (`npm run dev`) | ✅ | ✅ | ✅ | ✅ |
+| Admin panel (`npm run admin`) | ✅ | ✅ | ✅ | ✅ |
+| Build (`npm run build`) | ✅ | ✅ | ✅ | ✅ |
+| Background scripts (`dev:bg`, `admin:bg`) | ✅ | ✅ | ❌ | ✅ |
+| Deploy script (`npm run deploy`) | ✅ | ✅ | ❌ | ✅ |
+
+---
+
+## Platform Setup
+
+=== "Windows"
+
+    ### Option 1: WSL2 (Recommended)
+    
+    WSL2 provides a native Linux environment inside Windows with **full compatibility**.
+    
+    **Install WSL2:**
+    ```powershell
+    # Run in PowerShell as Administrator
+    wsl --install
+    ```
+    
+    **After restart, set up Ubuntu:**
+    ```bash
+    # Update packages
+    sudo apt update && sudo apt upgrade -y
+    
+    # Install Node.js via nvm (recommended)
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+    source ~/.bashrc
+    nvm install 20
+    nvm use 20
+    
+    # Install ffmpeg (optional, for video metadata)
+    sudo apt install ffmpeg -y
+    
+    # Clone and run project
+    git clone https://github.com/klukacin/goldplated-photos.git
+    cd goldplated-photos
+    npm install
+    npm run dev
+    ```
+    
+    !!! tip "Access from Windows"
+        Files are at `\\wsl$\Ubuntu\home\<username>\goldplated-photos`
+    
+    ### Option 2: Native Windows (Limited)
+    
+    For development only - **no bash scripts or deployment**.
+    
+    **Prerequisites:**
+    
+    1. **Node.js 20+**: Download from [nodejs.org](https://nodejs.org/)
+    2. **Git**: Download from [git-scm.com](https://git-scm.com/)
+    3. **FFmpeg** (optional): Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
+    
+    **Setup:**
+    ```powershell
+    # Clone repository
+    git clone https://github.com/klukacin/goldplated-photos.git
+    cd goldplated-photos
+    
+    # Install dependencies
+    npm install
+    
+    # Start dev server (foreground only)
+    npm run dev
+    
+    # In another terminal, start admin panel
+    npm run admin
+    ```
+    
+    !!! warning "Limitations on Native Windows"
+        - ❌ `npm run dev:bg` / `npm run admin:bg` (background scripts)
+        - ❌ `npm run stop:dev` / `npm run stop:admin`
+        - ❌ `npm run deploy` (requires bash + rsync)
+        
+        **Workaround:** Open two terminal windows and run servers in foreground.
+    
+    ### Option 3: Git Bash (Partial)
+    
+    Git Bash provides a bash shell but with limitations.
+    
+    - ✅ Basic bash scripts work
+    - ✅ `npm run dev`, `npm run admin`, `npm run build`
+    - ❌ `rsync` not included - deploy will fail
+
+=== "Linux"
+
+    Linux has **native compatibility**. Install Node.js and optional dependencies:
+    
+    **Ubuntu/Debian:**
+    ```bash
+    # Install Node.js via nvm (recommended)
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+    source ~/.bashrc
+    nvm install 20
+    
+    # Install ffmpeg (for video metadata)
+    sudo apt install ffmpeg -y
+    
+    # Install rsync (for deployment, usually pre-installed)
+    sudo apt install rsync -y
+    ```
+    
+    **Fedora/RHEL:**
+    ```bash
+    # Install Node.js
+    sudo dnf install nodejs -y
+    
+    # Install ffmpeg and rsync
+    sudo dnf install ffmpeg rsync -y
+    ```
+    
+    **Arch Linux:**
+    ```bash
+    # Install Node.js, ffmpeg, rsync
+    sudo pacman -S nodejs npm ffmpeg rsync
+    ```
+
+=== "macOS"
+
+    macOS has **native compatibility**. Install Node.js and optional dependencies:
+    
+    **Using Homebrew (recommended):**
+    ```bash
+    # Install Homebrew if not installed
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    
+    # Install Node.js
+    brew install node
+    
+    # Install ffmpeg (optional, for video metadata)
+    brew install ffmpeg
+    ```
+    
+    **Using nvm:**
+    ```bash
+    # Install nvm
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+    source ~/.zshrc  # or ~/.bashrc
+    
+    # Install Node.js
+    nvm install 20
+    nvm use 20
+    ```
+
+---
+
 ## Quick Install
 
 ```bash
