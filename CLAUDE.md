@@ -625,6 +625,55 @@ DEPLOY_CHMOD_PRIVATE=660   # Private files (index.md, .htaccess)
 | Shared hosting (same user) | 775 | 664 | 660 |
 | Apache/Nginx (www-data) | 755 | 644 | 640 |
 
+### Marketing Website Deployment
+
+The marketing website (`marketing_website/`) is a separate static site deployed to goldplated.photos.
+
+**Note:** The `marketing_website/` folder is in `.gitignore` (separate from main repo).
+
+**Deploy command:**
+```bash
+# Deploy marketing site (excludes macOS metadata files)
+sshpass -p 'PASSWORD' rsync -avz --progress --exclude='._*' \
+  -e "ssh -o StrictHostKeyChecking=no" \
+  marketing_website/ goldplated@mirjam.nosco.hr:public_html/
+```
+
+**Fix permissions after deploy:**
+```bash
+sshpass -p 'PASSWORD' ssh goldplated@mirjam.nosco.hr \
+  "find public_html -type d -exec chmod 775 {} \; && \
+   find public_html -type f -exec chmod 664 {} \; && \
+   chmod 660 public_html/.htaccess"
+```
+
+**Marketing site files:**
+- `marketing_website/index.html` - Homepage
+- `marketing_website/features.html` - Features page
+- `marketing_website/get-started.html` - Quick start guide
+- `marketing_website/about.html` - About page
+- `marketing_website/.htaccess` - Apache config (HTTPS redirect, caching, security headers)
+- `marketing_website/css/styles.css` - Styles
+- `marketing_website/js/main.js` - JavaScript
+
+**Important:** Always use `--exclude='._*'` to prevent macOS metadata files from being uploaded.
+
+### Documentation Site Deployment
+
+The documentation site (`docs/`) uses MkDocs and deploys to docs.goldplated.photos.
+
+**Build and deploy:**
+```bash
+# Build MkDocs
+cd docs
+mkdocs build
+
+# Deploy to server
+sshpass -p 'PASSWORD' rsync -avz --progress \
+  -e "ssh -o StrictHostKeyChecking=no" \
+  site/ docs@mirjam.nosco.hr:public_html/
+```
+
 ## Key Files
 
 **Pages:**

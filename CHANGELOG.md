@@ -5,6 +5,35 @@ All notable changes to Goldplated Photos will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-01-10
+
+### Added
+
+- **Cross-platform compatibility documentation**
+  - Windows setup instructions (WSL2 recommended, native Windows, Git Bash options)
+  - Linux setup instructions (Ubuntu/Debian, Fedora/RHEL, Arch Linux)
+  - macOS setup instructions (Homebrew, nvm)
+  - Platform compatibility matrix showing feature support
+  - Added to CLAUDE.md, marketing website (get-started.html), and MkDocs docs
+- **Marketing website `.htaccess`** configuration
+  - HTTPS redirect (force SSL)
+  - Security headers (X-Content-Type-Options, X-Frame-Options, XSS Protection, CSP, Referrer-Policy)
+  - Browser caching (1 year for images/fonts, 1 month for CSS/JS)
+  - Gzip compression for text assets
+  - Clean URLs (removes .html extension)
+  - Directory listing disabled
+- **Marketing & Docs deployment documentation** in CLAUDE.md
+  - Deploy commands with `--exclude='._*'` to prevent macOS metadata upload
+  - Permission fix commands (775/664/660)
+  - MkDocs build and deploy instructions
+
+### Fixed
+
+- **Marketing site file permissions** - Fixed from 700 to proper 775/664/660
+- **Cleaned up macOS `._*` metadata files** from production servers
+
+---
+
 ## [0.4.7] - 2026-01-08
 
 ### Added

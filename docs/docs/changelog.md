@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-01-10
+
+### Added
+
+- **Cross-platform compatibility documentation**
+    - Windows setup (WSL2, native, Git Bash)
+    - Linux setup (Ubuntu/Debian, Fedora/RHEL, Arch)
+    - macOS setup (Homebrew, nvm)
+    - Platform compatibility matrix
+- **Marketing website `.htaccess`** - HTTPS redirect, security headers, caching, compression
+- **Deployment documentation** - Marketing site and docs deployment commands in CLAUDE.md
+
+### Fixed
+
+- Marketing site file permissions (775/664/660)
+- Cleaned up macOS metadata files from servers
+
+---
+
 ## [0.4.6] - 2026-01-07
 
 ### Changed
