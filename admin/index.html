@@ -72,6 +72,8 @@
                 <input type="text" id="album-description" name="description">
               </div>
 
+              <input type="hidden" id="album-token" name="token">
+
               <div class="form-row">
                 <div class="form-group">
                   <label for="album-password">Password</label>
@@ -81,11 +83,13 @@
                   </div>
                 </div>
                 <div class="form-group">
-                  <label for="album-token">Token</label>
+                  <label for="album-share-token">Share Token (secret link)</label>
                   <div class="input-with-button">
-                    <input type="text" id="album-token" name="token" readonly>
+                    <input type="text" id="album-share-token" name="shareToken" readonly>
                     <button type="button" id="generate-token-btn" class="btn btn-sm">Generate</button>
+                    <button type="button" id="remove-share-token-btn" class="btn btn-sm">Remove</button>
                   </div>
+                  <small>With a token, the secret link opens the album without a password. No password + token = reachable only via the link.</small>
                 </div>
               </div>
 
@@ -147,10 +151,6 @@
                 <label class="checkbox">
                   <input type="checkbox" id="album-isCollection" name="isCollection">
                   <span>Is Collection (folder of sub-albums)</span>
-                </label>
-                <label class="checkbox">
-                  <input type="checkbox" id="album-allowAnonymous" name="allowAnonymous" checked>
-                  <span>Allow Anonymous Access (token bypasses parent password)</span>
                 </label>
                 <label class="checkbox">
                   <input type="checkbox" id="album-hidden" name="hidden">

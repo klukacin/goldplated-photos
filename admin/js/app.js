@@ -7,6 +7,7 @@ const app = {
     notifications.init();
     initModals();
     initPasswordToggles();
+    await loadAdminConfig();
 
     // Initialize tabs
     this.initTabs();

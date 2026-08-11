@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import matter from 'gray-matter';
 import { fileURLToPath } from 'url';
-import { dirname, join, extname, basename } from 'path';
+import { dirname, join, extname, basename, resolve, sep } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, rmSync } from 'fs';
 import crypto from 'crypto';
 
@@ -15,32 +15,56 @@ const HOME_DIR = join(PROJECT_ROOT, 'src/content/home');
 const PUBLIC_DIR = join(PROJECT_ROOT, 'public');
 // Note: Thumbnails are stored per-album in src/content/albums/{path}/.meta/thumbnails/
 
+// Load .env for SITE_URL etc. (best effort — file may not exist)
+try {
+  process.loadEnvFile(join(PROJECT_ROOT, '.env'));
+} catch { /* no .env — fine */ }
+
 const app = express();
 const PORT = 4444;
 
 // Middleware
 app.use(cors({ origin: ['http://localhost:4444', 'http://127.0.0.1:4444'] }));
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.static(join(__dirname)));
 
-// Multer setup for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadPath = req.uploadPath || join(PROJECT_ROOT, 'uploads');
-    if (!existsSync(uploadPath)) {
-      mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    cb(null, file.originalname);
+// Error type for clean status-code handling in routes/middleware
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
   }
-});
-const upload = multer({ storage });
+}
 
-// Helper: Generate random token
+// SECURITY: Resolve a user-supplied relative path against a base directory and
+// assert the result stays inside it. Throws 400 on traversal attempts.
+function resolveSafe(baseDir, relPath) {
+  const rel = String(relPath ?? '');
+  if (rel.includes('\0')) throw new HttpError(400, 'Invalid path');
+  const full = resolve(baseDir, rel);
+  if (full !== baseDir && !full.startsWith(baseDir + sep)) {
+    throw new HttpError(400, 'Invalid path');
+  }
+  return full;
+}
+
+// SECURITY: Reduce an uploaded/user-supplied filename to a safe basename
+function safeFilename(name) {
+  const cleaned = basename(String(name ?? '').replace(/\\/g, '/')).trim();
+  if (!cleaned || cleaned.startsWith('.') || cleaned.includes('\0')) {
+    throw new HttpError(400, 'Invalid filename');
+  }
+  return cleaned;
+}
+
+// Helper: Generate random token (internal album id for the access cookie)
 function generateToken() {
   return crypto.randomBytes(6).toString('hex');
+}
+
+// Helper: Generate random share token (secret link)
+function generateShareToken() {
+  return crypto.randomBytes(16).toString('base64url');
 }
 
 // Helper: Sanitize path to lowercase
@@ -55,6 +79,72 @@ function sanitizePath(inputPath) {
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
 const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
 
+// Multer setup for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    try {
+      const uploadPath = req.uploadPath;
+      if (!uploadPath) throw new HttpError(400, 'Upload destination not set');
+      if (!existsSync(uploadPath)) {
+        mkdirSync(uploadPath, { recursive: true });
+      }
+      cb(null, uploadPath);
+    } catch (err) {
+      cb(err);
+    }
+  },
+  filename: (req, file, cb) => {
+    try {
+      let name = safeFilename(file.originalname);
+      // Collision handling: never silently overwrite — suffix -1, -2, ...
+      // unless the client explicitly asked to overwrite (?overwrite=1).
+      if (req.query.overwrite !== '1') {
+        const ext = extname(name);
+        const stem = basename(name, ext);
+        let candidate = name;
+        let counter = 1;
+        while (existsSync(join(req.uploadPath, candidate))) {
+          candidate = `${stem}-${counter}${ext}`;
+          counter++;
+        }
+        if (candidate !== name) {
+          req.renamedFiles = req.renamedFiles || [];
+          req.renamedFiles.push({ from: name, to: candidate });
+          name = candidate;
+        }
+      }
+      cb(null, name);
+    } catch (err) {
+      cb(err);
+    }
+  }
+});
+
+const MAX_IMAGE_SIZE = 100 * 1024 * 1024;  // 100 MB per image
+const MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB per video
+
+function extFilter(allowedExtensions) {
+  return (req, file, cb) => {
+    const ext = extname(file.originalname || '').toLowerCase();
+    if (allowedExtensions.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new HttpError(400, `File type not allowed: ${file.originalname}`));
+    }
+  };
+}
+
+const uploadImages = multer({
+  storage,
+  limits: { fileSize: MAX_IMAGE_SIZE, files: 50 },
+  fileFilter: extFilter(IMAGE_EXTENSIONS)
+});
+const uploadVideos = multer({
+  storage,
+  limits: { fileSize: MAX_VIDEO_SIZE, files: 20 },
+  fileFilter: extFilter(VIDEO_EXTENSIONS)
+});
+
 // Helper: Check if file is an image
 function isImage(filename) {
   return IMAGE_EXTENSIONS.includes(extname(filename).toLowerCase());
@@ -67,14 +157,15 @@ function isVideo(filename) {
 
 // Helper: Read album metadata
 function readAlbumMeta(albumPath) {
-  const indexPath = join(ALBUMS_DIR, albumPath, 'index.md');
+  const albumDir = resolveSafe(ALBUMS_DIR, albumPath);
+  const indexPath = join(albumDir, 'index.md');
   if (!existsSync(indexPath)) return null;
 
   const fileContent = readFileSync(indexPath, 'utf-8');
   const { data, content: indexBody } = matter(fileContent);
 
   // Read body from separate body.md file, fall back to index.md content for backwards compatibility
-  const bodyPath = join(ALBUMS_DIR, albumPath, 'body.md');
+  const bodyPath = join(albumDir, 'body.md');
   let body = '';
   if (existsSync(bodyPath)) {
     body = readFileSync(bodyPath, 'utf-8');
@@ -88,11 +179,11 @@ function readAlbumMeta(albumPath) {
 
 // Helper: Write album metadata
 function writeAlbumMeta(albumPath, metadata, body = '') {
-  const indexPath = join(ALBUMS_DIR, albumPath, 'index.md');
-  const bodyPath = join(ALBUMS_DIR, albumPath, 'body.md');
-  const dir = dirname(indexPath);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  const albumDir = resolveSafe(ALBUMS_DIR, albumPath);
+  const indexPath = join(albumDir, 'index.md');
+  const bodyPath = join(albumDir, 'body.md');
+  if (!existsSync(albumDir)) {
+    mkdirSync(albumDir, { recursive: true });
   }
 
   // Write metadata to index.md (no body content)
@@ -105,6 +196,26 @@ function writeAlbumMeta(albumPath, metadata, body = '') {
   } else if (existsSync(bodyPath)) {
     unlinkSync(bodyPath); // Remove if empty
   }
+}
+
+// Helper: Merge a metadata patch into existing frontmatter.
+// Keys present with value null are removed; keys absent from the patch keep
+// their existing value — so a partial form never wipes fields it doesn't know.
+function mergeAlbumMeta(existing, patch) {
+  // `body` and `path` are handled separately by callers; never persist them.
+  const { body: _b, path: _p, isNew: _n, ...rest } = patch;
+  const merged = { ...existing };
+  delete merged.body;
+  delete merged.path;
+  delete merged.isNew;
+  for (const [key, value] of Object.entries(rest)) {
+    if (value === null) {
+      delete merged[key];
+    } else if (value !== undefined) {
+      merged[key] = value;
+    }
+  }
+  return merged;
 }
 
 // Helper: Build album tree
@@ -189,12 +300,12 @@ function getVideosInDir(dir) {
 // ============ ALBUMS API ============
 
 // GET /api/albums - List all albums as tree
-app.get('/api/albums', (req, res) => {
+app.get('/api/albums', (req, res, next) => {
   try {
     const tree = buildAlbumTree();
     res.json(tree);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
@@ -207,10 +318,10 @@ function getPathParam(param) {
 }
 
 // GET /api/albums/:path - Get single album
-app.get('/api/albums/*path', (req, res) => {
+app.get('/api/albums/*path', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.path);
-    const fullPath = join(ALBUMS_DIR, albumPath);
+    const fullPath = resolveSafe(ALBUMS_DIR, albumPath);
 
     // Check if folder exists
     if (!existsSync(fullPath)) {
@@ -231,21 +342,20 @@ app.get('/api/albums/*path', (req, res) => {
         isCollection: hasChildren,
         isNew: true, // Flag to indicate no index.md exists yet
         token: generateToken(),
-        allowAnonymous: true,
         sort: 'date-desc',
         style: 'grid',
         body: ''
       });
     }
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // POST /api/albums - Create new album
-app.post('/api/albums', (req, res) => {
+app.post('/api/albums', (req, res, next) => {
   try {
-    const { path: rawPath, ...metadata } = req.body;
+    const { path: rawPath, body, ...metadata } = req.body;
 
     if (!rawPath) {
       return res.status(400).json({ error: 'Path is required' });
@@ -253,56 +363,61 @@ app.post('/api/albums', (req, res) => {
 
     // Sanitize path to lowercase for case-sensitive filesystem compatibility
     const albumPath = sanitizePath(rawPath);
-    const fullPath = join(ALBUMS_DIR, albumPath);
+    const fullPath = resolveSafe(ALBUMS_DIR, albumPath);
     if (existsSync(join(fullPath, 'index.md'))) {
       return res.status(409).json({ error: 'Album already exists' });
     }
 
-    // Ensure token exists
+    // Ensure internal token exists
     if (!metadata.token) {
       metadata.token = generateToken();
     }
 
-    // Set defaults
-    const defaultMeta = {
+    // Set defaults, then drop explicit nulls (cleared optional fields)
+    const defaultMeta = mergeAlbumMeta({
       title: basename(albumPath).replace(/-/g, ' '),
-      allowAnonymous: true,
       sort: 'date-desc',
-      style: 'grid',
-      ...metadata
-    };
+      style: 'grid'
+    }, metadata);
 
-    writeAlbumMeta(albumPath, defaultMeta, req.body.body || '');
+    writeAlbumMeta(albumPath, defaultMeta, body || '');
     res.json({ success: true, path: albumPath, token: defaultMeta.token });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
-// PUT /api/albums/:path - Update album
-app.put('/api/albums/*path', (req, res) => {
+// PUT /api/albums/:path - Update album (merges into existing frontmatter —
+// fields the form doesn't send are preserved, null values are removed)
+app.put('/api/albums/*path', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.path);
-    const { body, ...metadata } = req.body;
+    const { body, ...patch } = req.body;
 
     const existing = readAlbumMeta(albumPath);
     if (!existing) {
       return res.status(404).json({ error: 'Album not found' });
     }
 
-    writeAlbumMeta(albumPath, metadata, body || '');
-    res.json({ success: true });
+    const merged = mergeAlbumMeta(existing, patch);
+    // body: undefined → keep existing; string (may be '') → replace
+    const newBody = body === undefined ? existing.body : body;
+    writeAlbumMeta(albumPath, merged, newBody || '');
+    res.json({ success: true, meta: { ...merged, path: albumPath } });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // DELETE /api/albums/:path - Delete album
-app.delete('/api/albums/*path', (req, res) => {
+app.delete('/api/albums/*path', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.path);
-    const fullPath = join(ALBUMS_DIR, albumPath);
+    const fullPath = resolveSafe(ALBUMS_DIR, albumPath);
 
+    if (albumPath === '' || fullPath === ALBUMS_DIR) {
+      return res.status(400).json({ error: 'Refusing to delete the albums root' });
+    }
     if (!existsSync(fullPath)) {
       return res.status(404).json({ error: 'Album not found' });
     }
@@ -310,17 +425,17 @@ app.delete('/api/albums/*path', (req, res) => {
     rmSync(fullPath, { recursive: true });
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // ============ PHOTOS API ============
 
 // GET /api/photos/:albumPath - List photos in album
-app.get('/api/photos/*albumPath', (req, res) => {
+app.get('/api/photos/*albumPath', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.albumPath);
-    const fullPath = join(ALBUMS_DIR, albumPath);
+    const fullPath = resolveSafe(ALBUMS_DIR, albumPath);
 
     if (!existsSync(fullPath)) {
       return res.status(404).json({ error: 'Album not found' });
@@ -329,29 +444,33 @@ app.get('/api/photos/*albumPath', (req, res) => {
     const photos = getPhotosInDir(fullPath);
     res.json(photos);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // POST /api/photos/:albumPath - Upload photos
 app.post('/api/photos/*albumPath', (req, res, next) => {
-  const albumPath = getPathParam(req.params.albumPath);
-  req.uploadPath = join(ALBUMS_DIR, albumPath);
-  next();
-}, upload.array('photos', 50), (req, res) => {
   try {
-    const uploaded = req.files.map(f => f.originalname);
-    res.json({ success: true, uploaded });
+    const albumPath = getPathParam(req.params.albumPath);
+    req.uploadPath = resolveSafe(ALBUMS_DIR, albumPath);
+    next();
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
+}, uploadImages.array('photos', 50), (req, res) => {
+  const files = req.files || [];
+  res.json({
+    success: true,
+    uploaded: files.map(f => f.filename),
+    renamed: req.renamedFiles || []
+  });
 });
 
-// DELETE /api/photos/:albumPath/:filename - Delete photo
-app.delete('/api/photos/:albumPath/file/:filename', (req, res) => {
+// DELETE /api/photos/:albumPath/file/:filename - Delete photo
+app.delete('/api/photos/:albumPath/file/:filename', (req, res, next) => {
   try {
-    const { albumPath, filename } = req.params;
-    const filePath = join(ALBUMS_DIR, albumPath, filename);
+    const filename = safeFilename(req.params.filename);
+    const filePath = resolveSafe(ALBUMS_DIR, join(req.params.albumPath, filename));
 
     if (!existsSync(filePath)) {
       return res.status(404).json({ error: 'Photo not found' });
@@ -360,17 +479,17 @@ app.delete('/api/photos/:albumPath/file/:filename', (req, res) => {
     unlinkSync(filePath);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // ============ VIDEOS API ============
 
 // GET /api/videos/:albumPath - List videos in album
-app.get('/api/videos/*albumPath', (req, res) => {
+app.get('/api/videos/*albumPath', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.albumPath);
-    const fullPath = join(ALBUMS_DIR, albumPath);
+    const fullPath = resolveSafe(ALBUMS_DIR, albumPath);
 
     if (!existsSync(fullPath)) {
       return res.status(404).json({ error: 'Album not found' });
@@ -379,14 +498,49 @@ app.get('/api/videos/*albumPath', (req, res) => {
     const videos = getVideosInDir(fullPath);
     res.json(videos);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
+  }
+});
+
+// POST /api/videos/:albumPath - Upload videos
+app.post('/api/videos/*albumPath', (req, res, next) => {
+  try {
+    const albumPath = getPathParam(req.params.albumPath);
+    req.uploadPath = resolveSafe(ALBUMS_DIR, albumPath);
+    next();
+  } catch (error) {
+    next(error);
+  }
+}, uploadVideos.array('videos', 20), (req, res) => {
+  const files = req.files || [];
+  res.json({
+    success: true,
+    uploaded: files.map(f => f.filename),
+    renamed: req.renamedFiles || []
+  });
+});
+
+// DELETE /api/videos/:albumPath/file/:filename - Delete video
+app.delete('/api/videos/:albumPath/file/:filename', (req, res, next) => {
+  try {
+    const filename = safeFilename(req.params.filename);
+    const filePath = resolveSafe(ALBUMS_DIR, join(req.params.albumPath, filename));
+
+    if (!existsSync(filePath)) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+
+    unlinkSync(filePath);
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
   }
 });
 
 // ============ FOLDERS API ============
 
 // POST /api/folders - Create folder
-app.post('/api/folders', (req, res) => {
+app.post('/api/folders', (req, res, next) => {
   try {
     const { path: rawPath } = req.body;
 
@@ -396,21 +550,21 @@ app.post('/api/folders', (req, res) => {
 
     // Sanitize path to lowercase for case-sensitive filesystem compatibility
     const folderPath = sanitizePath(rawPath);
-    const fullPath = join(ALBUMS_DIR, folderPath);
+    const fullPath = resolveSafe(ALBUMS_DIR, folderPath);
     if (!existsSync(fullPath)) {
       mkdirSync(fullPath, { recursive: true });
     }
 
     res.json({ success: true, path: folderPath });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // ============ HOME API ============
 
 // GET /api/home/intro - Get intro content
-app.get('/api/home/intro', (req, res) => {
+app.get('/api/home/intro', (req, res, next) => {
   try {
     const introPath = join(HOME_DIR, 'intro.md');
     if (!existsSync(introPath)) {
@@ -421,12 +575,12 @@ app.get('/api/home/intro', (req, res) => {
     const { data, content: body } = matter(content);
     res.json({ ...data, body });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // PUT /api/home/intro - Update intro
-app.put('/api/home/intro', (req, res) => {
+app.put('/api/home/intro', (req, res, next) => {
   try {
     const { body, ...metadata } = req.body;
     const introPath = join(HOME_DIR, 'intro.md');
@@ -439,12 +593,12 @@ app.put('/api/home/intro', (req, res) => {
     writeFileSync(introPath, content);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // GET /api/home/cards - List all cards
-app.get('/api/home/cards', (req, res) => {
+app.get('/api/home/cards', (req, res, next) => {
   try {
     const cardsDir = join(HOME_DIR, 'cards');
     if (!existsSync(cardsDir)) {
@@ -463,37 +617,38 @@ app.get('/api/home/cards', (req, res) => {
 
     res.json(cards);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // POST /api/home/cards - Create card
-app.post('/api/home/cards', (req, res) => {
+app.post('/api/home/cards', (req, res, next) => {
   try {
     const { id, body, ...metadata } = req.body;
-    const cardId = id || metadata.title?.toLowerCase().replace(/\s+/g, '-') || `card-${Date.now()}`;
+    const rawId = id || metadata.title?.toLowerCase().replace(/\s+/g, '-') || `card-${Date.now()}`;
+    const cardId = safeFilename(rawId).replace(/\.md$/i, '');
     const cardsDir = join(HOME_DIR, 'cards');
 
     if (!existsSync(cardsDir)) {
       mkdirSync(cardsDir, { recursive: true });
     }
 
-    const cardPath = join(cardsDir, `${cardId}.md`);
+    const cardPath = resolveSafe(cardsDir, `${cardId}.md`);
     const content = matter.stringify(body || '', { type: 'card', ...metadata });
     writeFileSync(cardPath, content);
 
     res.json({ success: true, id: cardId });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // PUT /api/home/cards/:id - Update card
-app.put('/api/home/cards/:id', (req, res) => {
+app.put('/api/home/cards/:id', (req, res, next) => {
   try {
-    const { id } = req.params;
+    const id = safeFilename(req.params.id).replace(/\.md$/i, '');
     const { body, ...metadata } = req.body;
-    const cardPath = join(HOME_DIR, 'cards', `${id}.md`);
+    const cardPath = resolveSafe(join(HOME_DIR, 'cards'), `${id}.md`);
 
     if (!existsSync(cardPath)) {
       return res.status(404).json({ error: 'Card not found' });
@@ -504,15 +659,15 @@ app.put('/api/home/cards/:id', (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // DELETE /api/home/cards/:id - Delete card
-app.delete('/api/home/cards/:id', (req, res) => {
+app.delete('/api/home/cards/:id', (req, res, next) => {
   try {
-    const { id } = req.params;
-    const cardPath = join(HOME_DIR, 'cards', `${id}.md`);
+    const id = safeFilename(req.params.id).replace(/\.md$/i, '');
+    const cardPath = resolveSafe(join(HOME_DIR, 'cards'), `${id}.md`);
 
     if (!existsSync(cardPath)) {
       return res.status(404).json({ error: 'Card not found' });
@@ -521,18 +676,21 @@ app.delete('/api/home/cards/:id', (req, res) => {
     unlinkSync(cardPath);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // POST /api/home/cards/reorder - Reorder cards
-app.post('/api/home/cards/reorder', (req, res) => {
+app.post('/api/home/cards/reorder', (req, res, next) => {
   try {
     const { order } = req.body; // Array of card IDs in new order
+    if (!Array.isArray(order)) {
+      return res.status(400).json({ error: 'order must be an array of card ids' });
+    }
     const cardsDir = join(HOME_DIR, 'cards');
 
     order.forEach((cardId, index) => {
-      const cardPath = join(cardsDir, `${cardId}.md`);
+      const cardPath = resolveSafe(cardsDir, `${safeFilename(cardId).replace(/\.md$/i, '')}.md`);
       if (existsSync(cardPath)) {
         const content = readFileSync(cardPath, 'utf-8');
         const { data, content: body } = matter(content);
@@ -543,14 +701,14 @@ app.post('/api/home/cards/reorder', (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // ============ ASSETS API ============
 
 // GET /api/assets/hero - List hero images
-app.get('/api/assets/hero', (req, res) => {
+app.get('/api/assets/hero', (req, res, next) => {
   try {
     const heroDir = join(PUBLIC_DIR, 'home/hero');
     if (!existsSync(heroDir)) {
@@ -566,7 +724,7 @@ app.get('/api/assets/hero', (req, res) => {
 
     res.json(images);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
@@ -574,30 +732,31 @@ app.get('/api/assets/hero', (req, res) => {
 app.post('/api/assets/hero', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'home/hero');
   next();
-}, upload.single('image'), (req, res) => {
+}, uploadImages.single('image'), (req, res, next) => {
   try {
-    res.json({ success: true, filename: req.file.originalname });
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+    res.json({ success: true, filename: req.file.filename });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // DELETE /api/assets/hero/:name - Delete hero image
-app.delete('/api/assets/hero/:name', (req, res) => {
+app.delete('/api/assets/hero/:name', (req, res, next) => {
   try {
-    const filePath = join(PUBLIC_DIR, 'home/hero', req.params.name);
+    const filePath = join(PUBLIC_DIR, 'home/hero', safeFilename(req.params.name));
     if (!existsSync(filePath)) {
       return res.status(404).json({ error: 'Image not found' });
     }
     unlinkSync(filePath);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // GET /api/assets/cards - List card images
-app.get('/api/assets/cards', (req, res) => {
+app.get('/api/assets/cards', (req, res, next) => {
   try {
     const cardsDir = join(PUBLIC_DIR, 'home/cards');
     if (!existsSync(cardsDir)) {
@@ -613,7 +772,7 @@ app.get('/api/assets/cards', (req, res) => {
 
     res.json(images);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
@@ -621,27 +780,28 @@ app.get('/api/assets/cards', (req, res) => {
 app.post('/api/assets/cards', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'home/cards');
   next();
-}, upload.single('image'), (req, res) => {
+}, uploadImages.single('image'), (req, res, next) => {
   try {
-    const filename = req.file.originalname;
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+    const filename = req.file.filename;
     const url = `/home/cards/${filename}`;
     res.json({ success: true, filename, url });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // DELETE /api/assets/cards/:name - Delete card image
-app.delete('/api/assets/cards/:name', (req, res) => {
+app.delete('/api/assets/cards/:name', (req, res, next) => {
   try {
-    const filePath = join(PUBLIC_DIR, 'home/cards', req.params.name);
+    const filePath = join(PUBLIC_DIR, 'home/cards', safeFilename(req.params.name));
     if (!existsSync(filePath)) {
       return res.status(404).json({ error: 'Image not found' });
     }
     unlinkSync(filePath);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
@@ -649,17 +809,18 @@ app.delete('/api/assets/cards/:name', (req, res) => {
 app.post('/api/assets/landing', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'images');
   next();
-}, upload.single('image'), (req, res) => {
+}, uploadImages.single('image'), (req, res, next) => {
   try {
-    // Rename to landing-bg.jpg
-    const oldPath = join(PUBLIC_DIR, 'images', req.file.originalname);
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
+    // Rename to landing-bg.jpg (this endpoint always replaces the background)
+    const oldPath = req.file.path;
     const newPath = join(PUBLIC_DIR, 'images', 'landing-bg.jpg');
     if (oldPath !== newPath) {
       renameSync(oldPath, newPath);
     }
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
@@ -673,7 +834,7 @@ function countFilesInDir(dir) {
 
 // Helper: Get thumbnail dir for an album
 function getAlbumThumbnailDir(albumPath) {
-  return join(ALBUMS_DIR, albumPath, '.meta/thumbnails');
+  return join(resolveSafe(ALBUMS_DIR, albumPath), '.meta/thumbnails');
 }
 
 // Helper: Count thumbnails for a specific album
@@ -724,17 +885,17 @@ function countAllThumbnails(dir = ALBUMS_DIR) {
 }
 
 // GET /api/cache/stats - Get thumbnail statistics for ALL albums
-app.get('/api/cache/stats', (req, res) => {
+app.get('/api/cache/stats', (req, res, next) => {
   try {
     const stats = countAllThumbnails();
     res.json(stats);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // DELETE /api/cache/thumbnails - Clear all thumbnails across all albums
-app.delete('/api/cache/thumbnails', (req, res) => {
+app.delete('/api/cache/thumbnails', (req, res, next) => {
   try {
     let deleted = 0;
 
@@ -763,23 +924,23 @@ app.delete('/api/cache/thumbnails', (req, res) => {
     clearThumbnailsRecursive(ALBUMS_DIR);
     res.json({ success: true, deleted });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // GET /api/cache/album/:path - Get thumbnail stats for specific album
-app.get('/api/cache/album/*albumPath', (req, res) => {
+app.get('/api/cache/album/*albumPath', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.albumPath);
     const stats = countAlbumThumbnails(albumPath);
     res.json(stats);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // DELETE /api/cache/album/:path - Clear thumbnails for specific album
-app.delete('/api/cache/album/*albumPath', (req, res) => {
+app.delete('/api/cache/album/*albumPath', (req, res, next) => {
   try {
     const albumPath = getPathParam(req.params.albumPath);
     const thumbDir = getAlbumThumbnailDir(albumPath);
@@ -796,15 +957,28 @@ app.delete('/api/cache/album/*albumPath', (req, res) => {
 
     res.json({ success: true, deleted: before });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    next(error);
   }
 });
 
 // ============ UTILITY API ============
 
-// GET /api/token - Generate new token
+// GET /api/token - Generate new internal token
 app.get('/api/token', (req, res) => {
   res.json({ token: generateToken() });
+});
+
+// GET /api/share-token - Generate new random share token (secret link)
+app.get('/api/share-token', (req, res) => {
+  res.json({ shareToken: generateShareToken() });
+});
+
+// GET /api/config - Admin-relevant configuration for the frontend
+app.get('/api/config', (req, res) => {
+  res.json({
+    previewUrl: process.env.ADMIN_PREVIEW_URL || 'http://localhost:4321',
+    siteUrl: process.env.SITE_URL || null
+  });
 });
 
 // Serve album images for preview
@@ -813,6 +987,28 @@ app.use('/albums', express.static(ALBUMS_DIR));
 // Serve public assets (hero images, card images, landing bg)
 app.use('/home', express.static(join(PUBLIC_DIR, 'home')));
 app.use('/images', express.static(join(PUBLIC_DIR, 'images')));
+
+// Error-handling middleware: always answer JSON, map known error types,
+// and never leak internal stack traces / absolute paths to the client.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  if (err instanceof multer.MulterError) {
+    const messages = {
+      LIMIT_FILE_SIZE: 'File too large',
+      LIMIT_FILE_COUNT: 'Too many files in one upload',
+      LIMIT_UNEXPECTED_FILE: 'Unexpected upload field'
+    };
+    return res.status(400).json({ error: messages[err.code] || `Upload error: ${err.code}` });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
+  console.error('[admin]', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
 // Start server
 app.listen(PORT, '127.0.0.1', () => {

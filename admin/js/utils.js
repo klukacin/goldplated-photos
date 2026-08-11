@@ -1,6 +1,21 @@
 // API Base URL
 const API_BASE = '';
 
+// Admin configuration (loaded from /api/config at startup; safe defaults)
+const adminConfig = {
+  previewUrl: 'http://localhost:4321',
+  siteUrl: null
+};
+
+async function loadAdminConfig() {
+  try {
+    const config = await api.get('/api/config');
+    Object.assign(adminConfig, config);
+  } catch {
+    // Keep defaults — dev server on :4321
+  }
+}
+
 // API Helper functions
 const api = {
   async get(endpoint) {
@@ -146,12 +161,6 @@ const modal = {
     });
   }
 };
-
-// Token generator
-async function generateToken() {
-  const result = await api.get('/api/token');
-  return result.token;
-}
 
 // Date formatter
 function formatDate(dateString) {

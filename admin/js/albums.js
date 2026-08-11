@@ -6,12 +6,14 @@ const albums = {
   photosLoaded: false,
   videosLoaded: false,
   cacheLoaded: false,
+  isNewAlbum: false,
 
   async init() {
     await this.loadTree();
     this.initEventListeners();
     this.initEditorTabs();
     this.initBodyEditor();
+    this.initVideoUpload();
   },
 
   initEditorTabs() {
@@ -211,7 +213,7 @@ const albums = {
           const confirmed = await modal.confirm('Delete Video', `Delete "${video.filename}"?`);
           if (confirmed) {
             try {
-              await api.delete(`/api/photos/${albumPath}/${video.filename}`);
+              await api.delete(`/api/videos/${encodeURIComponent(albumPath)}/file/${encodeURIComponent(video.filename)}`);
               item.remove();
               notifications.success('Video deleted');
               // Reload tree to update counts
@@ -226,6 +228,66 @@ const albums = {
       });
     } catch (error) {
       grid.innerHTML = `<p class="error-message">Failed to load videos: ${error.message}</p>`;
+    }
+  },
+
+  initVideoUpload() {
+    const input = document.getElementById('video-upload');
+    const zone = document.getElementById('video-upload-zone');
+    if (!input || !zone) return;
+
+    input.addEventListener('change', async (e) => {
+      if (e.target.files.length > 0) {
+        await this.uploadVideos(e.target.files);
+        e.target.value = '';
+      }
+    });
+
+    zone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      zone.classList.add('drag-over');
+    });
+
+    zone.addEventListener('dragleave', () => {
+      zone.classList.remove('drag-over');
+    });
+
+    zone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      zone.classList.remove('drag-over');
+      const files = Array.from(e.dataTransfer.files).filter(f =>
+        f.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv|m4v)$/i.test(f.name)
+      );
+      if (files.length > 0) {
+        await this.uploadVideos(files);
+      }
+    });
+  },
+
+  async uploadVideos(files) {
+    if (!this.selectedPath) {
+      notifications.error('Please select an album first');
+      return;
+    }
+
+    const zone = document.getElementById('video-upload-zone');
+    const originalText = zone.innerHTML;
+    zone.innerHTML = `<p>Uploading ${files.length} video(s)... This can take a while.</p>`;
+
+    try {
+      const result = await api.upload(`/api/videos/${this.selectedPath}`, Array.from(files), 'videos');
+      notifications.success(`Uploaded ${result.uploaded.length} video(s)`);
+      if (result.renamed && result.renamed.length > 0) {
+        notifications.warning(
+          `${result.renamed.length} file(s) already existed and were saved under a new name (e.g. ${result.renamed[0].to})`
+        );
+      }
+      await this.loadVideos(this.selectedPath);
+      await this.loadTree();
+    } catch (error) {
+      notifications.error('Failed to upload videos: ' + error.message);
+    } finally {
+      zone.innerHTML = originalText;
     }
   },
 
@@ -284,11 +346,19 @@ const albums = {
       }
     });
 
-    // Generate token
+    // Generate share token (random secret for the shareable link)
     document.getElementById('generate-token-btn').addEventListener('click', async () => {
-      const token = await generateToken();
-      document.getElementById('album-token').value = token;
+      const result = await api.get('/api/share-token');
+      document.getElementById('album-share-token').value = result.shareToken;
       this.updateShareableLink();
+      notifications.success('Share token generated. Save the album to activate the link.');
+    });
+
+    // Remove share token
+    document.getElementById('remove-share-token-btn').addEventListener('click', () => {
+      document.getElementById('album-share-token').value = '';
+      this.updateShareableLink();
+      notifications.warning('Share token removed. Save the album to deactivate the old link.');
     });
 
     // Copy shareable link
@@ -311,10 +381,11 @@ const albums = {
 
   updateShareableLink() {
     const path = document.getElementById('album-path').value;
-    const token = document.getElementById('album-token').value;
-    if (path && token) {
-      const baseUrl = window.location.origin.replace(':4444', ':4321'); // Use dev server port
-      const shareLink = `${baseUrl}/photos/${path}?token=${token}`;
+    const shareToken = document.getElementById('album-share-token').value;
+    if (path && shareToken) {
+      // Prefer the configured production URL, fall back to the dev server
+      const baseUrl = adminConfig.siteUrl || adminConfig.previewUrl;
+      const shareLink = `${baseUrl}/photos/${path}?token=${shareToken}`;
       document.getElementById('album-share-link').value = shareLink;
     } else {
       document.getElementById('album-share-link').value = '';
@@ -452,6 +523,7 @@ const albums = {
     try {
       const albumData = await api.get(`/api/albums/${path}`);
       this.currentThumbnail = albumData.thumbnail;
+      this.isNewAlbum = !!albumData.isNew;
       this.populateForm(albumData);
 
       document.getElementById('album-editor').classList.remove('hidden');
@@ -503,11 +575,11 @@ const albums = {
     document.getElementById('album-date').value = formatDate(data.date);
     document.getElementById('album-password').value = data.password || '';
     document.getElementById('album-token').value = data.token || '';
+    document.getElementById('album-share-token').value = data.shareToken || '';
     document.getElementById('album-sort').value = data.sort || 'date-desc';
     document.getElementById('album-style').value = data.style || 'grid';
     document.getElementById('album-tags').value = (data.tags || []).join(', ');
     document.getElementById('album-isCollection').checked = data.isCollection || false;
-    document.getElementById('album-allowAnonymous').checked = data.allowAnonymous !== false;
     document.getElementById('album-order').value = data.order || '';
     document.getElementById('album-hidden').checked = data.hidden || false;
     document.getElementById('album-allowDownload').checked = data.allowDownload || false;
@@ -521,53 +593,48 @@ const albums = {
       document.getElementById('album-body').value = data.body || '';
     }
 
-    // Thumbnail will be populated by photos module
+    // Cover select: always reset and reflect the album's current thumbnail so
+    // saving without opening the Photos tab never loses (or leaks) the cover.
+    // The photos module later replaces this with the full file list.
+    const thumbnailSelect = document.getElementById('album-thumbnail');
+    thumbnailSelect.innerHTML = '<option value="">Auto (first photo)</option>';
+    if (data.thumbnail) {
+      const option = document.createElement('option');
+      option.value = data.thumbnail;
+      option.textContent = data.thumbnail;
+      option.selected = true;
+      thumbnailSelect.appendChild(option);
+    }
 
     // Update shareable link
     this.updateShareableLink();
   },
 
   getFormData() {
+    // null = clear the field on the server (merge removes null keys);
+    // absent keys keep their existing value.
     const form = document.getElementById('album-form');
-    const data = {
+    const orderValue = form.querySelector('#album-order').value;
+    const dateValue = form.querySelector('#album-date').value;
+    const tagsValue = form.querySelector('#album-tags').value;
+
+    return {
       title: form.querySelector('#album-title').value,
-      description: form.querySelector('#album-description').value || undefined,
-      password: form.querySelector('#album-password').value || undefined,
-      token: form.querySelector('#album-token').value,
+      description: form.querySelector('#album-description').value || null,
+      password: form.querySelector('#album-password').value || null,
+      token: form.querySelector('#album-token').value || undefined,
+      shareToken: form.querySelector('#album-share-token').value || null,
       sort: form.querySelector('#album-sort').value,
       style: form.querySelector('#album-style').value,
       isCollection: form.querySelector('#album-isCollection').checked,
-      allowAnonymous: form.querySelector('#album-allowAnonymous').checked,
       hidden: form.querySelector('#album-hidden').checked,
       allowDownload: form.querySelector('#album-allowDownload').checked,
+      order: orderValue !== '' ? parseInt(orderValue) : null,
+      date: dateValue ? parseDate(dateValue) : null,
+      tags: tagsValue ? tagsValue.split(',').map(t => t.trim()).filter(t => t) : null,
+      thumbnail: form.querySelector('#album-thumbnail').value || null,
       body: this.bodyEditor ? this.bodyEditor.getValue() : form.querySelector('#album-body').value
     };
-
-    // Order (numeric, optional)
-    const orderValue = form.querySelector('#album-order').value;
-    if (orderValue !== '') {
-      data.order = parseInt(orderValue);
-    }
-
-    // Date
-    const dateValue = form.querySelector('#album-date').value;
-    if (dateValue) {
-      data.date = parseDate(dateValue);
-    }
-
-    // Tags
-    const tagsValue = form.querySelector('#album-tags').value;
-    if (tagsValue) {
-      data.tags = tagsValue.split(',').map(t => t.trim()).filter(t => t);
-    }
-
-    // Thumbnail
-    const thumbnailValue = form.querySelector('#album-thumbnail').value;
-    if (thumbnailValue) {
-      data.thumbnail = thumbnailValue;
-    }
-
-    return data;
   },
 
   async saveAlbum() {
@@ -575,12 +642,18 @@ const albums = {
 
     try {
       const data = this.getFormData();
-      const isNew = document.getElementById('save-album-btn').textContent === 'Create Album';
 
-      if (isNew) {
+      if (this.isNewAlbum) {
         // Create new album (folder exists but no index.md)
-        await api.post('/api/albums', { path: this.selectedPath, ...data });
+        const result = await api.post('/api/albums', { path: this.selectedPath, ...data });
         notifications.success('Album created successfully');
+        this.isNewAlbum = false;
+        // Server may have sanitized the path (lowercase) — follow it
+        if (result.path && result.path !== this.selectedPath) {
+          await this.loadTree();
+          await this.selectAlbum(result.path);
+          return;
+        }
       } else {
         await api.put(`/api/albums/${this.selectedPath}`, data);
         notifications.success('Album saved successfully');
@@ -617,7 +690,8 @@ const albums = {
       form.reset();
 
       await this.loadTree();
-      this.selectAlbum(path);
+      // Use the server's (sanitized) path, not the raw input
+      this.selectAlbum(result.path || path);
     } catch (error) {
       notifications.error('Failed to create album: ' + error.message);
     }

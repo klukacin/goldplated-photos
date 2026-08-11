@@ -78,7 +78,7 @@ const photos = {
 
       const img = document.createElement('img');
       // Use small thumbnail for faster loading in admin
-      img.src = `http://localhost:4321/api/thumbnail?path=${encodeURIComponent(this.currentAlbumPath + '/' + photo.filename)}&size=small`;
+      img.src = `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(this.currentAlbumPath + '/' + photo.filename)}&size=small`;
       img.alt = photo.filename;
       img.loading = 'lazy';
       // Fallback to original if thumbnail fails
@@ -154,6 +154,11 @@ const photos = {
     try {
       const result = await api.upload(`/api/photos/${this.currentAlbumPath}`, Array.from(files));
       notifications.success(`Uploaded ${result.uploaded.length} photo(s)`);
+      if (result.renamed && result.renamed.length > 0) {
+        notifications.warning(
+          `${result.renamed.length} file(s) already existed and were saved under a new name (e.g. ${result.renamed[0].to})`
+        );
+      }
       await this.loadPhotos(this.currentAlbumPath, this.currentThumbnail);
       await albums.loadTree(); // Refresh tree to update counts
     } catch (error) {
