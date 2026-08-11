@@ -5,7 +5,8 @@
  *
  * This script:
  * 1. Renames folders with uppercase letters to lowercase (for case-sensitive filesystems)
- * 2. Removes all .md files that are NOT index.md from album folders
+ * 2. Removes stray .md files from album folders (index.md and body.md are kept —
+ *    body.md holds the album text written in the admin panel)
  * 3. Creates a default index.md for any folder containing images but no index.md
  * 4. Auto-selects thumbnail for albums (first image, or first image from first subfolder)
  * 5. Updates existing index.md files to add thumbnail if missing
@@ -222,11 +223,13 @@ function processDirectory(dirPath, stats) {
     return;
   }
 
-  // Find and remove non-index.md markdown files
+  // Find and remove stray markdown files.
+  // IMPORTANT: body.md is admin-authored album text — never delete it.
+  const KEPT_MD_FILES = ['index.md', 'body.md'];
   const mdFiles = files.filter(f =>
     f.isFile() &&
     f.name.endsWith('.md') &&
-    f.name !== 'index.md'
+    !KEPT_MD_FILES.includes(f.name)
   );
 
   for (const mdFile of mdFiles) {

@@ -6,9 +6,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const ENTRY_FILE = path.join(__dirname, '../dist/server/entry.mjs');
-const REMOTE_ROOT = '/home/klukacincom/public_html';
 
-console.log(`Fixing paths in ${ENTRY_FILE}...`);
+// Remote root comes from the environment (deploy.sh exports it from .env).
+const REMOTE_ROOT = process.env.DEPLOY_REMOTE_ROOT;
+if (!REMOTE_ROOT) {
+  console.error('Error: DEPLOY_REMOTE_ROOT is not set. Configure it in .env (see .env.example).');
+  process.exit(1);
+}
+
+console.log(`Fixing paths in ${ENTRY_FILE} (remote root: ${REMOTE_ROOT})...`);
 
 if (!fs.existsSync(ENTRY_FILE)) {
   console.error('Error: dist/server/entry.mjs not found. Run build first.');
@@ -19,24 +25,23 @@ let content = fs.readFileSync(ENTRY_FILE, 'utf8');
 
 // Find the lines with "client": "file://..." and "server": "file://..."
 // We use a regex to replace the value
-const clientRegex = /"client":\s*"file:\/\/[^"]+"/g;
-const serverRegex = /"server":\s*"file:\/\/[^"]+"/g;
-
 const newClient = `"client": "file://${REMOTE_ROOT}/client/"`;
 const newServer = `"server": "file://${REMOTE_ROOT}/server/"`;
 
 let changed = false;
 
-if (clientRegex.test(content)) {
-  content = content.replace(clientRegex, newClient);
+const afterClient = content.replace(/"client":\s*"file:\/\/[^"]+"/g, newClient);
+if (afterClient !== content) {
+  content = afterClient;
   changed = true;
   console.log('Updated client path.');
 } else {
   console.warn('Warning: Could not find client path pattern.');
 }
 
-if (serverRegex.test(content)) {
-  content = content.replace(serverRegex, newServer);
+const afterServer = content.replace(/"server":\s*"file:\/\/[^"]+"/g, newServer);
+if (afterServer !== content) {
+  content = afterServer;
   changed = true;
   console.log('Updated server path.');
 } else {
