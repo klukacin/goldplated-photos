@@ -10,9 +10,10 @@ import { siteConfig } from '../../config';
 
 const rootAlbums = await getSubAlbums('');
 
-// Separate public (no password) and locked (has password) albums
-const publicAlbums = rootAlbums.filter(a => !a.data.password);
-const lockedAlbums = rootAlbums.filter(a => !!a.data.password);
+// Separate public and locked (password or link-share protected) albums
+const isLocked = (a: typeof rootAlbums[0]) => !!a.data.password || !!a.data.shareToken;
+const publicAlbums = rootAlbums.filter(a => !isLocked(a));
+const lockedAlbums = rootAlbums.filter(isLocked);
 
 // Fetch cover photos for public albums
 const publicAlbumsWithCovers = await Promise.all(
@@ -26,17 +27,13 @@ const publicAlbumsWithCovers = await Promise.all(
   })
 );
 
-// Fetch cover photos for locked albums
-const lockedAlbumsWithCovers = await Promise.all(
-  lockedAlbums.map(async (album) => {
-    const albumPath = album.id.replace('/index.md', '');
-    const coverPhotoUrl = await getAlbumCoverPhoto(albumPath, album.data.thumbnail);
-    return {
-      album,
-      coverPhotoUrl
-    };
-  })
-);
+// SECURITY: Locked albums get no cover photo — this page is prerendered, so a
+// real cover would bake protected content into the public build. AlbumGrid
+// renders its lock placeholder instead.
+const lockedAlbumsWithCovers = lockedAlbums.map((album) => ({
+  album,
+  coverPhotoUrl: null as string | null
+}));
 
 // Count for toggle labels
 const publicCount = publicAlbums.length;

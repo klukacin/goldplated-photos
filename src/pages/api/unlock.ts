@@ -1,15 +1,13 @@
 import type { APIRoute } from 'astro';
-import { timingSafeEqual } from 'crypto';
 import { getAlbumByPath, getAllDescendants } from '../../lib/albums';
+import {
+  getAccessCookieValue,
+  getClientIp,
+  parseAccessCookie,
+  safeCompare,
+  setAccessCookie
+} from '../../lib/access';
 import { isRateLimited, recordFailedAttempt, clearRateLimit, getRemainingAttempts } from '../../lib/rate-limit';
-
-// SECURITY: Timing-safe string comparison
-function safeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-}
 
 export const prerender = false;
 
@@ -24,8 +22,8 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
       return redirect(`${returnUrl}?error=missing-fields`);
     }
 
-    // Rate limiting
-    const ip = clientAddress || request.headers.get('x-forwarded-for') || 'unknown';
+    // Rate limiting (real client IP, also behind the reverse proxy)
+    const ip = getClientIp(clientAddress, request.headers.get('x-forwarded-for'));
     if (isRateLimited(ip)) {
       return redirect(`${returnUrl}?error=rate-limited`);
     }
@@ -41,7 +39,7 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
       return redirect(`/photos/${albumPath}`);
     }
 
-    // Verify password
+    // Verify password (timing-safe)
     if (!safeCompare(password, correctPassword)) {
       recordFailedAttempt(ip);
       const remaining = getRemainingAttempts(ip);
@@ -51,21 +49,15 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
     // Password correct - clear rate limit
     clearRateLimit(ip);
 
-    // Get existing unlocked albums from cookie
-    const existingCookie = cookies.get('album-access')?.value;
-    let unlocked: string[] = [];
-    try {
-      unlocked = existingCookie ? JSON.parse(existingCookie) : [];
-    } catch {
-      unlocked = [];
-    }
+    // Get existing unlocked albums from the signed cookie (invalid → empty)
+    const unlocked = parseAccessCookie(getAccessCookieValue(cookies));
 
     // Add this album's token
     if (!unlocked.includes(album.data.token)) {
       unlocked.push(album.data.token);
     }
 
-    // CASCADE: Also unlock all descendants without passwords
+    // CASCADE: Also unlock all descendants without their own lock
     const descendants = await getAllDescendants(albumPath);
     descendants.forEach(desc => {
       if (!desc.data.password && !unlocked.includes(desc.data.token)) {
@@ -73,14 +65,8 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
       }
     });
 
-    // Set HttpOnly cookie
-    cookies.set('album-access', JSON.stringify(unlocked), {
-      httpOnly: true,
-      secure: import.meta.env.PROD, // HTTPS only in production
-      sameSite: 'strict',
-      maxAge: 60 * 60 * 24, // 24 hours
-      path: '/'
-    });
+    // Set signed HttpOnly cookie
+    setAccessCookie(cookies, unlocked);
 
     // Redirect back to album
     return redirect(`/photos/${albumPath}`);

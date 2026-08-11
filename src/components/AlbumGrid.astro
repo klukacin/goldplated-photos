@@ -17,7 +17,7 @@ interface Props {
 }
 
 const { albums, parentPath, parentToken, isParentProtected = false, hasParentAccess = true } = Astro.props;
-const siteUrl = siteConfig.siteUrl;
+const siteUrl = siteConfig.url;
 
 // Cache version - increment to bust browser cache after thumbnail changes
 const THUMBNAIL_VERSION = 2;
@@ -45,8 +45,9 @@ function formatCroatianDate(date: Date): string {
     const isProtected = albumHasPassword || isParentProtected;
     const hasCoverPhoto = !!coverPhotoUrl;
     const isCollection = album.data.isCollection;
-    // For albums inside protected parent, use parent token if album has no password
-    const effectiveToken = albumHasPassword ? album.data.token : parentToken;
+    // Share links use the album's own shareToken when it has one, otherwise the
+    // parent's (internal `token` ids never leave the server — they grant nothing).
+    const effectiveToken = album.data.shareToken || parentToken;
 
     return (
       <a

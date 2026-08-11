@@ -1,17 +1,11 @@
 import { getCollection, type CollectionEntry } from 'astro:content';
 import fs from 'fs/promises';
 import path from 'path';
-import { createHash } from 'crypto';
 import sharp from 'sharp';
 import * as exifr from 'exifr';
 import { marked } from 'marked';
 
 export type Album = CollectionEntry<'albums'>;
-
-export interface AlbumWithPhotos extends Album {
-  photos: Photo[];
-  subAlbums: Album[];
-}
 
 export interface Photo {
   filename: string;
@@ -184,17 +178,6 @@ export async function getPhotosForAlbum(albumPath: string): Promise<Photo[]> {
 }
 
 /**
- * Get counts of photos and videos in an album
- */
-export async function getMediaCounts(albumPath: string): Promise<{ photos: number; videos: number }> {
-  const media = await getPhotosForAlbum(albumPath);
-  return {
-    photos: media.filter(m => !m.isVideo).length,
-    videos: media.filter(m => m.isVideo).length
-  };
-}
-
-/**
  * Get archive files (ZIP, RAR, 7z) from an album directory
  */
 export async function getArchiveFiles(albumPath: string): Promise<ArchiveFile[]> {
@@ -274,41 +257,6 @@ export function buildBreadcrumbs(albumPath: string): Array<{ label: string; path
 }
 
 /**
- * Check if password is correct for album
- */
-export function checkPassword(album: Album, password: string): boolean {
-  if (!album.data.password) return true;
-  return album.data.password === password;
-}
-
-/**
- * Sort photos based on album settings
- */
-export async function sortPhotos(photos: Photo[], sortOrder: string): Promise<Photo[]> {
-  switch (sortOrder) {
-    case 'name':
-      return photos.sort((a, b) => a.filename.localeCompare(b.filename));
-    case 'date-asc':
-    case 'date-desc':
-      // Will be implemented with EXIF data
-      return photos;
-    case 'custom':
-    default:
-      return photos;
-  }
-}
-
-/**
- * Generate stable token for album path
- */
-export function generateAlbumToken(albumPath: string): string {
-  return createHash('sha256')
-    .update(albumPath)
-    .digest('hex')
-    .substring(0, 12);
-}
-
-/**
  * Get all ancestor albums (bottom-up)
  */
 export async function getAncestors(albumPath: string): Promise<Album[]> {
@@ -335,41 +283,4 @@ export async function getAllDescendants(parentPath: string): Promise<Album[]> {
     const albumId = album.id.replace('/index.md', '');
     return albumId.startsWith(pathPrefix) && albumId !== parentPath;
   });
-}
-
-/**
- * Check if user has access to album
- */
-export function checkAccess(
-  album: Album,
-  ancestors: Album[],
-  unlockedTokens: Set<string>,
-  providedToken?: string
-): {
-  hasAccess: boolean;
-  requiresPassword: boolean;
-  blockingAncestor?: Album;
-} {
-  // 1. Valid token + allowAnonymous = bypass parent passwords
-  if (providedToken === album.data.token && album.data.allowAnonymous) {
-    return { hasAccess: true, requiresPassword: false };
-  }
-
-  // 2. Check album password
-  if (album.data.password && !unlockedTokens.has(album.data.token)) {
-    return { hasAccess: false, requiresPassword: true };
-  }
-
-  // 3. Check ancestor passwords (inheritance)
-  for (const ancestor of ancestors) {
-    if (ancestor.data.password && !unlockedTokens.has(ancestor.data.token)) {
-      return {
-        hasAccess: false,
-        requiresPassword: true,
-        blockingAncestor: ancestor
-      };
-    }
-  }
-
-  return { hasAccess: true, requiresPassword: false };
 }

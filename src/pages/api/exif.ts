@@ -2,10 +2,11 @@ import type { APIRoute } from 'astro';
 import * as exifr from 'exifr';
 import fs from 'fs/promises';
 import path from 'path';
+import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
 
 export const prerender = false;
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, cookies }) => {
   try {
     const { photoUrl } = await request.json();
 
@@ -20,9 +21,18 @@ export const POST: APIRoute = async ({ request }) => {
     const photoPath = photoUrl.replace('/albums/', '');
 
     // SECURITY: Block path traversal attempts
-    if (photoPath.includes('..') || photoPath.startsWith('/')) {
+    if (photoPath.includes('..') || photoPath.startsWith('/') || photoPath.includes('\0')) {
       return new Response(JSON.stringify({ error: 'Invalid path' }), {
         status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // SECURITY: Enforce album access (EXIF can contain GPS coordinates)
+    const access = await resolveFileAccess(photoPath, getAccessCookieValue(cookies));
+    if (!access.hasAccess) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
         headers: { 'Content-Type': 'application/json' }
       });
     }

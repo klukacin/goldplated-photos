@@ -2,7 +2,8 @@ import type { APIRoute } from 'astro';
 import sharp from 'sharp';
 import fs from 'fs/promises';
 import path from 'path';
-import { createHash } from 'crypto';
+import { lookup } from 'mrmime';
+import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
 
 export const prerender = false;
 
@@ -13,7 +14,7 @@ const THUMBNAIL_SIZES = {
   large: 1920   // Full view
 };
 
-export const GET: APIRoute = async ({ request }) => {
+export const GET: APIRoute = async ({ request, cookies }) => {
   const url = new URL(request.url);
   const photoPath = url.searchParams.get('path');
   const size = url.searchParams.get('size') || 'small';
@@ -23,7 +24,7 @@ export const GET: APIRoute = async ({ request }) => {
   }
 
   // Security: Prevent directory traversal
-  if (photoPath.includes('..') || photoPath.startsWith('/')) {
+  if (photoPath.includes('..') || photoPath.startsWith('/') || photoPath.includes('\0')) {
     return new Response('Invalid path', { status: 400 });
   }
 
@@ -31,6 +32,19 @@ export const GET: APIRoute = async ({ request }) => {
   if (!['small', 'medium', 'large'].includes(size)) {
     return new Response('Invalid size', { status: 400 });
   }
+
+  // SECURITY: Enforce album access (password / share token)
+  const access = await resolveFileAccess(
+    photoPath,
+    getAccessCookieValue(cookies),
+    url.searchParams.get('token')
+  );
+  if (!access.hasAccess) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+  const cacheControl = access.isProtected
+    ? 'private, max-age=31536000'
+    : 'public, max-age=31536000, immutable';
 
   const width = THUMBNAIL_SIZES[size as keyof typeof THUMBNAIL_SIZES];
   const sourcePath = path.join(process.cwd(), 'src/content/albums', photoPath);
@@ -56,7 +70,7 @@ export const GET: APIRoute = async ({ request }) => {
         headers: {
           'Content-Type': 'image/jpeg',
           'Content-Length': cachedBuffer.length.toString(),
-          'Cache-Control': 'public, max-age=31536000, immutable',
+          'Cache-Control': cacheControl,
         },
       });
     } catch {
@@ -73,7 +87,6 @@ export const GET: APIRoute = async ({ request }) => {
     const thumbnail = await sharp(sourcePath)
       .rotate() // Auto-rotate based on EXIF orientation
       .resize(width, null, {
-        width: width,
         withoutEnlargement: true,
         fit: 'inside'
       })
@@ -92,21 +105,24 @@ export const GET: APIRoute = async ({ request }) => {
       headers: {
         'Content-Type': 'image/jpeg',
         'Content-Length': thumbnail.length.toString(),
-        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Cache-Control': cacheControl,
       },
     });
   } catch (error) {
     console.error('[Thumbnail] Error generating thumbnail:', error);
 
-    // Fallback to original image if thumbnail generation fails
+    // Fallback to original image if thumbnail generation fails.
+    // Use the real MIME type and a SHORT cache so a transient Sharp failure
+    // is not cached for a year by browsers/CDNs.
     try {
       const original = await fs.readFile(sourcePath);
+      const mimeType = lookup(path.extname(sourcePath).toLowerCase()) || 'application/octet-stream';
       return new Response(original, {
         status: 200,
         headers: {
-          'Content-Type': 'image/jpeg',
+          'Content-Type': mimeType,
           'Content-Length': original.length.toString(),
-          'Cache-Control': 'public, max-age=31536000, immutable',
+          'Cache-Control': 'no-cache',
         },
       });
     } catch {

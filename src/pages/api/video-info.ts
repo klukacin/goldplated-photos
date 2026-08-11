@@ -3,6 +3,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffprobeInstaller from '@ffprobe-installer/ffprobe';
 import fs from 'fs/promises';
 import path from 'path';
+import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
 
 export const prerender = false;
 
@@ -70,7 +71,7 @@ function getCodecName(codec: string): string {
   return codecMap[codec.toLowerCase()] || codec.toUpperCase();
 }
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, cookies }) => {
   try {
     const { videoUrl } = await request.json();
 
@@ -85,9 +86,18 @@ export const POST: APIRoute = async ({ request }) => {
     const videoPath = videoUrl.replace('/albums/', '');
 
     // SECURITY: Block path traversal attempts
-    if (videoPath.includes('..') || videoPath.startsWith('/')) {
+    if (videoPath.includes('..') || videoPath.startsWith('/') || videoPath.includes('\0')) {
       return new Response(JSON.stringify({ error: 'Invalid path' }), {
         status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // SECURITY: Enforce album access
+    const access = await resolveFileAccess(videoPath, getAccessCookieValue(cookies));
+    if (!access.hasAccess) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
         headers: { 'Content-Type': 'application/json' }
       });
     }

@@ -3,7 +3,9 @@
 // Photos are only fetched and rendered AFTER access is verified
 export const prerender = false;
 
-import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, getArchiveFiles, buildBreadcrumbs, getAncestors, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown, type ArchiveFile } from '../../lib/albums';
+import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, getArchiveFiles, buildBreadcrumbs, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown, type ArchiveFile } from '../../lib/albums';
+import { resolveAlbumAccess, setAccessCookie, getAccessCookieValue, getClientIp } from '../../lib/access';
+import { isRateLimited, recordFailedAttempt } from '../../lib/rate-limit';
 import Layout from '../../layouts/Layout.astro';
 import SEO from '../../components/SEO.astro';
 import AlbumGrid from '../../components/AlbumGrid.astro';
@@ -24,109 +26,29 @@ if (!album) {
 
 // Get token from query parameter (for share links)
 const url = new URL(Astro.request.url);
-const providedToken = url.searchParams.get('token');
 const errorParam = url.searchParams.get('error');
 const remainingAttempts = url.searchParams.get('remaining');
 
 // Get photo parameter for individual photo sharing
 const photoParam = url.searchParams.get('photo');
 
-// Get ancestors for password inheritance checking
-const ancestors = await getAncestors(path!);
+// SECURITY: Server-side access verification (shared module — same rules as media routes)
+const ip = getClientIp(Astro.clientAddress, Astro.request.headers.get('x-forwarded-for'));
+// Ignore share tokens from rate-limited clients (prevents token brute force)
+const providedToken = isRateLimited(ip) ? null : url.searchParams.get('token');
 
-// Check if album or any ancestor has password
-const albumHasPassword = !!album.data.password;
-const hasPasswordProtection = albumHasPassword || ancestors.some(a => !!a.data.password);
+const access = await resolveAlbumAccess(path!, getAccessCookieValue(cookies), providedToken);
+const { hasAccess, blockingAlbum } = access;
+const hasPasswordProtection = access.isProtected;
 
-// SECURITY: Server-side access verification
-let hasAccess = false;
-let blockingAlbum: { path: string; title: string } | null = null;
+// A share token was presented but didn't grant access → count towards rate limit
+if (providedToken && !hasAccess) {
+  recordFailedAttempt(ip);
+}
 
-if (!hasPasswordProtection) {
-  // No password protection - grant access
-  hasAccess = true;
-} else {
-  // Get unlocked tokens from cookie
-  const accessCookie = cookies.get('album-access')?.value;
-  let unlockedTokens: string[] = [];
-  try {
-    unlockedTokens = accessCookie ? JSON.parse(accessCookie) : [];
-  } catch {
-    unlockedTokens = [];
-  }
-
-  // Check if URL token grants access (share links)
-  if (providedToken) {
-    // Check if token matches this album
-    if (providedToken === album.data.token && album.data.allowAnonymous !== false) {
-      hasAccess = true;
-      // Add to cookie for subsequent requests
-      if (!unlockedTokens.includes(album.data.token)) {
-        unlockedTokens.push(album.data.token);
-        cookies.set('album-access', JSON.stringify(unlockedTokens), {
-          httpOnly: true,
-          secure: import.meta.env.PROD,
-          sameSite: 'strict',
-          maxAge: 60 * 60 * 24,
-          path: '/'
-        });
-      }
-    }
-    // Check if token matches any ancestor
-    if (!hasAccess) {
-      for (const ancestor of ancestors) {
-        if (providedToken === ancestor.data.token) {
-          hasAccess = true;
-          if (!unlockedTokens.includes(ancestor.data.token)) {
-            unlockedTokens.push(ancestor.data.token);
-            cookies.set('album-access', JSON.stringify(unlockedTokens), {
-              httpOnly: true,
-              secure: import.meta.env.PROD,
-              sameSite: 'strict',
-              maxAge: 60 * 60 * 24,
-              path: '/'
-            });
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  // Check cookie-based access
-  if (!hasAccess) {
-    // Check if this album's token is unlocked
-    if (unlockedTokens.includes(album.data.token)) {
-      hasAccess = true;
-    } else {
-      // Check ancestors - if any unlocked ancestor exists above a password-protected one, grant access
-      let foundUnlockedAncestor = false;
-      for (const ancestor of ancestors) {
-        if (unlockedTokens.includes(ancestor.data.token)) {
-          foundUnlockedAncestor = true;
-          break;
-        }
-        if (ancestor.data.password) {
-          // Found a password-protected ancestor that's not unlocked
-          blockingAlbum = {
-            path: ancestor.id.replace('/index.md', ''),
-            title: ancestor.data.title
-          };
-          break;
-        }
-      }
-
-      if (foundUnlockedAncestor) {
-        hasAccess = true;
-      } else if (!blockingAlbum && albumHasPassword) {
-        // This album itself is blocking
-        blockingAlbum = { path: path!, title: album.data.title };
-      } else if (!blockingAlbum) {
-        // No blocking ancestor found and album doesn't have password
-        hasAccess = true;
-      }
-    }
-  }
+// Persist a fresh share-token grant in the signed cookie
+if (access.grantedTokens) {
+  setAccessCookie(cookies, access.grantedTokens);
 }
 
 // SECURITY: Only fetch content if access is granted
@@ -257,7 +179,7 @@ if (!hasAccess) {
 
     <div class="album-content" id="album-content"
          data-album-path={path}
-         data-album-token={album.data.token}
+         data-album-token={album.data.shareToken || ''}
          data-has-access={hasAccess}
          data-shared-photo={photoParam || ''}>
 
@@ -266,41 +188,50 @@ if (!hasAccess) {
         <div class="password-protection">
           <div class="password-form">
             <div class="lock-icon">🔒</div>
-            <h2>This album is password protected</h2>
-            <p>Please enter the password to view the photos</p>
+            {blockingAlbum?.hasPassword === false ? (
+              <>
+                <h2>This album is private</h2>
+                <p>It can only be opened with the private link you received from the owner.</p>
+              </>
+            ) : (
+              <>
+                <h2>This album is password protected</h2>
+                <p>Please enter the password to view the photos</p>
 
-            {/* Show which album is blocking access */}
-            {blockingAlbum && blockingAlbum.path !== path && (
-              <p class="blocking-info">
-                Access blocked by: <strong>{blockingAlbum.title}</strong>
-              </p>
-            )}
-
-            {/* Error messages from URL params */}
-            {errorParam === 'wrong-password' && (
-              <p class="error-message">
-                Incorrect password.
-                {remainingAttempts && parseInt(remainingAttempts) > 0 && (
-                  <span>{remainingAttempts} attempts remaining.</span>
+                {/* Show which album is blocking access */}
+                {blockingAlbum && blockingAlbum.path !== path && (
+                  <p class="blocking-info">
+                    Access blocked by: <strong>{blockingAlbum.title}</strong>
+                  </p>
                 )}
-              </p>
-            )}
-            {errorParam === 'rate-limited' && (
-              <p class="error-message">Too many attempts. Please try again in 15 minutes.</p>
-            )}
 
-            <form method="POST" action="/api/unlock">
-              <input type="hidden" name="albumPath" value={blockingAlbum?.path || path} />
-              <input type="hidden" name="returnUrl" value={`/photos/${path}`} />
-              <input
-                type="password"
-                name="password"
-                placeholder="Enter password"
-                autocomplete="off"
-                required
-              />
-              <button type="submit">Unlock Album</button>
-            </form>
+                {/* Error messages from URL params */}
+                {errorParam === 'wrong-password' && (
+                  <p class="error-message">
+                    Incorrect password.
+                    {remainingAttempts && parseInt(remainingAttempts) > 0 && (
+                      <span>{remainingAttempts} attempts remaining.</span>
+                    )}
+                  </p>
+                )}
+                {errorParam === 'rate-limited' && (
+                  <p class="error-message">Too many attempts. Please try again in 15 minutes.</p>
+                )}
+
+                <form method="POST" action="/api/unlock">
+                  <input type="hidden" name="albumPath" value={blockingAlbum?.path || path} />
+                  <input type="hidden" name="returnUrl" value={`/photos/${path}`} />
+                  <input
+                    type="password"
+                    name="password"
+                    placeholder="Enter password"
+                    autocomplete="off"
+                    required
+                  />
+                  <button type="submit">Unlock Album</button>
+                </form>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -323,7 +254,7 @@ if (!hasAccess) {
             <AlbumGrid
               albums={subAlbumsWithCovers}
               parentPath={path}
-              parentToken={album.data.token}
+              parentToken={album.data.shareToken || ''}
               isParentProtected={hasPasswordProtection}
               hasParentAccess={hasAccess}
             />
@@ -378,7 +309,7 @@ if (!hasAccess) {
               photos={photos}
               style={album.data.style}
               albumPath={path!}
-              albumToken={album.data.token}
+              albumToken={album.data.shareToken || ''}
               isProtected={hasPasswordProtection}
               hasAccess={hasAccess}
             />

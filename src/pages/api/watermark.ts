@@ -3,6 +3,7 @@ import sharp from 'sharp';
 import fs from 'fs/promises';
 import path from 'path';
 import { siteConfig } from '../../config';
+import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
 
 export const prerender = false;
 
@@ -12,7 +13,7 @@ export const prerender = false;
  * GET /api/watermark?path=album/photo.jpg
  * Returns: Watermarked JPEG image for download
  */
-export const GET: APIRoute = async ({ request }) => {
+export const GET: APIRoute = async ({ request, cookies }) => {
   const url = new URL(request.url);
   const photoPath = url.searchParams.get('path');
 
@@ -21,8 +22,18 @@ export const GET: APIRoute = async ({ request }) => {
   }
 
   // Security: Prevent directory traversal
-  if (photoPath.includes('..') || photoPath.startsWith('/')) {
+  if (photoPath.includes('..') || photoPath.startsWith('/') || photoPath.includes('\0')) {
     return new Response('Invalid path', { status: 400 });
+  }
+
+  // SECURITY: Enforce album access
+  const access = await resolveFileAccess(
+    photoPath,
+    getAccessCookieValue(cookies),
+    url.searchParams.get('token')
+  );
+  if (!access.hasAccess) {
+    return new Response('Unauthorized', { status: 401 });
   }
 
   const sourcePath = path.join(process.cwd(), 'src/content/albums', photoPath);

@@ -3,10 +3,11 @@ import JSZip from 'jszip';
 import fs from 'fs/promises';
 import path from 'path';
 import { getAlbumByPath } from '../../lib/albums';
+import { resolveAlbumAccess, getAccessCookieValue } from '../../lib/access';
 
 export const prerender = false;
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, cookies }) => {
   try {
     const { albumPath } = await request.json();
 
@@ -18,14 +19,13 @@ export const POST: APIRoute = async ({ request }) => {
     }
 
     // SECURITY: Block path traversal attempts
-    if (albumPath.includes('..') || albumPath.startsWith('/')) {
+    if (albumPath.includes('..') || albumPath.startsWith('/') || albumPath.includes('\0')) {
       return new Response(JSON.stringify({ error: 'Invalid path' }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // SECURITY: Check album access control
     const album = await getAlbumByPath(albumPath);
     if (!album) {
       return new Response(JSON.stringify({ error: 'Album not found' }), {
@@ -34,15 +34,25 @@ export const POST: APIRoute = async ({ request }) => {
       });
     }
 
-    // If album is password-protected, require valid token
-    if (album.data.password) {
-      const providedToken = request.headers.get('X-Album-Token');
-      if (providedToken !== album.data.token) {
-        return new Response(JSON.stringify({ error: 'Unauthorized - album is password protected' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
+    // Downloads must be explicitly enabled for the album
+    if (!album.data.allowDownload) {
+      return new Response(JSON.stringify({ error: 'Downloads are not enabled for this album' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // SECURITY: Full access check — album AND ancestors (cookie or share token)
+    const access = await resolveAlbumAccess(
+      albumPath,
+      getAccessCookieValue(cookies),
+      request.headers.get('X-Album-Token')
+    );
+    if (!access.hasAccess) {
+      return new Response(JSON.stringify({ error: 'Unauthorized - album is protected' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
     const albumDir = path.join(process.cwd(), 'src/content/albums', albumPath);
