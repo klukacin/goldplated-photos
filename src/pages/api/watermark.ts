@@ -26,6 +26,11 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     return new Response('Invalid path', { status: 400 });
   }
 
+  // Security: Block metadata files (markdown, .meta cache, dotfiles)
+  if (photoPath.endsWith('.md') || photoPath.split('/').some(s => s.startsWith('.'))) {
+    return new Response('Not found', { status: 404 });
+  }
+
   // SECURITY: Enforce album access
   const access = await resolveFileAccess(
     photoPath,

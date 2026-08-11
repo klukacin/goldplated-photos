@@ -28,6 +28,14 @@ export const POST: APIRoute = async ({ request, cookies }) => {
       });
     }
 
+    // SECURITY: Block metadata files (markdown, .meta cache, dotfiles)
+    if (photoPath.endsWith('.md') || photoPath.split('/').some((s: string) => s.startsWith('.'))) {
+      return new Response(JSON.stringify({ error: 'Photo not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     // SECURITY: Enforce album access (EXIF can contain GPS coordinates)
     const access = await resolveFileAccess(photoPath, getAccessCookieValue(cookies));
     if (!access.hasAccess) {

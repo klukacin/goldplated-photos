@@ -160,6 +160,15 @@ describe('resolveChainAccess', () => {
     expect(resolveChainAccess([a], undefined, shareToken).hasAccess).toBe(true);
   });
 
+  it('a child with its own lock stays locked even when the parent is unlocked', () => {
+    const parent = album('2025', { password: 'p' });
+    const linkOnlyChild = album('2025/secret', { shareToken: generateShareToken() });
+    const passwordChild = album('2025/vip', { password: 'q' });
+    const parentCookie = cookieFor(parent.data.token);
+    expect(resolveChainAccess([linkOnlyChild, parent], parentCookie).hasAccess).toBe(false);
+    expect(resolveChainAccess([passwordChild, parent], parentCookie).hasAccess).toBe(false);
+  });
+
   it('ignores forged (unsigned) cookies', () => {
     const a = album('2025/priv', { password: 'p' });
     const forged = JSON.stringify([a.data.token]);
@@ -171,10 +180,15 @@ describe('getClientIp', () => {
   it('uses the direct address when it is a real client', () => {
     expect(getClientIp('203.0.113.7', '198.51.100.1')).toBe('203.0.113.7');
   });
-  it('uses the first X-Forwarded-For hop behind a local proxy', () => {
-    expect(getClientIp('127.0.0.1', '198.51.100.1, 10.0.0.1')).toBe('198.51.100.1');
+  it('uses the LAST X-Forwarded-For hop behind a local proxy (appended by our proxy)', () => {
+    expect(getClientIp('127.0.0.1', '198.51.100.1')).toBe('198.51.100.1');
     expect(getClientIp('::1', '198.51.100.1')).toBe('198.51.100.1');
     expect(getClientIp('::ffff:127.0.0.1', '198.51.100.1')).toBe('198.51.100.1');
+  });
+  it('ignores client-spoofed leading X-Forwarded-For entries', () => {
+    // The proxy APPENDS the real peer: "spoofed, realIP" — trust the last hop
+    expect(getClientIp('127.0.0.1', '1.2.3.4, 198.51.100.1')).toBe('198.51.100.1');
+    expect(getClientIp('127.0.0.1', 'a, b, 198.51.100.1')).toBe('198.51.100.1');
   });
   it('falls back to "unknown" when nothing is available', () => {
     expect(getClientIp(undefined, null)).toBe('unknown');

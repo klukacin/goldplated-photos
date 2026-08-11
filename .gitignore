@@ -17,6 +17,7 @@ firebase-debug.log
 # environment variables
 .env
 .env.production
+.access-secret
 
 # macOS-specific files
 .DS_Store

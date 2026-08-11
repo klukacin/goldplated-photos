@@ -1,5 +1,5 @@
 import type { APIRoute } from 'astro';
-import { getAlbumByPath, getAllDescendants } from '../../lib/albums';
+import { getAlbumByPath } from '../../lib/albums';
 import {
   getAccessCookieValue,
   getClientIp,
@@ -52,18 +52,12 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
     // Get existing unlocked albums from the signed cookie (invalid → empty)
     const unlocked = parseAccessCookie(getAccessCookieValue(cookies));
 
-    // Add this album's token
+    // Add this album's token. No descendant cascade needed: access resolution
+    // grants descendants of an unlocked ancestor automatically, and descendants
+    // with their own lock (password or shareToken) must NOT be auto-unlocked.
     if (!unlocked.includes(album.data.token)) {
       unlocked.push(album.data.token);
     }
-
-    // CASCADE: Also unlock all descendants without their own lock
-    const descendants = await getAllDescendants(albumPath);
-    descendants.forEach(desc => {
-      if (!desc.data.password && !unlocked.includes(desc.data.token)) {
-        unlocked.push(desc.data.token);
-      }
-    });
 
     // Set signed HttpOnly cookie
     setAccessCookie(cookies, unlocked);

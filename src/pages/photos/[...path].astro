@@ -179,7 +179,7 @@ if (!hasAccess) {
 
     <div class="album-content" id="album-content"
          data-album-path={path}
-         data-album-token={album.data.shareToken || ''}
+         data-album-token={hasAccess ? (album.data.shareToken || '') : ''}
          data-has-access={hasAccess}
          data-shared-photo={photoParam || ''}>
 

@@ -14,6 +14,8 @@
  *   it is unlocked. An unlocked album grants its descendants.
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 export const ACCESS_COOKIE = 'album-access';
 export const ACCESS_COOKIE_MAX_AGE = 60 * 60 * 24; // 24 hours
@@ -43,14 +45,41 @@ function getSecret(): Buffer {
 
   if (fromEnv && fromEnv.length >= 16) {
     cachedSecret = Buffer.from(fromEnv, 'utf-8');
-  } else {
-    // Ephemeral fallback: cookies stay valid only until the server restarts.
-    cachedSecret = randomBytes(32);
+    return cachedSecret;
+  }
+
+  // Fallback: persist a generated secret to .access-secret so sessions
+  // survive restarts and are shared across PM2 cluster workers. Only if the
+  // file cannot be written do we degrade to an ephemeral per-process secret.
+  const secretFile = join(process.cwd(), '.access-secret');
+  try {
+    cachedSecret = Buffer.from(readFileSync(secretFile, 'utf-8').trim(), 'base64url');
+    if (cachedSecret.length >= 16) return cachedSecret;
+  } catch { /* not there yet */ }
+
+  const generated = randomBytes(32);
+  try {
+    // 'wx' fails when the file appeared meanwhile (concurrent worker) — re-read
+    writeFileSync(secretFile, generated.toString('base64url'), { flag: 'wx', mode: 0o600 });
+    cachedSecret = generated;
     if (!warnedAboutSecret) {
       warnedAboutSecret = true;
       console.warn(
-        '[access] ACCESS_SECRET is not set (or shorter than 16 chars). ' +
-        'Using an ephemeral secret: visitors will need to re-enter passwords after every server restart. ' +
+        '[access] ACCESS_SECRET is not set — generated one and stored it in .access-secret. ' +
+        'Set ACCESS_SECRET in .env to manage it explicitly.'
+      );
+    }
+  } catch {
+    try {
+      cachedSecret = Buffer.from(readFileSync(secretFile, 'utf-8').trim(), 'base64url');
+      if (cachedSecret.length >= 16) return cachedSecret;
+    } catch { /* unreadable too */ }
+    cachedSecret = generated;
+    if (!warnedAboutSecret) {
+      warnedAboutSecret = true;
+      console.warn(
+        '[access] ACCESS_SECRET is not set and .access-secret could not be written. ' +
+        'Using an ephemeral secret: visitors must re-enter passwords after every restart. ' +
         'Set ACCESS_SECRET in .env for stable sessions.'
       );
     }
@@ -216,7 +245,10 @@ const LOOPBACK = new Set(['127.0.0.1', '::1']);
 
 /**
  * Determine the real client IP. Behind the local reverse proxy the direct
- * peer address is loopback, so fall back to the first X-Forwarded-For hop.
+ * peer address is loopback, so fall back to the LAST X-Forwarded-For hop —
+ * that's the one appended by our own proxy. Earlier hops are client-supplied
+ * and trivially spoofable (an attacker could rotate them to reset rate
+ * limits or frame another IP).
  */
 export function getClientIp(
   directAddress: string | undefined | null,
@@ -226,8 +258,9 @@ export function getClientIp(
   const isLoopback =
     LOOPBACK.has(direct) || direct.startsWith('::ffff:127.') || direct === '';
   if (isLoopback && forwardedFor) {
-    const firstHop = forwardedFor.split(',')[0].trim();
-    if (firstHop) return firstHop;
+    const hops = forwardedFor.split(',').map(h => h.trim()).filter(Boolean);
+    const lastHop = hops[hops.length - 1];
+    if (lastHop) return lastHop;
   }
   return direct || 'unknown';
 }

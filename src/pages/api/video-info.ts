@@ -93,6 +93,14 @@ export const POST: APIRoute = async ({ request, cookies }) => {
       });
     }
 
+    // SECURITY: Block metadata files (markdown, .meta cache, dotfiles)
+    if (videoPath.endsWith('.md') || videoPath.split('/').some((s: string) => s.startsWith('.'))) {
+      return new Response(JSON.stringify({ error: 'Video not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     // SECURITY: Enforce album access
     const access = await resolveFileAccess(videoPath, getAccessCookieValue(cookies));
     if (!access.hasAccess) {

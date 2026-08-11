@@ -28,6 +28,13 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     return new Response('Invalid path', { status: 400 });
   }
 
+  // Security: Block metadata — markdown (contains passwords), .meta cache and
+  // dotfiles. Without this, the original-file fallback below could serve
+  // index.md verbatim.
+  if (photoPath.endsWith('.md') || photoPath.split('/').some(s => s.startsWith('.'))) {
+    return new Response('Not found', { status: 404 });
+  }
+
   // Validate size
   if (!['small', 'medium', 'large'].includes(size)) {
     return new Response('Invalid size', { status: 400 });
