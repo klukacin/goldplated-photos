@@ -17,7 +17,7 @@ const { photos, style, albumPath, albumToken = '', isProtected = false, hasAcces
 const siteUrl = siteConfig.url;
 
 // Cache version - increment to bust browser cache after thumbnail changes
-const THUMBNAIL_VERSION = 2;
+const THUMBNAIL_VERSION = 3;
 
 // Helper function to generate thumbnail URL
 function getThumbnailUrl(photoUrl: string, size: 'small' | 'medium' | 'large' = 'small'): string {
@@ -26,12 +26,23 @@ function getThumbnailUrl(photoUrl: string, size: 'small' | 'medium' | 'large' = 
   return `/api/thumbnail?path=${encodeURIComponent(path)}&size=${size}&v=${THUMBNAIL_VERSION}`;
 }
 
+// srcset with all three server-side sizes — the browser picks by layout width
+function getThumbnailSrcset(photoUrl: string): string {
+  return `${getThumbnailUrl(photoUrl, 'small')} 400w, ${getThumbnailUrl(photoUrl, 'medium')} 1200w, ${getThumbnailUrl(photoUrl, 'large')} 1920w`;
+}
+
 // Helper function to get the best thumbnail size for lightbox based on viewport
 function getLightboxSize(photoUrl: string): string {
   const path = photoUrl.replace('/albums/', '');
   // For lightbox, use 'large' by default (1920px) which should fit most screens
   return `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=${THUMBNAIL_VERSION}`;
 }
+
+// Initial `sizes` matching the album's configured layout; kept in sync on
+// client-side style switches by applyDisplayStyle() in the album page script.
+const gridSizes = '(max-width: 768px) 50vw, 33vw';
+const singleColumnSizes = '(max-width: 1400px) 100vw, 1400px';
+const initialSizes = style === 'single-column' ? singleColumnSizes : gridSizes;
 
 // Helper function to get video MIME type from filename
 function getVideoMimeType(filename: string): string {
@@ -102,10 +113,16 @@ function getVideoMimeType(filename: string): string {
         >
           <div class="photo-thumb" style={`--aspect-ratio: ${photo.width || 3} / ${photo.height || 2}`}>
             <img
-              src={getThumbnailUrl(photo.url, 'large')}
+              src={getThumbnailUrl(photo.url, 'small')}
+              srcset={getThumbnailSrcset(photo.url)}
+              sizes={initialSizes}
               alt={photo.filename}
+              width={photo.width}
+              height={photo.height}
               loading="lazy"
+              decoding="async"
               class="photo-img"
+              style={photo.blur ? `background-image:url(${photo.blur});background-size:cover;background-position:center` : undefined}
             />
           </div>
         </a>
@@ -1560,7 +1577,7 @@ function getVideoMimeType(filename: string): string {
     const photoUrl = e.itemData.element?.getAttribute('data-photo-url');
     if (photoUrl) {
       const path = photoUrl.replace('/albums/', '');
-      e.itemData.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
+      e.itemData.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
     }
   });
 
@@ -1701,7 +1718,7 @@ function getVideoMimeType(filename: string): string {
         const photoUrl = element?.getAttribute('data-photo-url');
         if (photoUrl) {
           const path = photoUrl.replace('/albums/', '');
-          const thumbnailUrl = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
+          const thumbnailUrl = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
           const thumbSizeBytes = await getThumbnailSize(thumbnailUrl);
           sizeDisplay.textContent = `${thumbW}×${thumbH} · ${formatFileSize(thumbSizeBytes)}`;
         } else {
@@ -1726,7 +1743,7 @@ function getVideoMimeType(filename: string): string {
         } else {
           // Revert to thumbnail
           const path = photoUrl.replace('/albums/', '');
-          pswp.currSlide.data.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
+          pswp.currSlide.data.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
         }
         pswp.refreshSlideContent(pswp.currIndex);
       }

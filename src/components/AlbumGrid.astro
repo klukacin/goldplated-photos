@@ -20,13 +20,16 @@ const { albums, parentPath, parentToken, isParentProtected = false, hasParentAcc
 const siteUrl = siteConfig.url;
 
 // Cache version - increment to bust browser cache after thumbnail changes
-const THUMBNAIL_VERSION = 2;
+const THUMBNAIL_VERSION = 3;
 
 // Helper function to generate thumbnail URL
 function getThumbnailUrl(photoUrl: string, size: 'small' | 'medium' | 'large' = 'small'): string {
   const path = photoUrl.replace('/albums/', '');
   return `/api/thumbnail?path=${encodeURIComponent(path)}&size=${size}&v=${THUMBNAIL_VERSION}`;
 }
+
+// Album cards render at roughly a third of the container on desktop
+const coverSizes = '(max-width: 768px) 50vw, 400px';
 
 // Format date in Croatian format (DD.MM.YYYY)
 function formatCroatianDate(date: Date): string {
@@ -65,8 +68,12 @@ function formatCroatianDate(date: Date): string {
           {hasCoverPhoto ? (
             <>
               <img
-                src={getThumbnailUrl(coverPhotoUrl, 'large')}
+                src={getThumbnailUrl(coverPhotoUrl, 'small')}
+                srcset={`${getThumbnailUrl(coverPhotoUrl, 'small')} 400w, ${getThumbnailUrl(coverPhotoUrl, 'medium')} 1200w`}
+                sizes={coverSizes}
                 alt={displayTitle}
+                loading="lazy"
+                decoding="async"
                 class="cover-image"
               />
               {isProtected && <span class="lock-icon">🔒</span>}

@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { lookup } from 'mrmime';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
+import { imageJobSemaphore } from '../../lib/semaphore';
 
 export const prerender = false;
 
@@ -13,6 +14,11 @@ const THUMBNAIL_SIZES = {
   medium: 1200, // Lightbox preview
   large: 1920   // Full view
 };
+
+const FORMATS = {
+  webp: { contentType: 'image/webp', ext: 'webp' },
+  jpeg: { contentType: 'image/jpeg', ext: 'jpg' }
+} as const;
 
 export const GET: APIRoute = async ({ request, cookies }) => {
   const url = new URL(request.url);
@@ -53,55 +59,67 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     ? 'private, max-age=31536000'
     : 'public, max-age=31536000, immutable';
 
+  // Content negotiation: serve WebP to clients that accept it (smaller files),
+  // JPEG otherwise. The disk cache is keyed by format; responses carry
+  // `Vary: Accept` so shared caches keep the variants apart.
+  const wantsWebp = (request.headers.get('accept') || '').includes('image/webp');
+  const format = FORMATS[wantsWebp ? 'webp' : 'jpeg'];
+
   const width = THUMBNAIL_SIZES[size as keyof typeof THUMBNAIL_SIZES];
   const sourcePath = path.join(process.cwd(), 'src/content/albums', photoPath);
 
   // Extract album directory and filename
   const albumDir = path.dirname(photoPath);
   const filename = path.basename(photoPath);
-  const ext = path.extname(filename);
-  const nameWithoutExt = path.basename(filename, ext);
 
-  // Cache in album's .meta directory: src/content/albums/{album}/.meta/thumbnails/{size}/{filename}
+  // Cache in album's .meta directory:
+  // src/content/albums/{album}/.meta/thumbnails/{size}/{filename}.{fmt}
   const cacheDir = path.join(process.cwd(), 'src/content/albums', albumDir, '.meta/thumbnails', size);
-  const cachePath = path.join(cacheDir, filename);
+  const cachePath = path.join(cacheDir, `${filename}.${format.ext}`);
+
+  const baseHeaders = {
+    'Content-Type': format.contentType,
+    'Cache-Control': cacheControl,
+    'Vary': 'Accept',
+  };
 
   try {
-    // Check if thumbnail already exists in cache
-    try {
-      await fs.access(cachePath);
+    const sourceStat = await fs.stat(sourcePath);
 
-      const cachedBuffer = await fs.readFile(cachePath);
-      return new Response(new Uint8Array(cachedBuffer), {
-        status: 200,
-        headers: {
-          'Content-Type': 'image/jpeg',
-          'Content-Length': cachedBuffer.length.toString(),
-          'Cache-Control': cacheControl,
-        },
-      });
+    // Serve from cache only when it is newer than the source file — replacing
+    // a photo under the same name invalidates its thumbnails automatically.
+    try {
+      const cacheStat = await fs.stat(cachePath);
+      if (cacheStat.mtimeMs >= sourceStat.mtimeMs) {
+        const cachedBuffer = await fs.readFile(cachePath);
+        return new Response(new Uint8Array(cachedBuffer), {
+          status: 200,
+          headers: {
+            ...baseHeaders,
+            'Content-Length': cachedBuffer.length.toString(),
+          },
+        });
+      }
     } catch {
       // Cache miss, continue to generate
     }
 
-    // Check if source file exists
-    await fs.access(sourcePath);
-
     // Ensure cache directory exists
     await fs.mkdir(cacheDir, { recursive: true });
 
-    // Generate thumbnail with Sharp
-    const thumbnail = await sharp(sourcePath)
-      .rotate() // Auto-rotate based on EXIF orientation
-      .resize(width, null, {
-        withoutEnlargement: true,
-        fit: 'inside'
-      })
-      .jpeg({
-        quality: 85,
-        progressive: true
-      })
-      .toBuffer();
+    // Generate thumbnail with Sharp (bounded concurrency — a cold large album
+    // must not saturate CPU/memory with parallel libvips jobs)
+    const thumbnail = await imageJobSemaphore.run(() => {
+      const pipeline = sharp(sourcePath)
+        .rotate() // Auto-rotate based on EXIF orientation
+        .resize(width, null, {
+          withoutEnlargement: true,
+          fit: 'inside'
+        });
+      return wantsWebp
+        ? pipeline.webp({ quality: 82 }).toBuffer()
+        : pipeline.jpeg({ quality: 85, progressive: true }).toBuffer();
+    });
 
     // Save to cache
     await fs.writeFile(cachePath, thumbnail);
@@ -110,9 +128,8 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     return new Response(new Uint8Array(thumbnail), {
       status: 200,
       headers: {
-        'Content-Type': 'image/jpeg',
+        ...baseHeaders,
         'Content-Length': thumbnail.length.toString(),
-        'Cache-Control': cacheControl,
       },
     });
   } catch (error) {

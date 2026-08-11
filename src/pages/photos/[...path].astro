@@ -1065,6 +1065,14 @@ if (!hasAccess) {
           photoGallery.classList.remove('photo-grid-grid', 'photo-grid-masonry', 'photo-grid-slideshow', 'photo-grid-single-column');
           // Add the new style class
           photoGallery.classList.add(`photo-grid-${style}`);
+          // Keep responsive `sizes` in sync so the browser picks the right
+          // srcset step: full-width in single-column, grid fractions otherwise
+          const sizes = style === 'single-column'
+            ? '(max-width: 1400px) 100vw, 1400px'
+            : '(max-width: 768px) 50vw, 33vw';
+          photoGallery.querySelectorAll('img.photo-img').forEach(img => {
+            img.setAttribute('sizes', sizes);
+          });
         }
       }
 
