@@ -62,6 +62,18 @@ if (hasAccess) {
   allMedia = await getPhotosForAlbum(path!);
   archiveFiles = await getArchiveFiles(path!);
 
+  // Custom order: apply the admin-managed photoOrder as the server-side base
+  // order. Files not in the list sort after, by name.
+  if (album.data.sort === 'custom' && album.data.photoOrder?.length) {
+    const orderIndex = new Map(album.data.photoOrder.map((f, i) => [f, i]));
+    allMedia.sort((a, b) => {
+      const ia = orderIndex.get(a.filename) ?? Infinity;
+      const ib = orderIndex.get(b.filename) ?? Infinity;
+      if (ia !== ib) return ia - ib;
+      return a.filename.localeCompare(b.filename);
+    });
+  }
+
   // Fetch cover photos for sub-albums
   subAlbumsWithCovers = await Promise.all(
     subAlbums.map(async (subAlbum) => {
@@ -268,6 +280,7 @@ if (!hasAccess) {
                 <h2>({photoCount}/{videoCount})</h2>
                 <div class="gallery-controls">
                   <select id="sort-select" class="control-select" title="Sort photos" data-album-sort={album.data.sort}>
+                    <option value="custom">Album Order</option>
                     <option value="date-oldest">Date (Oldest)</option>
                     <option value="date-newest">Date (Newest)</option>
                     <option value="exif-oldest">EXIF Date (Oldest)</option>
@@ -965,7 +978,7 @@ if (!hasAccess) {
           'exif-desc': 'exif-newest',
           'exif-asc': 'exif-oldest',
           'name': 'name-asc',
-          'custom': 'name-asc'
+          'custom': 'custom'
         };
 
         // Get album's default sort from data attribute
@@ -1002,6 +1015,14 @@ if (!hasAccess) {
             const filenameB = b.getAttribute('data-photo-filename') || '';
 
             switch (sortBy) {
+              case 'custom': {
+                // Server renders photos in album order (photoOrder applied
+                // server-side) — restore it via the original render index
+                const indexA = parseInt(a.getAttribute('data-index') || '0');
+                const indexB = parseInt(b.getAttribute('data-index') || '0');
+                return indexA - indexB;
+              }
+
               case 'name-asc':
                 return filenameA.localeCompare(filenameB);
 

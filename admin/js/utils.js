@@ -65,6 +65,11 @@ const api = {
   },
 
   async upload(endpoint, files, fieldName = 'photos') {
+    return api.uploadWithProgress(endpoint, files, fieldName, null);
+  },
+
+  // Upload via XHR so we can report progress (fetch has no upload progress)
+  uploadWithProgress(endpoint, files, fieldName = 'photos', onProgress = null) {
     const formData = new FormData();
     if (Array.isArray(files)) {
       files.forEach(file => formData.append(fieldName, file));
@@ -72,15 +77,32 @@ const api = {
       formData.append(fieldName, files);
     }
 
-    const response = await fetch(`${API_BASE}${endpoint}`, {
-      method: 'POST',
-      body: formData
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE}${endpoint}`);
+
+      if (onProgress) {
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable) {
+            onProgress(Math.round((e.loaded / e.total) * 100), e.loaded, e.total);
+          }
+        });
+      }
+
+      xhr.addEventListener('load', () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch { /* non-JSON */ }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(data ?? {});
+        } else {
+          reject(new Error(data?.error || `Upload failed (${xhr.status})`));
+        }
+      });
+      xhr.addEventListener('error', () => reject(new Error('Upload failed (network error)')));
+      xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+
+      xhr.send(formData);
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Upload failed' }));
-      throw new Error(error.error || 'Upload failed');
-    }
-    return response.json();
   }
 };
 
@@ -129,14 +151,15 @@ const modal = {
     document.getElementById(modalId).classList.add('hidden');
   },
 
-  confirm(title, message) {
+  confirm(title, message, yesLabel = 'Confirm') {
     return new Promise((resolve) => {
-      const modalEl = document.getElementById('confirm-modal');
       document.getElementById('confirm-title').textContent = title;
       document.getElementById('confirm-message').textContent = message;
 
       const yesBtn = document.getElementById('confirm-yes');
       const noBtn = document.getElementById('confirm-no');
+      yesBtn.textContent = yesLabel;
+      yesBtn.classList.toggle('btn-danger', /delete|remove|discard/i.test(yesLabel));
 
       const cleanup = () => {
         modal.hide('confirm-modal');

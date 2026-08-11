@@ -62,11 +62,14 @@ const app = {
       this.loadCacheStats();
     });
 
+    this.initScriptRunner();
+
     // Clear cache
     document.getElementById('clear-cache-btn').addEventListener('click', async () => {
       const confirmed = await modal.confirm(
         'Clear Thumbnails',
-        'This will delete all cached thumbnails. They will be regenerated on next access. Continue?'
+        'This will delete all cached thumbnails. They will be regenerated on next access. Continue?',
+        'Clear'
       );
       if (confirmed) {
         const btn = document.getElementById('clear-cache-btn');
@@ -81,6 +84,75 @@ const app = {
           btn.classList.remove('loading');
         }
       }
+    });
+  },
+
+  async initScriptRunner() {
+    const buttonsEl = document.getElementById('runner-buttons');
+    const outputEl = document.getElementById('runner-output');
+    const statusEl = document.getElementById('runner-status');
+    if (!buttonsEl) return;
+
+    let scripts = [];
+    try {
+      const data = await api.get('/api/tools/scripts');
+      scripts = data.scripts;
+    } catch {
+      buttonsEl.innerHTML = '<p style="color: var(--text-secondary);">Script runner unavailable.</p>';
+      return;
+    }
+
+    const setRunning = (running, label = '') => {
+      buttonsEl.querySelectorAll('button').forEach(b => { b.disabled = running; });
+      statusEl.textContent = running ? `Running: ${label}…` : '';
+    };
+
+    scripts.forEach(script => {
+      const btn = document.createElement('button');
+      btn.className = 'btn' + (script.confirm ? ' btn-warning' : '');
+      btn.textContent = script.label;
+      btn.addEventListener('click', async () => {
+        if (script.confirm) {
+          const confirmed = await modal.confirm(
+            script.label,
+            `Run "${script.label}" now? Watch the output below.`,
+            'Run'
+          );
+          if (!confirmed) return;
+        }
+
+        outputEl.textContent = '';
+        outputEl.classList.remove('hidden');
+        setRunning(true, script.label);
+
+        const source = new EventSource(`/api/tools/run/${script.id}`);
+        const append = (text) => {
+          outputEl.textContent += text;
+          outputEl.scrollTop = outputEl.scrollHeight;
+        };
+        source.addEventListener('output', (e) => append(JSON.parse(e.data)));
+        source.addEventListener('done', (e) => {
+          const { code } = JSON.parse(e.data);
+          append(`\n— finished with exit code ${code} —\n`);
+          source.close();
+          setRunning(false);
+          if (code === 0) {
+            notifications.success(`${script.label} finished`);
+          } else {
+            notifications.error(`${script.label} failed (exit code ${code})`);
+          }
+        });
+        source.onerror = () => {
+          // Connection failed (409 lock or server error) — EventSource can't
+          // expose the status, so report generically
+          if (source.readyState === EventSource.CLOSED) return;
+          source.close();
+          setRunning(false);
+          append('\n— connection lost (is another script already running?) —\n');
+          notifications.error(`${script.label}: connection lost`);
+        };
+      });
+      buttonsEl.appendChild(btn);
     });
   },
 

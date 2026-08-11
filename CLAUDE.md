@@ -547,21 +547,29 @@ A local-only web-based CMS for content management. **Never deployed to productio
 
 | Tab | Purpose |
 |-----|---------|
-| **Albums** | Create/edit albums, upload photos/videos, manage settings |
-| **Home** | Edit landing background, hero slider, intro text, content cards |
-| **Tools** | Thumbnail cache management, quick links |
+| **Albums** | Create/edit/rename/move albums, reorder siblings (↑↓ in tree), upload photos/videos with progress, drag-drop photo reordering (persists `photoOrder` + sets `sort: custom`), multi-select bulk delete/move/set-cover, click-to-preview with EXIF, share-token management |
+| **Home** | Edit landing background, hero slider, intro text, content cards (drag to reorder) |
+| **Tools** | Thumbnail cache management, script runner (build/deploy/maintenance with live output), quick links |
+
+Unsaved album changes prompt before switching albums or closing the tab. CodeMirror is vendored locally (`admin/vendor/`), so the admin works offline.
 
 ### Admin API Endpoints
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/api/albums`, `/api/albums/*path` | Album CRUD |
+| `/api/albums`, `/api/albums/*path` | Album CRUD (PUT merges frontmatter; `null` clears a field) |
+| `/api/album-rename/*path` | Rename/move an album folder |
+| `/api/albums-reorder` | Persist sibling album order (`order` fields) |
 | `/api/photos/*path` | Photo upload/delete |
+| `/api/photo-order/*path` | Save drag-drop photo order (`photoOrder`) |
+| `/api/photo-bulk/delete\|move/*path` | Bulk photo operations |
+| `/api/photo-exif/*path` | EXIF for the admin preview |
 | `/api/videos/*path` | Video upload/delete |
 | `/api/home/intro` | Intro text |
-| `/api/home/cards` | Content cards CRUD |
+| `/api/home/cards` | Content cards CRUD + reorder |
 | `/api/assets/hero`, `/api/assets/cards` | Asset management |
 | `/api/cache/stats`, `/api/cache/thumbnails` | Cache management |
+| `/api/tools/scripts`, `/api/tools/run/:id` | Whitelisted script runner (SSE output, one at a time) |
 
 ### Data Flow
 

@@ -16,6 +16,9 @@ const albums = defineCollection({
     // DEPRECATED: no longer consulted. Access via token requires an explicit shareToken.
     allowAnonymous: z.boolean().default(true),
     sort: z.enum(['date-asc', 'date-desc', 'exif-asc', 'exif-desc', 'name', 'custom']).default('date-desc'),
+    // Explicit photo order (filenames) used when sort is 'custom' — managed by
+    // drag & drop in the admin panel. Unlisted files sort after, by name.
+    photoOrder: z.array(z.string()).optional(),
     style: z.enum(['grid', 'masonry', 'slideshow', 'single-column']).default('single-column'),
     thumbnail: z.string().optional(),
     tags: z.array(z.string()).optional(),

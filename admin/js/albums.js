@@ -7,6 +7,8 @@ const albums = {
   videosLoaded: false,
   cacheLoaded: false,
   isNewAlbum: false,
+  currentPhotoOrder: null,
+  isDirty: false,
 
   async init() {
     await this.loadTree();
@@ -14,6 +16,35 @@ const albums = {
     this.initEditorTabs();
     this.initBodyEditor();
     this.initVideoUpload();
+    this.initDirtyTracking();
+  },
+
+  initDirtyTracking() {
+    const form = document.getElementById('album-form');
+    form.addEventListener('input', () => { this.isDirty = true; });
+    form.addEventListener('change', () => { this.isDirty = true; });
+
+    window.addEventListener('beforeunload', (e) => {
+      if (this.isDirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+  },
+
+  markClean() {
+    this.isDirty = false;
+  },
+
+  async confirmDiscardChanges() {
+    if (!this.isDirty) return true;
+    const confirmed = await modal.confirm(
+      'Unsaved Changes',
+      'You have unsaved changes in this album. Discard them?',
+      'Discard'
+    );
+    if (confirmed) this.markClean();
+    return confirmed;
   },
 
   initEditorTabs() {
@@ -61,7 +92,8 @@ const albums = {
       if (!this.selectedPath) return;
       const confirmed = await modal.confirm(
         'Clear Album Thumbnails',
-        'This will delete all cached thumbnails for this album. Continue?'
+        'This will delete all cached thumbnails for this album. Continue?',
+        'Clear'
       );
       if (confirmed) {
         const btn = document.getElementById('clear-album-cache-btn');
@@ -210,7 +242,7 @@ const albums = {
         // Delete button handler
         item.querySelector('.delete-video').addEventListener('click', async (e) => {
           e.stopPropagation(); // Don't trigger video play
-          const confirmed = await modal.confirm('Delete Video', `Delete "${video.filename}"?`);
+          const confirmed = await modal.confirm('Delete Video', `Delete "${video.filename}"?`, 'Delete');
           if (confirmed) {
             try {
               await api.delete(`/api/videos/${encodeURIComponent(albumPath)}/file/${encodeURIComponent(video.filename)}`);
@@ -311,6 +343,10 @@ const albums = {
         lineWrapping: true,
         lineNumbers: true
       });
+      this.bodyEditor.on('change', (_cm, change) => {
+        // setValue (programmatic populate) must not mark the form dirty
+        if (change.origin !== 'setValue') this.isDirty = true;
+      });
       // Refresh after initialization to ensure proper rendering
       setTimeout(() => this.bodyEditor.refresh(), 100);
     }
@@ -338,11 +374,38 @@ const albums = {
       if (this.selectedPath) {
         const confirmed = await modal.confirm(
           'Delete Album',
-          `Are you sure you want to delete "${this.selectedPath}"? This will also delete all photos in this album.`
+          `Are you sure you want to delete "${this.selectedPath}"? This will also delete all photos in this album.`,
+          'Delete'
         );
         if (confirmed) {
           await this.deleteAlbum(this.selectedPath);
         }
+      }
+    });
+
+    // Rename / move album
+    document.getElementById('rename-album-btn').addEventListener('click', () => {
+      if (!this.selectedPath || this.isNewAlbum) return;
+      document.getElementById('rename-album-path').value = this.selectedPath;
+      modal.show('rename-album-modal');
+    });
+
+    document.getElementById('rename-album-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const newPath = document.getElementById('rename-album-path').value.trim();
+      if (!newPath || newPath === this.selectedPath) {
+        modal.hide('rename-album-modal');
+        return;
+      }
+      try {
+        const result = await api.post(`/api/album-rename/${this.selectedPath}`, { newPath });
+        notifications.success(`Album moved to "${result.path}"`);
+        modal.hide('rename-album-modal');
+        this.markClean();
+        await this.loadTree();
+        await this.selectAlbum(result.path);
+      } catch (error) {
+        notifications.error('Failed to rename album: ' + error.message);
       }
     });
 
@@ -401,6 +464,23 @@ const albums = {
     }
   },
 
+  async reorderSibling(items, index, dir) {
+    const target = index + dir;
+    if (target < 0 || target >= items.length) return;
+    const names = items.map(i => i.name);
+    [names[index], names[target]] = [names[target], names[index]];
+    const parent = items[index].path.split('/').slice(0, -1).join('/');
+    try {
+      const result = await api.post('/api/albums-reorder', { parent, order: names });
+      if (result.skipped && result.skipped.length > 0) {
+        notifications.warning(`Order not saved for folders without settings: ${result.skipped.join(', ')}`);
+      }
+      await this.loadTree();
+    } catch (error) {
+      notifications.error('Failed to reorder albums: ' + error.message);
+    }
+  },
+
   renderTree() {
     const container = document.getElementById('album-tree');
     container.innerHTML = '';
@@ -411,7 +491,7 @@ const albums = {
     }
 
     const renderItems = (items, parent) => {
-      items.forEach(item => {
+      items.forEach((item, itemIndex) => {
         const itemEl = document.createElement('div');
         itemEl.className = 'tree-item';
 
@@ -473,6 +553,29 @@ const albums = {
           rowEl.appendChild(videoCountEl);
         }
 
+        // Reorder arrows (persist sibling order via `order` frontmatter)
+        const reorderEl = document.createElement('span');
+        reorderEl.className = 'tree-reorder';
+        const upBtn = document.createElement('button');
+        upBtn.textContent = '↑';
+        upBtn.title = 'Move up';
+        upBtn.disabled = itemIndex === 0;
+        upBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.reorderSibling(items, itemIndex, -1);
+        });
+        const downBtn = document.createElement('button');
+        downBtn.textContent = '↓';
+        downBtn.title = 'Move down';
+        downBtn.disabled = itemIndex === items.length - 1;
+        downBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.reorderSibling(items, itemIndex, 1);
+        });
+        reorderEl.appendChild(upBtn);
+        reorderEl.appendChild(downBtn);
+        rowEl.appendChild(reorderEl);
+
         // Click to select
         rowEl.addEventListener('click', () => {
           this.selectAlbum(item.path);
@@ -496,6 +599,9 @@ const albums = {
   },
 
   async selectAlbum(path) {
+    if (path !== this.selectedPath && !(await this.confirmDiscardChanges())) {
+      return;
+    }
     this.selectedPath = path;
     this.photosLoaded = false;
     this.videosLoaded = false;
@@ -523,8 +629,10 @@ const albums = {
     try {
       const albumData = await api.get(`/api/albums/${path}`);
       this.currentThumbnail = albumData.thumbnail;
+      this.currentPhotoOrder = albumData.photoOrder || null;
       this.isNewAlbum = !!albumData.isNew;
       this.populateForm(albumData);
+      this.markClean();
 
       document.getElementById('album-editor').classList.remove('hidden');
       document.getElementById('album-placeholder').classList.add('hidden');
@@ -658,6 +766,8 @@ const albums = {
         await api.put(`/api/albums/${this.selectedPath}`, data);
         notifications.success('Album saved successfully');
       }
+
+      this.markClean();
 
       // Reset button text
       document.getElementById('save-album-btn').textContent = 'Save';

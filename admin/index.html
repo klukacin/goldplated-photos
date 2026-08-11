@@ -4,11 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Photo Gallery Admin</title>
-  <!-- CodeMirror -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/monokai.min.css">
+  <!-- CodeMirror (served locally so the admin works offline) -->
+  <script src="vendor/codemirror/codemirror.js"></script>
+  <script src="vendor/codemirror/markdown.js"></script>
+  <link rel="stylesheet" href="vendor/codemirror/codemirror.css">
+  <link rel="stylesheet" href="vendor/codemirror/monokai.css">
   <!-- Admin styles (must be after CodeMirror CSS for overrides to work) -->
   <link rel="stylesheet" href="css/admin.css">
 </head>
@@ -39,6 +39,7 @@
               <h2 id="album-editor-title">Edit Album</h2>
               <div class="editor-actions">
                 <button id="save-album-btn" class="btn btn-primary">Save</button>
+                <button id="rename-album-btn" class="btn">Rename / Move</button>
                 <button id="delete-album-btn" class="btn btn-danger">Delete</button>
               </div>
             </div>
@@ -177,15 +178,24 @@
               <div class="photos-header">
                 <h3>Photos</h3>
                 <div class="photos-actions">
+                  <button id="select-photos-btn" class="btn">Select</button>
                   <label class="btn btn-primary">
                     Upload Photos
                     <input type="file" id="photo-upload" multiple accept="image/*" hidden>
                   </label>
                 </div>
               </div>
+              <div id="bulk-toolbar" class="bulk-toolbar hidden">
+                <span id="bulk-count">0 selected</span>
+                <button id="select-all-btn" class="btn btn-sm">Select All</button>
+                <button id="bulk-cover-btn" class="btn btn-sm" disabled>Set as Cover</button>
+                <button id="bulk-move-btn" class="btn btn-sm" disabled>Move…</button>
+                <button id="bulk-delete-btn" class="btn btn-sm btn-danger" disabled>Delete</button>
+              </div>
               <div id="upload-zone" class="upload-zone">
                 <p>Drag & drop photos here or click Upload</p>
               </div>
+              <p class="reorder-hint">Tip: drag photos to set a custom order — it is saved automatically.</p>
               <div id="photo-grid" class="photo-grid"></div>
             </div>
 
@@ -361,10 +371,13 @@
           </div>
         </div>
 
-        <div class="section-card">
+        <div class="section-card runner-card">
           <h2>Site Actions</h2>
-          <p>Run build commands or open the development server.</p>
-          <div class="button-group">
+          <p>Run maintenance and deployment scripts. Output streams live below.</p>
+          <div id="runner-buttons" class="button-group"></div>
+          <div id="runner-status" class="runner-status"></div>
+          <pre id="runner-output" class="runner-output hidden"></pre>
+          <div class="button-group" style="margin-top: 1rem;">
             <a href="http://localhost:4321" target="_blank" class="btn">Open Dev Site</a>
             <a href="http://localhost:4321/photos" target="_blank" class="btn">Open Gallery</a>
           </div>
@@ -412,6 +425,62 @@
           <button type="button" class="btn modal-cancel">Cancel</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Rename / Move Album Modal -->
+  <div id="rename-album-modal" class="modal hidden">
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h2>Rename / Move Album</h2>
+        <button class="modal-close">&times;</button>
+      </div>
+      <form id="rename-album-form" class="form">
+        <div class="form-group">
+          <label for="rename-album-path">New path *</label>
+          <input type="text" id="rename-album-path" required placeholder="2025/events/new-name">
+          <small>Change the last segment to rename, or the parent folders to move the album. Lowercase is enforced.</small>
+        </div>
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Apply</button>
+          <button type="button" class="btn modal-cancel">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Move Photos Modal -->
+  <div id="move-photos-modal" class="modal hidden">
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h2>Move Photos</h2>
+        <button class="modal-close">&times;</button>
+      </div>
+      <form id="move-photos-form" class="form">
+        <p>Move <strong id="move-count">0</strong> photo(s) to:</p>
+        <div class="form-group">
+          <select id="move-target" required></select>
+        </div>
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Move</button>
+          <button type="button" class="btn modal-cancel">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Photo Preview Modal -->
+  <div id="photo-preview-modal" class="modal hidden">
+    <div class="modal-content modal-preview">
+      <div class="modal-header">
+        <h2 id="preview-title">Photo</h2>
+        <button class="modal-close">&times;</button>
+      </div>
+      <img id="preview-image" class="preview-image" alt="Preview">
+      <div class="preview-info">
+        <span id="preview-meta"></span>
+        <span id="preview-exif" class="preview-exif"></span>
+      </div>
     </div>
   </div>
 

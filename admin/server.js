@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import matter from 'gray-matter';
+import exifr from 'exifr';
+import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join, extname, basename, resolve, sep } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, rmSync } from 'fs';
@@ -258,7 +260,13 @@ function buildAlbumTree(dir = ALBUMS_DIR, relativePath = '') {
     }
   }
 
-  return items.sort((a, b) => a.name.localeCompare(b.name));
+  // Sort like the gallery: explicit `order` first, then alphabetically
+  return items.sort((a, b) => {
+    const orderA = a.meta?.order ?? Infinity;
+    const orderB = b.meta?.order ?? Infinity;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.name.localeCompare(b.name);
+  });
 }
 
 // Helper: Get photos in directory
@@ -959,6 +967,256 @@ app.delete('/api/cache/album/*albumPath', (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+// ============ PHOTO ORDER / BULK / EXIF API ============
+
+// POST /api/photo-order/:albumPath - Save custom photo order (drag & drop)
+app.post('/api/photo-order/*albumPath', (req, res, next) => {
+  try {
+    const albumPath = getPathParam(req.params.albumPath);
+    const { order } = req.body;
+    if (!Array.isArray(order) || !order.every(f => typeof f === 'string')) {
+      return res.status(400).json({ error: 'order must be an array of filenames' });
+    }
+
+    const existing = readAlbumMeta(albumPath);
+    if (!existing) {
+      return res.status(404).json({ error: 'Album not found' });
+    }
+
+    const photoOrder = order.map(f => safeFilename(f));
+    const merged = mergeAlbumMeta(existing, { photoOrder });
+    writeAlbumMeta(albumPath, merged, existing.body || '');
+    res.json({ success: true, photoOrder });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/photo-bulk/delete/:albumPath - Delete multiple photos/videos
+app.post('/api/photo-bulk/delete/*albumPath', (req, res, next) => {
+  try {
+    const albumPath = getPathParam(req.params.albumPath);
+    const albumDir = resolveSafe(ALBUMS_DIR, albumPath);
+    const { filenames } = req.body;
+    if (!Array.isArray(filenames) || filenames.length === 0) {
+      return res.status(400).json({ error: 'filenames must be a non-empty array' });
+    }
+
+    const deleted = [];
+    const missing = [];
+    for (const raw of filenames) {
+      const filename = safeFilename(raw);
+      const filePath = join(albumDir, filename);
+      if (existsSync(filePath)) {
+        unlinkSync(filePath);
+        deleted.push(filename);
+      } else {
+        missing.push(filename);
+      }
+    }
+    res.json({ success: true, deleted, missing });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/photo-bulk/move/:albumPath - Move photos/videos to another album
+app.post('/api/photo-bulk/move/*albumPath', (req, res, next) => {
+  try {
+    const albumPath = getPathParam(req.params.albumPath);
+    const sourceDir = resolveSafe(ALBUMS_DIR, albumPath);
+    const { filenames, target } = req.body;
+    if (!Array.isArray(filenames) || filenames.length === 0) {
+      return res.status(400).json({ error: 'filenames must be a non-empty array' });
+    }
+    if (typeof target !== 'string' || !target.trim()) {
+      return res.status(400).json({ error: 'target album path is required' });
+    }
+    const targetDir = resolveSafe(ALBUMS_DIR, sanitizePath(target.trim()));
+    if (!existsSync(targetDir) || !statSync(targetDir).isDirectory()) {
+      return res.status(404).json({ error: 'Target album not found' });
+    }
+    if (targetDir === sourceDir) {
+      return res.status(400).json({ error: 'Target album is the same as the source' });
+    }
+
+    const moved = [];
+    const renamed = [];
+    const missing = [];
+    for (const raw of filenames) {
+      const filename = safeFilename(raw);
+      const src = join(sourceDir, filename);
+      if (!existsSync(src)) {
+        missing.push(filename);
+        continue;
+      }
+      // Collision handling: never overwrite in the target album
+      let destName = filename;
+      const ext = extname(filename);
+      const stem = basename(filename, ext);
+      let counter = 1;
+      while (existsSync(join(targetDir, destName))) {
+        destName = `${stem}-${counter}${ext}`;
+        counter++;
+      }
+      renameSync(src, join(targetDir, destName));
+      moved.push(destName);
+      if (destName !== filename) renamed.push({ from: filename, to: destName });
+    }
+    res.json({ success: true, moved, renamed, missing });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/photo-exif/:photoPath - EXIF data for the admin preview
+app.get('/api/photo-exif/*photoPath', async (req, res, next) => {
+  try {
+    const photoPath = getPathParam(req.params.photoPath);
+    const filePath = resolveSafe(ALBUMS_DIR, photoPath);
+    if (!existsSync(filePath) || !isImage(filePath)) {
+      return res.status(404).json({ error: 'Photo not found' });
+    }
+    try {
+      const exif = await exifr.parse(filePath, {
+        pick: ['DateTimeOriginal', 'Make', 'Model', 'LensModel', 'FocalLength', 'FNumber', 'ExposureTime', 'ISO']
+      });
+      res.json({ exif: exif || {} });
+    } catch {
+      res.json({ exif: {} });
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============ ALBUM RENAME / REORDER API ============
+
+// POST /api/album-rename/:path - Rename or move an album folder
+app.post('/api/album-rename/*path', (req, res, next) => {
+  try {
+    const albumPath = getPathParam(req.params.path);
+    const src = resolveSafe(ALBUMS_DIR, albumPath);
+    const { newPath } = req.body;
+
+    if (typeof newPath !== 'string' || !newPath.trim()) {
+      return res.status(400).json({ error: 'newPath is required' });
+    }
+    const sanitized = sanitizePath(newPath.trim().replace(/^\/+|\/+$/g, ''));
+    const dest = resolveSafe(ALBUMS_DIR, sanitized);
+
+    if (!existsSync(src)) {
+      return res.status(404).json({ error: 'Album not found' });
+    }
+    if (src === ALBUMS_DIR || dest === ALBUMS_DIR) {
+      return res.status(400).json({ error: 'Invalid path' });
+    }
+    if (existsSync(dest)) {
+      return res.status(409).json({ error: 'An album already exists at that path' });
+    }
+    if ((dest + sep).startsWith(src + sep)) {
+      return res.status(400).json({ error: 'Cannot move an album inside itself' });
+    }
+
+    mkdirSync(dirname(dest), { recursive: true });
+    renameSync(src, dest);
+    res.json({ success: true, path: sanitized });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/albums-reorder - Persist sibling album order (writes `order` fields)
+app.post('/api/albums-reorder', (req, res, next) => {
+  try {
+    const { parent, order } = req.body; // parent: '' for root; order: folder names
+    if (!Array.isArray(order) || !order.every(n => typeof n === 'string')) {
+      return res.status(400).json({ error: 'order must be an array of folder names' });
+    }
+    const parentPath = typeof parent === 'string' ? parent : '';
+    resolveSafe(ALBUMS_DIR, parentPath); // validate
+
+    const skipped = [];
+    order.forEach((name, index) => {
+      const childPath = parentPath ? `${parentPath}/${safeFilename(name)}` : safeFilename(name);
+      const existing = readAlbumMeta(childPath);
+      if (!existing) {
+        skipped.push(name); // bare folder without index.md — nothing to write to
+        return;
+      }
+      const merged = mergeAlbumMeta(existing, { order: index + 1 });
+      writeAlbumMeta(childPath, merged, existing.body || '');
+    });
+    res.json({ success: true, skipped });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============ TOOLS API (script runner) ============
+
+// Fixed whitelist — ids map to commands, nothing user-supplied is executed
+const TOOL_SCRIPTS = {
+  'build': { label: 'Build site', cmd: 'npm', args: ['run', 'build'], confirm: false },
+  'deploy': { label: 'Deploy to production', cmd: 'npm', args: ['run', 'deploy'], confirm: true },
+  'deploy-parallel': { label: 'Deploy (parallel sync)', cmd: 'npm', args: ['run', 'deploy:parallel'], confirm: true },
+  'update-albums': { label: 'Normalize albums (npm run update)', cmd: 'node', args: ['scripts/update-albums.mjs'], confirm: true },
+  'sanitize': { label: 'Sanitize folder names', cmd: 'node', args: ['scripts/sanitize-folders.mjs'], confirm: true },
+  'fix-covers': { label: 'Fix broken cover photos', cmd: 'node', args: ['scripts/fix-broken-cards.mjs'], confirm: false },
+};
+
+let runningTool = null;
+
+// GET /api/tools/scripts - List runnable scripts
+app.get('/api/tools/scripts', (req, res) => {
+  res.json({
+    running: runningTool,
+    scripts: Object.entries(TOOL_SCRIPTS).map(([id, s]) => ({
+      id, label: s.label, confirm: s.confirm
+    }))
+  });
+});
+
+// GET /api/tools/run/:id - Run a whitelisted script, stream output via SSE
+app.get('/api/tools/run/:id', (req, res) => {
+  const id = req.params.id;
+  const tool = TOOL_SCRIPTS[id];
+  if (!tool) {
+    return res.status(404).json({ error: 'Unknown script' });
+  }
+  if (runningTool) {
+    return res.status(409).json({ error: `"${runningTool}" is already running` });
+  }
+  runningTool = id;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+  const send = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  send('start', { id, label: tool.label });
+
+  const child = spawn(tool.cmd, tool.args, { cwd: PROJECT_ROOT, env: process.env });
+  child.stdout.on('data', d => send('output', d.toString()));
+  child.stderr.on('data', d => send('output', d.toString()));
+  child.on('close', (code) => {
+    send('done', { code });
+    runningTool = null;
+    res.end();
+  });
+  child.on('error', (err) => {
+    send('output', `Failed to start: ${err.message}\n`);
+    send('done', { code: -1 });
+    runningTool = null;
+    res.end();
+  });
+  // If the browser disconnects, let the script finish (a deploy must not be
+  // killed mid-flight) — the lock clears when the process exits.
 });
 
 // ============ UTILITY API ============
