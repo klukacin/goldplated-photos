@@ -9,13 +9,15 @@ export default defineConfig({
     mode: 'standalone'
   }),
   server: {
-    port: 4321,
-    strictPort: true
+    port: 4321
   },
   security: {
     checkOrigin: false  // Disable CSRF origin check (safe: we have rate limiting + sameSite cookies)
   },
   vite: {
+    server: {
+      strictPort: true
+    },
     ssr: {
       noExternal: ['exifr', 'photoswipe']
     }

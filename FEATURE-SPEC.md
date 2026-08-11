@@ -1,6 +1,7 @@
 # Feature Specification — Gallery & Admin Improvements
 
-> Status: **draft for review** — defined 2026-08-11 with the project owner.
+> Status: **Phase 1 delivered** (access model R1.x, admin fixes R3.1–R3.5, guardrails R4.x) — defined 2026-08-11 with the project owner.
+> Note: the share-token frontmatter field shipped as `shareToken` alongside the retained internal `token` id (cookie id), exactly per §1.1.
 > This document defines what the application must do after this round of improvements.
 > It is the reference for implementation; each phase below should be checked off against it.
 

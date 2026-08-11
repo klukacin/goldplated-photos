@@ -180,6 +180,10 @@ npm run deploy       # Full deployment to production server
 
 # Maintenance
 npm run update       # Normalize album structure (auto-create index.md)
+
+# Quality
+npm run check        # TypeScript check (astro check) - must pass
+npm test             # Unit tests (vitest) - access control, rate limiting
 ```
 
 ### Recommended Development Setup
@@ -227,20 +231,20 @@ The site has three main sections:
 | AlbumGrid | `src/components/AlbumGrid.astro` | Sub-album grid with cover photo thumbnails |
 | Breadcrumbs | `src/components/Breadcrumbs.astro` | Hierarchical navigation path |
 | SEO | `src/components/SEO.astro` | Open Graph and Twitter Card meta tags for social sharing |
-| PasswordProtection | `src/components/PasswordProtection.astro` | Password entry form (DEPRECATED - now inline in SSR) |
 | Footer | `src/components/Footer.astro` | Site footer with email contact and copyright |
 
 ### API Endpoints
 
 | Endpoint | File | Description |
 |----------|------|-------------|
-| `/api/thumbnail` | `src/pages/api/thumbnail.ts` | Generate/serve cached thumbnails (small/medium/large) |
-| `/api/exif` | `src/pages/api/exif.ts` | Extract EXIF metadata from photos |
-| `/api/video-info` | `src/pages/api/video-info.ts` | Extract video metadata via ffprobe |
-| `/api/check-password` | `src/pages/api/check-password.ts` | Validate album passwords (legacy) |
-| `/api/check-access` | `src/pages/api/check-access.ts` | Check if user has access to album (legacy) |
-| `/api/unlock` | `src/pages/api/unlock.ts` | SSR password verification, sets HttpOnly cookie |
-| `/api/download-album` | `src/pages/api/download-album.ts` | Create ZIP of album photos (requires X-Album-Token header) |
+| `/api/thumbnail` | `src/pages/api/thumbnail.ts` | Generate/serve cached thumbnails (small/medium/large), access-checked |
+| `/api/exif` | `src/pages/api/exif.ts` | Extract EXIF metadata from photos, access-checked |
+| `/api/video-info` | `src/pages/api/video-info.ts` | Extract video metadata via ffprobe, access-checked |
+| `/api/watermark` | `src/pages/api/watermark.ts` | Watermarked JPEG for social sharing, access-checked |
+| `/api/unlock` | `src/pages/api/unlock.ts` | SSR password verification, sets signed HttpOnly cookie |
+| `/api/download-album` | `src/pages/api/download-album.ts` | Create ZIP of album photos (cookie or X-Album-Token share token; checks ancestors) |
+
+**All media routes enforce album access** via `src/lib/access.ts` — originals (`/albums/*`), thumbnails, EXIF, video info, watermark and ZIP download all deny protected content without a valid signed cookie or share token.
 
 ### PhotoGrid Views & States
 
@@ -353,31 +357,38 @@ Albums support 6 sort options via dropdown (persisted to localStorage):
 - Date taken (Oldest / Newest) - **default: oldest first**
 - File size (Smallest / Largest)
 
-### Password Protection Flow (SSR)
+### Access Control (src/lib/access.ts + access-core.ts)
 
-**SECURITY:** Protected albums use Server-Side Rendering (SSR) - image URLs are NOT exposed in page source until access is verified.
+**SECURITY:** Protected albums use Server-Side Rendering (SSR) — image URLs are NOT exposed in page source until access is verified, and every media route re-checks access server-side.
 
-**How it works:**
-1. Album page uses `prerender = false` (SSR, not static)
-2. Server checks `album-access` cookie for unlocked tokens
-3. If NOT authorized: Only password form is rendered (no image URLs in source)
-4. If authorized: Full album content is rendered with image URLs
+**Album access types:**
+| Type | Frontmatter | Behavior |
+|------|-------------|----------|
+| Public | (none) | Freely accessible |
+| Password-protected | `password: "..."` | Password form; unlock sets signed cookie |
+| Link-share | `shareToken: "<random>"` | Reachable ONLY via secret link `?token=<shareToken>` |
+
+An album can have both — the share link then skips the password form.
+
+**Tokens:**
+- `token` (required) — internal album id stored in the access cookie. Grants nothing by itself.
+- `shareToken` (optional) — random secret, generated in the admin panel or via `node scripts/add-share-token.mjs <album-path>`. The ONLY value accepted from `?token=`/`X-Album-Token`.
+- `allowAnonymous` — DEPRECATED, ignored.
+
+**Signed cookie:**
+- `album-access` cookie value is `base64url(json).hmac` signed with `ACCESS_SECRET` from `.env` (min 16 chars). Without it an ephemeral secret is used (sessions reset on restart).
+- Cookie flags: `httpOnly`, `secure` (prod), `sameSite: strict`, 24h expiry. Forged/unsigned cookies are rejected.
 
 **Unlock flow:**
 1. User submits password via form POST to `/api/unlock`
-2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min)
-3. On success: Sets HttpOnly cookie with album token, redirects to album
-4. Cookie flags: `httpOnly`, `secure` (prod), `sameSite: strict`, 24h expiry
+2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min per real client IP — X-Forwarded-For aware behind the proxy)
+3. On success: unlocks the album + cascades to password-less descendants, sets signed cookie, redirects
 
 **Access inheritance:**
-- Parent album access grants access to child albums without passwords
-- Tokens can be passed via `?token=` query parameter (share links)
+- A locked ancestor blocks descendants until unlocked; an unlocked album grants its descendants
+- Share tokens of ancestors also grant descendants
 
-**Security features:**
-- Path traversal protection on all API endpoints
-- Rate limiting prevents brute force attacks
-- Timing-safe password comparison prevents timing attacks
-- HttpOnly cookies prevent XSS token theft
+**Single implementation:** `resolveAlbumAccess()` / `resolveFileAccess()` are used by the album page AND all media routes (`/albums/*`, thumbnail, exif, video-info, watermark, download-album). Never add a media route without calling them. Pure logic lives in `access-core.ts` (unit-tested in `tests/`).
 
 Passwords are plaintext strings in frontmatter (simple protection, not cryptographically secure).
 
@@ -686,26 +697,32 @@ sshpass -p 'PASSWORD' rsync -avz --progress \
 - `src/components/PhotoGrid.astro` - Photo display, lightbox, EXIF, keyboard nav, sorting
 - `src/components/AlbumGrid.astro` - Sub-album grid with cover photos
 - `src/components/SEO.astro` - Open Graph and Twitter Card meta tags for social sharing
-- `src/components/PasswordProtection.astro` - Password entry form
 - `src/components/Breadcrumbs.astro` - Hierarchical navigation
 - `src/components/Footer.astro` - Site footer with email contact and copyright
 - `src/layouts/Layout.astro` - Base layout wrapper
 
 **API Routes:**
-- `src/pages/albums/[...path].ts` - Serve original images
-- `src/pages/api/thumbnail.ts` - Generate/serve cached thumbnails
-- `src/pages/api/exif.ts` - Extract EXIF metadata
-- `src/pages/api/unlock.ts` - SSR password verification (sets HttpOnly cookie)
-- `src/pages/api/check-password.ts` - Validate album passwords (legacy)
-- `src/pages/api/download-album.ts` - Create ZIP of album photos
+- `src/pages/albums/[...path].ts` - Serve original images (access-checked)
+- `src/pages/api/thumbnail.ts` - Generate/serve cached thumbnails (access-checked)
+- `src/pages/api/exif.ts` - Extract EXIF metadata (access-checked)
+- `src/pages/api/video-info.ts` - Video metadata via ffprobe (access-checked)
+- `src/pages/api/watermark.ts` - Watermarked share image (access-checked)
+- `src/pages/api/unlock.ts` - SSR password verification (sets signed HttpOnly cookie)
+- `src/pages/api/download-album.ts` - Create ZIP of album photos (access-checked incl. ancestors)
 
 **Configuration:**
 - `src/config.ts` - Centralized site configuration (URL, name, social defaults)
-- `.env.example` - Environment variables template for deployment
+- `.env.example` - Environment variables template (SITE_URL, ACCESS_SECRET, deploy settings)
 
 **Utilities:**
-- `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos, password checking
+- `src/lib/access-core.ts` - Pure access-control logic (signed cookie, share tokens, chain resolution) — unit-tested
+- `src/lib/access.ts` - Astro glue: resolveAlbumAccess/resolveFileAccess/setAccessCookie
+- `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos
 - `src/lib/rate-limit.ts` - In-memory rate limiting (10 attempts / 15 minutes per IP)
+
+**Tests & CI:**
+- `tests/*.test.ts` - Vitest unit tests (access control, rate limiting)
+- `.github/workflows/ci.yml` - CI: astro check → vitest → syntax checks → build
 
 **Static Assets:**
 - `public/images/landing-bg.jpg` - Landing page background
@@ -722,8 +739,9 @@ sshpass -p 'PASSWORD' rsync -avz --progress \
 - `scripts/deploy.sh` - Production deployment script
 - `scripts/start-dev.sh` / `stop-dev.sh` - Dev server background control
 - `scripts/start-admin.sh` / `stop-admin.sh` - Admin server background control
-- `scripts/update-albums.mjs` - Album structure normalization
-- `scripts/fix-server-paths.mjs` - Production path fixer
+- `scripts/update-albums.mjs` - Album structure normalization (keeps admin-authored body.md)
+- `scripts/fix-server-paths.mjs` - Production path fixer (reads DEPLOY_REMOTE_ROOT from env)
+- `scripts/add-share-token.mjs` - Generate/remove/list album share tokens (secret links)
 
 ## Important Patterns
 

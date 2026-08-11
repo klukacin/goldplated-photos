@@ -50,6 +50,7 @@ export const POST: APIRoute = async ({ request, cookies }) => {
 
     // Extract EXIF data
     try {
+      // Cast: exifr's TS Options type is missing several documented keys (ifd0 etc.)
       const exifData = await exifr.parse(fullPath, {
         tiff: true,
         exif: true,
@@ -59,7 +60,7 @@ export const POST: APIRoute = async ({ request, cookies }) => {
         xmp: true,  // For Rating
         ifd1: false,
         interop: false,
-      });
+      } as unknown as Parameters<typeof exifr.parse>[1]);
 
       return new Response(JSON.stringify({ exif: exifData || {} }), {
         status: 200,

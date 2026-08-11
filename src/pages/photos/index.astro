@@ -360,7 +360,7 @@ if (publicAlbumsWithCovers.length > 0 && publicAlbumsWithCovers[0].coverPhotoUrl
           applyFilter(filter);
 
           // Save preference
-          localStorage.setItem('photoGallery_viewFilter', filter);
+          if (filter) localStorage.setItem('photoGallery_viewFilter', filter);
         });
       });
     }

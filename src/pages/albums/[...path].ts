@@ -49,7 +49,7 @@ export const GET: APIRoute = async ({ params, url, cookies }) => {
     const mimeType = lookup(ext) || 'application/octet-stream';
 
     // Return the image (private: browser may cache, shared caches must not)
-    return new Response(fileBuffer, {
+    return new Response(new Uint8Array(fileBuffer), {
       status: 200,
       headers: {
         'Content-Type': mimeType,

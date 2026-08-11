@@ -98,7 +98,7 @@ export const POST: APIRoute = async ({ request, cookies }) => {
 
     const albumName = albumPath.split('/').pop() || 'album';
 
-    return new Response(zipBuffer, {
+    return new Response(new Uint8Array(zipBuffer), {
       status: 200,
       headers: {
         'Content-Type': 'application/zip',

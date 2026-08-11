@@ -990,6 +990,7 @@ if (!hasAccess) {
         });
 
         function sortPhotos(sortBy: string) {
+          if (!photoGallery) return;
           const photoItems = Array.from(photoGallery.querySelectorAll('.photo-item'));
 
           if (photoItems.length === 0) {
@@ -1059,6 +1060,7 @@ if (!hasAccess) {
         });
 
         function applyDisplayStyle(style: string) {
+          if (!photoGallery) return;
           // Remove all style classes
           photoGallery.classList.remove('photo-grid-grid', 'photo-grid-masonry', 'photo-grid-slideshow', 'photo-grid-single-column');
           // Add the new style class
@@ -1201,6 +1203,7 @@ if (!hasAccess) {
       });
 
       function sortAlbums(sortBy: string) {
+        if (!albumGrid) return;
         const cards = Array.from(albumGrid.querySelectorAll('.album-card')) as HTMLElement[];
 
         cards.sort((a, b) => {
@@ -1233,7 +1236,7 @@ if (!hasAccess) {
           }
         });
 
-        cards.forEach(card => albumGrid.appendChild(card));
+        cards.forEach(card => albumGrid!.appendChild(card));
       }
     }
 

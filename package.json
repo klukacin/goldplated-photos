@@ -30,6 +30,9 @@
     "dev:bg": "./scripts/start-dev.sh",
     "stop:dev": "./scripts/stop-dev.sh",
     "build": "astro build",
+    "check": "astro check",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "preview": "astro preview",
     "deploy": "./scripts/deploy.sh",
     "deploy:parallel": "./scripts/deploy.sh --parallel",
@@ -61,6 +64,9 @@
     "sharp": "^0.34.5"
   },
   "devDependencies": {
-    "@types/fluent-ffmpeg": "^2.1.28"
+    "@astrojs/check": "^0.9.10",
+    "@types/fluent-ffmpeg": "^2.1.28",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

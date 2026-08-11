@@ -65,7 +65,7 @@ export const GET: APIRoute = async ({ request, cookies }) => {
       await fs.access(cachePath);
 
       const cachedBuffer = await fs.readFile(cachePath);
-      return new Response(cachedBuffer, {
+      return new Response(new Uint8Array(cachedBuffer), {
         status: 200,
         headers: {
           'Content-Type': 'image/jpeg',
@@ -100,7 +100,7 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     await fs.writeFile(cachePath, thumbnail);
 
     // Return thumbnail
-    return new Response(thumbnail, {
+    return new Response(new Uint8Array(thumbnail), {
       status: 200,
       headers: {
         'Content-Type': 'image/jpeg',
@@ -117,7 +117,7 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     try {
       const original = await fs.readFile(sourcePath);
       const mimeType = lookup(path.extname(sourcePath).toLowerCase()) || 'application/octet-stream';
-      return new Response(original, {
+      return new Response(new Uint8Array(original), {
         status: 200,
         headers: {
           'Content-Type': mimeType,

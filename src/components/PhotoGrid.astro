@@ -1581,16 +1581,18 @@ function getVideoMimeType(filename: string): string {
   // Handle keyboard shortcuts in lightbox
   lightbox.on('uiRegister', function() {
     const pswp = lightbox.pswp;
+    if (!pswp || !pswp.element) return;
+    const pswpElement = pswp.element;
 
     // Prevent duplicate UI creation
-    if (pswp.element?.querySelector('.pswp-custom-ui')) {
+    if (pswpElement.querySelector('.pswp-custom-ui')) {
       return;
     }
 
     // Move EXIF overlay into PhotoSwipe container for fullscreen compatibility
     const exifOverlay = document.getElementById('exif-overlay');
-    if (exifOverlay && pswp.element && !pswp.element.contains(exifOverlay)) {
-      pswp.element.appendChild(exifOverlay);
+    if (exifOverlay && !pswpElement.contains(exifOverlay)) {
+      pswpElement.appendChild(exifOverlay);
     }
 
     // === Custom Lightbox UI ===
@@ -1624,7 +1626,7 @@ function getVideoMimeType(filename: string): string {
         <span class="pswp-btn pswp-btn-close" title="Close (Esc)">×</span>
       </div>
     `;
-    pswp.element.appendChild(customUI);
+    pswpElement.appendChild(customUI);
 
     // Create shortcuts help overlay
     const shortcutsOverlay = document.createElement('div');
@@ -1645,7 +1647,7 @@ function getVideoMimeType(filename: string): string {
         <p class="pswp-shortcuts-hint">Press ? or click outside to close</p>
       </div>
     `;
-    pswp.element.appendChild(shortcutsOverlay);
+    pswpElement.appendChild(shortcutsOverlay);
 
     // Get UI elements
     const counterText = customUI.querySelector('.pswp-counter-text') as HTMLElement;
@@ -1713,23 +1715,20 @@ function getVideoMimeType(filename: string): string {
 
     // Toggle original mode
     function toggleOriginalMode() {
+      if (!pswp || !pswp.currSlide) return;
       isOriginalMode = !isOriginalMode;
 
-      if (isOriginalMode) {
-        // Load original image for current slide
-        const photoUrl = pswp.currSlide?.data?.element?.getAttribute('data-photo-url');
-        if (photoUrl) {
+      const photoUrl = pswp.currSlide.data?.element?.getAttribute('data-photo-url');
+      if (photoUrl) {
+        if (isOriginalMode) {
+          // Load original image for current slide
           pswp.currSlide.data.src = photoUrl;
-          pswp.refreshSlideContent(pswp.currIndex);
-        }
-      } else {
-        // Revert to thumbnail
-        const photoUrl = pswp.currSlide?.data?.element?.getAttribute('data-photo-url');
-        if (photoUrl) {
+        } else {
+          // Revert to thumbnail
           const path = photoUrl.replace('/albums/', '');
           pswp.currSlide.data.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=2`;
-          pswp.refreshSlideContent(pswp.currIndex);
         }
+        pswp.refreshSlideContent(pswp.currIndex);
       }
 
       updateCustomUI();
@@ -1744,7 +1743,7 @@ function getVideoMimeType(filename: string): string {
     // Toggle zen mode
     function toggleZenMode() {
       isZenMode = !isZenMode;
-      pswp.element.classList.toggle('pswp--zen', isZenMode);
+      pswpElement.classList.toggle('pswp--zen', isZenMode);
     }
 
     // Button click handlers
@@ -1840,21 +1839,23 @@ function getVideoMimeType(filename: string): string {
       // Handle 'f' or 'F' key to toggle fullscreen
       if (event.key === 'f' || event.key === 'F') {
         event.preventDefault();
-        const pswpElement = pswp.element;
+        // Safari-prefixed fullscreen APIs are not in the DOM typings
+        const fullscreenEl = pswpElement as HTMLElement & { webkitRequestFullscreen?: () => void };
+        const fullscreenDoc = document as Document & { webkitExitFullscreen?: () => void };
 
         if (!document.fullscreenElement) {
           // Enter fullscreen
-          if (pswpElement.requestFullscreen) {
-            pswpElement.requestFullscreen();
-          } else if (pswpElement.webkitRequestFullscreen) {
-            pswpElement.webkitRequestFullscreen();
+          if (fullscreenEl.requestFullscreen) {
+            fullscreenEl.requestFullscreen();
+          } else if (fullscreenEl.webkitRequestFullscreen) {
+            fullscreenEl.webkitRequestFullscreen();
           }
         } else {
           // Exit fullscreen
-          if (document.exitFullscreen) {
-            document.exitFullscreen();
-          } else if (document.webkitExitFullscreen) {
-            document.webkitExitFullscreen();
+          if (fullscreenDoc.exitFullscreen) {
+            fullscreenDoc.exitFullscreen();
+          } else if (fullscreenDoc.webkitExitFullscreen) {
+            fullscreenDoc.webkitExitFullscreen();
           }
         }
       }
@@ -1868,12 +1869,12 @@ function getVideoMimeType(filename: string): string {
     let touchStartX = 0;
     const SWIPE_THRESHOLD = 50; // Minimum distance for swipe detection
 
-    pswp.element.addEventListener('touchstart', (event) => {
+    pswpElement.addEventListener('touchstart', (event) => {
       touchStartY = event.touches[0].clientY;
       touchStartX = event.touches[0].clientX;
     }, { passive: true });
 
-    pswp.element.addEventListener('touchend', (event) => {
+    pswpElement.addEventListener('touchend', (event) => {
       const touchEndY = event.changedTouches[0].clientY;
       const touchEndX = event.changedTouches[0].clientX;
 

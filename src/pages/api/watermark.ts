@@ -117,7 +117,7 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     const nameWithoutExt = originalFilename.replace(/\.[^.]+$/, '');
     const downloadFilename = `${nameWithoutExt}-share.jpg`;
 
-    return new Response(watermarked, {
+    return new Response(new Uint8Array(watermarked), {
       status: 200,
       headers: {
         'Content-Type': 'image/jpeg',
