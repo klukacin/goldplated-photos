@@ -255,6 +255,7 @@ function buildAlbumTree(dir = ALBUMS_DIR, relativePath = '') {
         children,
         photoCount: photos.length + childPhotoCount,
         videoCount: videos.length + childVideoCount,
+        proofingCount: countProofingSubmissions(fullPath),
         isCollection: meta?.isCollection || children.length > 0
       });
     }
@@ -1150,6 +1151,65 @@ app.post('/api/albums-reorder', (req, res, next) => {
       writeAlbumMeta(childPath, merged, existing.body || '');
     });
     res.json({ success: true, skipped });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============ PROOFING API ============
+
+// Helper: proofing submissions directory for an album
+function proofingDir(albumPath) {
+  return join(resolveSafe(ALBUMS_DIR, albumPath), '.meta', 'proofing');
+}
+
+// Helper: count proofing submissions (for tree badges)
+function countProofingSubmissions(fullPath) {
+  const dir = join(fullPath, '.meta', 'proofing');
+  if (!existsSync(dir)) return 0;
+  return readdirSync(dir).filter(f => f.endsWith('.json')).length;
+}
+
+// GET /api/proofing/:albumPath - List proofing submissions (newest first)
+app.get('/api/proofing/*albumPath', (req, res, next) => {
+  try {
+    const albumPath = getPathParam(req.params.albumPath);
+    const dir = proofingDir(albumPath);
+    if (!existsSync(dir)) return res.json([]);
+
+    const submissions = readdirSync(dir)
+      .filter(f => f.endsWith('.json'))
+      .sort()
+      .reverse()
+      .map(f => {
+        try {
+          const data = JSON.parse(readFileSync(join(dir, f), 'utf-8'));
+          return { id: f, ...data };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    res.json(submissions);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// DELETE /api/proofing/:albumPath/file/:id - Delete one submission
+app.delete('/api/proofing/:albumPath/file/:id', (req, res, next) => {
+  try {
+    const id = safeFilename(req.params.id);
+    if (!id.endsWith('.json')) {
+      return res.status(400).json({ error: 'Invalid submission id' });
+    }
+    const filePath = join(proofingDir(req.params.albumPath), id);
+    if (!existsSync(filePath)) {
+      return res.status(404).json({ error: 'Submission not found' });
+    }
+    unlinkSync(filePath);
+    res.json({ success: true });
   } catch (error) {
     next(error);
   }

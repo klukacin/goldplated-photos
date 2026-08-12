@@ -26,6 +26,7 @@ const albums = defineCollection({
     order: z.number().optional(), // Lower numbers appear first in album listings
     hidden: z.boolean().default(false), // Hide from album listings (accessible via direct link)
     allowDownload: z.boolean().default(false), // Enable Download Album button
+    proofing: z.boolean().default(false), // Enable client proofing (select + comment + submit)
   }),
 });
 

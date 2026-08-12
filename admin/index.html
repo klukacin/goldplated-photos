@@ -49,6 +49,7 @@
               <button class="editor-tab active" data-editor-tab="settings">Settings</button>
               <button class="editor-tab" data-editor-tab="photos">Photos <span id="photo-count-badge" class="badge">0</span></button>
               <button class="editor-tab" data-editor-tab="videos">Videos <span id="video-count-badge" class="badge">0</span></button>
+              <button class="editor-tab" data-editor-tab="proofing">Proofing <span id="proofing-count-badge" class="badge">0</span></button>
               <button class="editor-tab" data-editor-tab="cache">Cache</button>
             </div>
 
@@ -161,6 +162,10 @@
                   <input type="checkbox" id="album-allowDownload" name="allowDownload">
                   <span>Allow Download (enable Download Album button)</span>
                 </label>
+                <label class="checkbox">
+                  <input type="checkbox" id="album-proofing" name="proofing">
+                  <span>Client Proofing (visitors can select photos, comment and send you their picks)</span>
+                </label>
               </div>
 
               <div class="form-group">
@@ -214,6 +219,15 @@
                 <p>Drag & drop videos here or click Upload</p>
               </div>
               <div id="video-grid" class="video-grid"></div>
+            </div>
+
+            <!-- Proofing Tab -->
+            <div id="proofing-panel" class="editor-tab-content">
+              <div class="photos-header">
+                <h3>Client Selections</h3>
+                <button id="refresh-proofing-btn" class="btn btn-sm">Refresh</button>
+              </div>
+              <div id="proofing-submissions" class="proofing-submissions"></div>
             </div>
 
             <!-- Cache Tab -->

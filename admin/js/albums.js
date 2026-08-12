@@ -6,6 +6,7 @@ const albums = {
   photosLoaded: false,
   videosLoaded: false,
   cacheLoaded: false,
+  proofingLoaded: false,
   isNewAlbum: false,
   currentPhotoOrder: null,
   isDirty: false,
@@ -80,7 +81,18 @@ const albums = {
           this.loadAlbumCacheStats();
           this.cacheLoaded = true;
         }
+
+        // Lazy load proofing submissions when Proofing tab is clicked
+        if (tabName === 'proofing' && !this.proofingLoaded && this.selectedPath) {
+          this.loadProofing(this.selectedPath);
+          this.proofingLoaded = true;
+        }
       });
+    });
+
+    // Proofing refresh button
+    document.getElementById('refresh-proofing-btn').addEventListener('click', () => {
+      if (this.selectedPath) this.loadProofing(this.selectedPath);
     });
 
     // Album cache buttons
@@ -109,6 +121,129 @@ const albums = {
         }
       }
     });
+  },
+
+  async loadProofing(albumPath) {
+    const container = document.getElementById('proofing-submissions');
+    container.innerHTML = '<p class="loading">Loading submissions...</p>';
+
+    try {
+      const submissions = await api.get(`/api/proofing/${albumPath}`);
+
+      if (submissions.length === 0) {
+        container.innerHTML = '<p class="empty-message">No client selections yet. Enable "Client Proofing" in Settings and share the album — selections will appear here.</p>';
+        return;
+      }
+
+      container.innerHTML = '';
+      submissions.forEach(sub => {
+        const card = document.createElement('div');
+        card.className = 'proofing-card';
+
+        const header = document.createElement('div');
+        header.className = 'proofing-card-header';
+
+        const title = document.createElement('div');
+        title.className = 'proofing-card-title';
+        const when = new Date(sub.submittedAt).toLocaleString();
+        title.textContent = `${sub.name || 'Anonymous'} — ${sub.selections.length} photo(s) — ${when}`;
+        header.appendChild(title);
+
+        const actions = document.createElement('div');
+        actions.className = 'proofing-card-actions';
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'btn btn-sm';
+        copyBtn.textContent = 'Copy list';
+        copyBtn.addEventListener('click', async () => {
+          const list = sub.selections.map(s => s.filename).join('\n');
+          try {
+            await navigator.clipboard.writeText(list);
+            notifications.success('Filename list copied');
+          } catch {
+            notifications.error('Could not copy to clipboard');
+          }
+        });
+        actions.appendChild(copyBtn);
+
+        const csvBtn = document.createElement('button');
+        csvBtn.className = 'btn btn-sm';
+        csvBtn.textContent = 'CSV';
+        csvBtn.addEventListener('click', () => {
+          const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+          const rows = [
+            ['filename', 'comment', 'client', 'submittedAt'].join(','),
+            ...sub.selections.map(s => [esc(s.filename), esc(s.comment), esc(sub.name), esc(sub.submittedAt)].join(','))
+          ];
+          const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `proofing-${albumPath.replace(/\//g, '_')}-${sub.id.replace(/\.json$/, '')}.csv`;
+          a.click();
+          URL.revokeObjectURL(a.href);
+        });
+        actions.appendChild(csvBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'btn btn-sm btn-danger';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.addEventListener('click', async () => {
+          const confirmed = await modal.confirm(
+            'Delete Submission',
+            `Delete the selection from ${sub.name || 'Anonymous'} (${sub.selections.length} photos)?`,
+            'Delete'
+          );
+          if (confirmed) {
+            try {
+              await api.delete(`/api/proofing/${encodeURIComponent(albumPath)}/file/${encodeURIComponent(sub.id)}`);
+              notifications.success('Submission deleted');
+              await this.loadProofing(albumPath);
+              await this.loadTree();
+            } catch (error) {
+              notifications.error('Failed to delete submission: ' + error.message);
+            }
+          }
+        });
+        actions.appendChild(deleteBtn);
+
+        header.appendChild(actions);
+        card.appendChild(header);
+
+        const grid = document.createElement('div');
+        grid.className = 'proofing-thumbs';
+        sub.selections.forEach(sel => {
+          const cell = document.createElement('div');
+          cell.className = 'proofing-thumb';
+
+          const img = document.createElement('img');
+          img.src = `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(albumPath + '/' + sel.filename)}&size=small`;
+          img.alt = sel.filename;
+          img.loading = 'lazy';
+          img.onerror = () => { img.src = getAlbumImageUrl(albumPath, sel.filename); };
+          cell.appendChild(img);
+
+          const label = document.createElement('div');
+          label.className = 'proofing-thumb-label';
+          label.textContent = sel.filename;
+          cell.appendChild(label);
+
+          if (sel.comment) {
+            const comment = document.createElement('div');
+            comment.className = 'proofing-thumb-comment';
+            comment.textContent = sel.comment;
+            comment.title = sel.comment;
+            cell.appendChild(comment);
+          }
+
+          grid.appendChild(cell);
+        });
+        card.appendChild(grid);
+
+        container.appendChild(card);
+      });
+    } catch (error) {
+      container.innerHTML = `<p class="error-message">Failed to load submissions: ${error.message}</p>`;
+    }
   },
 
   async loadAlbumCacheStats() {
@@ -553,6 +688,15 @@ const albums = {
           rowEl.appendChild(videoCountEl);
         }
 
+        // Proofing submissions badge
+        if (item.proofingCount > 0) {
+          const proofingEl = document.createElement('span');
+          proofingEl.className = 'tree-count tree-proofing-count';
+          proofingEl.textContent = `♥${item.proofingCount}`;
+          proofingEl.title = `${item.proofingCount} client selection${item.proofingCount > 1 ? 's' : ''}`;
+          rowEl.appendChild(proofingEl);
+        }
+
         // Reorder arrows (persist sibling order via `order` frontmatter)
         const reorderEl = document.createElement('span');
         reorderEl.className = 'tree-reorder';
@@ -606,6 +750,7 @@ const albums = {
     this.photosLoaded = false;
     this.videosLoaded = false;
     this.cacheLoaded = false;
+    this.proofingLoaded = false;
 
     // Update selection without re-rendering (preserves expand/collapse state)
     document.querySelectorAll('#album-tree .tree-row').forEach(row => {
@@ -653,12 +798,13 @@ const albums = {
         saveBtn.textContent = 'Save';
       }
 
-      // Update photo and video count badges (from tree data)
+      // Update photo, video and proofing count badges (from tree data)
       const albumInTree = this.findAlbumInTree(path);
       const photoCount = albumInTree?.photoCount || 0;
       const videoCount = albumInTree?.videoCount || 0;
       document.getElementById('photo-count-badge').textContent = photoCount;
       document.getElementById('video-count-badge').textContent = videoCount;
+      document.getElementById('proofing-count-badge').textContent = albumInTree?.proofingCount || 0;
 
     } catch (error) {
       notifications.error('Failed to load album: ' + error.message);
@@ -691,6 +837,7 @@ const albums = {
     document.getElementById('album-order').value = data.order || '';
     document.getElementById('album-hidden').checked = data.hidden || false;
     document.getElementById('album-allowDownload').checked = data.allowDownload || false;
+    document.getElementById('album-proofing').checked = data.proofing || false;
 
     // Set body content
     if (this.bodyEditor) {
@@ -737,6 +884,7 @@ const albums = {
       isCollection: form.querySelector('#album-isCollection').checked,
       hidden: form.querySelector('#album-hidden').checked,
       allowDownload: form.querySelector('#album-allowDownload').checked,
+      proofing: form.querySelector('#album-proofing').checked,
       order: orderValue !== '' ? parseInt(orderValue) : null,
       date: dateValue ? parseDate(dateValue) : null,
       tags: tagsValue ? tagsValue.split(',').map(t => t.trim()).filter(t => t) : null,

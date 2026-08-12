@@ -242,7 +242,8 @@ The site has three main sections:
 | `/api/video-info` | `src/pages/api/video-info.ts` | Extract video metadata via ffprobe, access-checked |
 | `/api/watermark` | `src/pages/api/watermark.ts` | Watermarked JPEG for social sharing, access-checked |
 | `/api/unlock` | `src/pages/api/unlock.ts` | SSR password verification, sets signed HttpOnly cookie |
-| `/api/download-album` | `src/pages/api/download-album.ts` | Create ZIP of album photos (cookie or X-Album-Token share token; checks ancestors) |
+| `/api/download-album` | `src/pages/api/download-album.ts` | Streamed ZIP of album photos (cookie or X-Album-Token; checks ancestors; requires `allowDownload`) |
+| `/api/proofing` | `src/pages/api/proofing.ts` | Store a client proofing submission (requires `proofing: true` + album access; rate-limited; validated against the album's photo list; saved to `.meta/proofing/`) |
 
 **All media routes enforce album access** via `src/lib/access.ts` — originals (`/albums/*`), thumbnails, EXIF, video info, watermark and ZIP download all deny protected content without a valid signed cookie or share token.
 
@@ -352,10 +353,15 @@ Albums display cover photos in the grid using this priority:
 
 ### Photo Sorting
 
-Albums support 6 sort options via dropdown (persisted to localStorage):
+Albums support sort options via dropdown (persisted to localStorage):
+- Album Order (custom — the admin's drag-drop `photoOrder`, applied server-side when `sort: custom`)
 - Name (A-Z / Z-A)
-- Date taken (Oldest / Newest) - **default: oldest first**
+- Date taken / EXIF date (Oldest / Newest)
 - File size (Smallest / Largest)
+
+### Client Proofing
+
+Enable per album with `proofing: true` (checkbox in admin Settings). Visitors get a heart on every photo (grid + lightbox, `L` key), selections persist in localStorage per album, and a bottom bar opens a review panel (per-photo comments + optional name) that POSTs to `/api/proofing`. Submissions are JSON files in `<album>/.meta/proofing/`, browsable in the admin's Proofing tab (thumbnails, comments, copy-list, CSV export, delete) with a ♥ badge in the album tree.
 
 ### Access Control (src/lib/access.ts + access-core.ts)
 

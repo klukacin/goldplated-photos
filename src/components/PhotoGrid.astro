@@ -9,9 +9,10 @@ interface Props {
   albumToken?: string;
   isProtected?: boolean;
   hasAccess?: boolean;
+  proofing?: boolean;
 }
 
-const { photos, style, albumPath, albumToken = '', isProtected = false, hasAccess = true } = Astro.props;
+const { photos, style, albumPath, albumToken = '', isProtected = false, hasAccess = true, proofing = false } = Astro.props;
 
 // Get site URL for share links
 const siteUrl = siteConfig.url;
@@ -126,6 +127,13 @@ function getVideoMimeType(filename: string): string {
             />
           </div>
         </a>
+      )}
+      {proofing && !photo.isVideo && (
+        <button class="proof-heart" data-filename={photo.filename} aria-pressed="false" title="Select this photo" aria-label="Select this photo">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+          </svg>
+        </button>
       )}
       <div class="photo-icons">
         <button class="icon-btn icon-share" data-photo-filename={photo.filename} title="Share" aria-label="Share">
@@ -273,6 +281,32 @@ function getVideoMimeType(filename: string): string {
     </div>
   </div>
 </div>
+
+{proofing && (
+  <>
+    <!-- Proofing bar (appears when at least one photo is selected) -->
+    <div id="proofing-bar" class="proofing-bar" data-album-path={albumPath} data-album-token={albumToken} hidden>
+      <span id="proofing-count" aria-live="polite">0 selected</span>
+      <button id="proofing-review-btn" class="proofing-btn proofing-btn-primary" type="button">Review &amp; Send</button>
+      <button id="proofing-clear-btn" class="proofing-btn" type="button">Clear</button>
+    </div>
+
+    <!-- Proofing review modal -->
+    <div id="proofing-modal" class="proofing-modal-overlay">
+      <div class="proofing-modal" role="dialog" aria-modal="true" aria-labelledby="proofing-modal-title">
+        <div class="proofing-modal-header">
+          <h3 id="proofing-modal-title">Your selection</h3>
+          <button class="proofing-modal-close" aria-label="Close" type="button">&times;</button>
+        </div>
+        <div id="proofing-list" class="proofing-list"></div>
+        <div class="proofing-modal-footer">
+          <input id="proofing-name" type="text" maxlength="100" placeholder="Your name (optional)" autocomplete="name" />
+          <button id="proofing-send-btn" class="proofing-btn proofing-btn-primary" type="button">Send selection</button>
+        </div>
+      </div>
+    </div>
+  </>
+)}
 
 <style>
   .photo-grid {
@@ -1140,6 +1174,193 @@ function getVideoMimeType(filename: string): string {
       transition: none;
     }
   }
+  /* ============ Client proofing ============ */
+  .proof-heart {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    z-index: 11;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.92);
+    color: #444;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    transition: transform 0.15s, color 0.15s;
+  }
+  .proof-heart:hover { transform: scale(1.1); }
+  .proof-heart.selected {
+    color: #e0245e;
+    background: #fff;
+  }
+  .proof-heart.selected svg { fill: #e0245e; stroke: #e0245e; }
+
+  .proofing-bar {
+    position: fixed;
+    left: 50%;
+    bottom: 1.25rem;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background: #111;
+    color: #fff;
+    padding: 0.6rem 1rem;
+    border-radius: 999px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    z-index: 900;
+    font-size: 0.9rem;
+  }
+  .proofing-bar[hidden] { display: none; }
+
+  .proofing-btn {
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    background: transparent;
+    color: #fff;
+    border-radius: 999px;
+    padding: 0.35rem 0.9rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .proofing-btn:hover { background: rgba(255, 255, 255, 0.12); }
+  .proofing-btn-primary {
+    background: #fff;
+    color: #111;
+    border-color: #fff;
+    font-weight: 600;
+  }
+  .proofing-btn-primary:hover { background: #e8e8e8; }
+  .proofing-btn:disabled { opacity: 0.5; cursor: default; }
+
+  .proofing-modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+  }
+  .proofing-modal-overlay.active { display: flex; }
+
+  .proofing-modal {
+    background: #fff;
+    border-radius: 12px;
+    width: min(640px, 100%);
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .proofing-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid #eee;
+  }
+  .proofing-modal-header h3 { margin: 0; font-size: 1.1rem; }
+  .proofing-modal-close {
+    border: none;
+    background: none;
+    font-size: 1.5rem;
+    line-height: 1;
+    cursor: pointer;
+    color: #666;
+  }
+
+  .proofing-list {
+    overflow-y: auto;
+    padding: 0.75rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    flex: 1;
+  }
+  .proofing-item {
+    display: grid;
+    grid-template-columns: 72px 1fr auto;
+    gap: 0.75rem;
+    align-items: start;
+  }
+  .proofing-item img {
+    width: 72px;
+    height: 72px;
+    object-fit: cover;
+    border-radius: 6px;
+  }
+  .proofing-item-fields { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+  .proofing-item-name {
+    font-size: 0.8rem;
+    color: #555;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .proofing-item textarea {
+    width: 100%;
+    min-height: 2.2rem;
+    resize: vertical;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 0.35rem 0.5rem;
+    font: inherit;
+    font-size: 0.85rem;
+  }
+  .proofing-item-remove {
+    border: none;
+    background: none;
+    color: #999;
+    font-size: 1.2rem;
+    cursor: pointer;
+    padding: 0.25rem;
+  }
+  .proofing-item-remove:hover { color: #e0245e; }
+  .proofing-empty { color: #777; text-align: center; padding: 1.5rem 0; }
+
+  .proofing-modal-footer {
+    display: flex;
+    gap: 0.75rem;
+    padding: 1rem 1.25rem;
+    border-top: 1px solid #eee;
+  }
+  .proofing-modal-footer input {
+    flex: 1;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font: inherit;
+    font-size: 0.9rem;
+    min-width: 0;
+  }
+  .proofing-modal-footer .proofing-btn-primary {
+    background: #111;
+    color: #fff;
+    border-color: #111;
+    border-radius: 8px;
+  }
+  .proofing-modal-footer .proofing-btn-primary:hover { background: #333; }
+
+  /* Lightbox heart lives in PhotoSwipe's container (created dynamically) */
+  :global(.pswp-btn-heart.selected) { color: #e0245e !important; }
+
+  @media (max-width: 768px) {
+    /* Clients proof on phones — the heart must not depend on hover */
+    .proof-heart { width: 40px; height: 40px; }
+    .proofing-bar {
+      width: calc(100% - 2rem);
+      justify-content: space-between;
+      bottom: 0.75rem;
+    }
+    .proofing-item { grid-template-columns: 56px 1fr auto; }
+    .proofing-item img { width: 56px; height: 56px; }
+  }
 </style>
 
 <script>
@@ -1200,6 +1421,207 @@ function getVideoMimeType(filename: string): string {
     hasAccess: shareModal?.dataset.hasAccess === 'true',
     siteUrl: shareModal?.dataset.siteUrl || window.location.origin
   };
+
+  // ============ Client Proofing ============
+  const proofingBar = document.getElementById('proofing-bar');
+  const proofingEnabled = !!proofingBar;
+  const proofingAlbumPath = proofingBar?.dataset.albumPath || '';
+  const proofingAlbumToken = proofingBar?.dataset.albumToken || '';
+  const proofingStorageKey = `proofing_${proofingAlbumPath}`;
+  // filename -> comment (null = no comment)
+  const proofingSelections = new Map<string, string | null>();
+
+  function proofingLoad() {
+    try {
+      const raw = localStorage.getItem(proofingStorageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      for (const [filename, comment] of Object.entries(parsed)) {
+        proofingSelections.set(filename, typeof comment === 'string' ? comment : null);
+      }
+    } catch {
+      // Corrupt state — start fresh
+    }
+  }
+
+  function proofingSave() {
+    try {
+      localStorage.setItem(proofingStorageKey, JSON.stringify(Object.fromEntries(proofingSelections)));
+    } catch {
+      // localStorage unavailable (private mode) — selection lives in memory only
+    }
+  }
+
+  function proofingIsSelected(filename: string): boolean {
+    return proofingSelections.has(filename);
+  }
+
+  function proofingToggle(filename: string) {
+    if (!filename) return;
+    if (proofingSelections.has(filename)) {
+      proofingSelections.delete(filename);
+    } else {
+      proofingSelections.set(filename, null);
+    }
+    proofingSave();
+    proofingUpdateUI();
+  }
+
+  function currentLightboxFilename(): string {
+    return currentPhotoUrl.split('/').pop() || '';
+  }
+
+  function proofingUpdateUI() {
+    if (!proofingEnabled) return;
+    document.querySelectorAll<HTMLElement>('.proof-heart').forEach(btn => {
+      const selected = proofingIsSelected(btn.dataset.filename || '');
+      btn.classList.toggle('selected', selected);
+      btn.setAttribute('aria-pressed', selected.toString());
+    });
+    const count = proofingSelections.size;
+    const countEl = document.getElementById('proofing-count');
+    if (countEl) countEl.textContent = `${count} selected`;
+    if (proofingBar) proofingBar.hidden = count === 0;
+    // Lightbox heart (created dynamically by the custom toolbar)
+    const lightboxHeart = document.querySelector('.pswp-btn-heart');
+    if (lightboxHeart) {
+      lightboxHeart.classList.toggle('selected', proofingIsSelected(currentLightboxFilename()));
+    }
+  }
+
+  function renderProofingList() {
+    const list = document.getElementById('proofing-list');
+    if (!list) return;
+    list.innerHTML = '';
+
+    if (proofingSelections.size === 0) {
+      list.innerHTML = '<p class="proofing-empty">No photos selected yet. Tap the heart on the photos you like.</p>';
+      return;
+    }
+
+    for (const [filename, comment] of proofingSelections) {
+      const item = document.createElement('div');
+      item.className = 'proofing-item';
+
+      const img = document.createElement('img');
+      img.src = `/api/thumbnail?path=${encodeURIComponent(`${proofingAlbumPath}/${filename}`)}&size=small&v=3`;
+      img.alt = filename;
+      img.loading = 'lazy';
+      item.appendChild(img);
+
+      const fields = document.createElement('div');
+      fields.className = 'proofing-item-fields';
+      const name = document.createElement('span');
+      name.className = 'proofing-item-name';
+      name.textContent = filename;
+      fields.appendChild(name);
+      const textarea = document.createElement('textarea');
+      textarea.maxLength = 500;
+      textarea.placeholder = 'Note for this photo (optional)';
+      textarea.value = comment || '';
+      textarea.addEventListener('input', () => {
+        proofingSelections.set(filename, textarea.value.trim() || null);
+        proofingSave();
+      });
+      fields.appendChild(textarea);
+      item.appendChild(fields);
+
+      const remove = document.createElement('button');
+      remove.className = 'proofing-item-remove';
+      remove.type = 'button';
+      remove.title = 'Remove from selection';
+      remove.setAttribute('aria-label', `Remove ${filename} from selection`);
+      remove.textContent = '×';
+      remove.addEventListener('click', () => {
+        proofingSelections.delete(filename);
+        proofingSave();
+        proofingUpdateUI();
+        renderProofingList();
+      });
+      item.appendChild(remove);
+
+      list.appendChild(item);
+    }
+  }
+
+  async function proofingSend() {
+    const sendBtn = document.getElementById('proofing-send-btn') as HTMLButtonElement | null;
+    if (!sendBtn || proofingSelections.size === 0) return;
+
+    const nameInput = document.getElementById('proofing-name') as HTMLInputElement | null;
+    const payload = {
+      albumPath: proofingAlbumPath,
+      name: nameInput?.value.trim() || null,
+      selections: [...proofingSelections].map(([filename, comment]) => ({ filename, comment }))
+    };
+
+    sendBtn.disabled = true;
+    sendBtn.textContent = 'Sending…';
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (proofingAlbumToken) headers['X-Album-Token'] = proofingAlbumToken;
+      const response = await fetch('/api/proofing', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to send selection');
+      }
+      proofingSelections.clear();
+      proofingSave();
+      proofingUpdateUI();
+      document.getElementById('proofing-modal')?.classList.remove('active');
+      document.body.style.overflow = '';
+      showToast(`Selection sent (${data.count} photos). Thank you!`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Failed to send selection');
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send selection';
+    }
+  }
+
+  function initProofing() {
+    if (!proofingEnabled) return;
+    proofingLoad();
+    proofingUpdateUI();
+
+    document.querySelectorAll<HTMLElement>('.proof-heart').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        proofingToggle(btn.dataset.filename || '');
+      });
+    });
+
+    const proofingModal = document.getElementById('proofing-modal');
+    const openModal = () => {
+      renderProofingList();
+      proofingModal?.classList.add('active');
+      document.body.style.overflow = 'hidden';
+    };
+    const closeModal = () => {
+      proofingModal?.classList.remove('active');
+      document.body.style.overflow = '';
+      proofingUpdateUI(); // comments/removals may have changed
+    };
+
+    document.getElementById('proofing-review-btn')?.addEventListener('click', openModal);
+    document.getElementById('proofing-clear-btn')?.addEventListener('click', () => {
+      proofingSelections.clear();
+      proofingSave();
+      proofingUpdateUI();
+    });
+    proofingModal?.querySelector('.proofing-modal-close')?.addEventListener('click', closeModal);
+    proofingModal?.addEventListener('click', (e) => {
+      if (e.target === proofingModal) closeModal();
+    });
+    document.getElementById('proofing-send-btn')?.addEventListener('click', proofingSend);
+  }
+
+  initProofing();
 
   // Current photo being shared
   let currentShareFilename = '';
@@ -1628,6 +2050,7 @@ function getVideoMimeType(filename: string): string {
         <span class="pswp-size"></span>
       </div>
       <div class="pswp-toolbar">
+        ${proofingEnabled ? '<span class="pswp-btn pswp-btn-heart" title="Select photo (L)">♥</span>' : ''}
         <span class="pswp-btn pswp-btn-info" title="Photo info (I)">i</span>
         <span class="pswp-btn pswp-btn-share" title="Share (S)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -1656,6 +2079,7 @@ function getVideoMimeType(filename: string): string {
           <tr><td>O</td><td>Toggle original quality</td></tr>
           <tr><td>I</td><td>Toggle photo info</td></tr>
           <tr><td>S</td><td>Share photo</td></tr>
+          ${proofingEnabled ? '<tr><td>L</td><td>Select / unselect photo</td></tr>' : ''}
           <tr><td>F</td><td>Toggle fullscreen</td></tr>
           <tr><td>H</td><td>Toggle zen mode (hide UI)</td></tr>
           <tr><td>?</td><td>Toggle this help</td></tr>
@@ -1728,6 +2152,9 @@ function getVideoMimeType(filename: string): string {
 
       // Update original button state
       originalBtn.classList.toggle('active', isOriginalMode);
+
+      // Update proofing heart state for the current photo
+      proofingUpdateUI();
     }
 
     // Toggle original mode
@@ -1776,6 +2203,9 @@ function getVideoMimeType(filename: string): string {
     originalBtn.addEventListener('click', toggleOriginalMode);
     helpBtn.addEventListener('click', toggleHelp);
     closeBtn.addEventListener('click', () => pswp.close());
+    customUI.querySelector('.pswp-btn-heart')?.addEventListener('click', () => {
+      proofingToggle(currentLightboxFilename());
+    });
 
     // Close help overlay when clicking background
     shortcutsOverlay.addEventListener('click', (e) => {
@@ -1830,6 +2260,12 @@ function getVideoMimeType(filename: string): string {
       if (event.key === '?') {
         event.preventDefault();
         toggleHelp();
+      }
+
+      // Handle 'l' or 'L' key to toggle the proofing selection
+      if (proofingEnabled && (event.key === 'l' || event.key === 'L')) {
+        event.preventDefault();
+        proofingToggle(currentLightboxFilename());
       }
 
       // Handle 's' or 'S' key to share
