@@ -180,7 +180,7 @@ if (!hasAccess) {
       {album.data.tags && album.data.tags.length > 0 && (
         <div class="tags">
           {album.data.tags.map(tag => (
-            <span class="tag">{tag}</span>
+            <a class="tag" href={`/photos/tags/${encodeURIComponent(tag.trim())}`}>{tag}</a>
           ))}
         </div>
       )}
@@ -535,6 +535,12 @@ if (!hasAccess) {
     padding: 0.25rem 0.75rem;
     border-radius: 16px;
     font-size: 0.85rem;
+    text-decoration: none;
+    transition: background 0.15s;
+  }
+  .tag:hover {
+    background: #bbdefb;
+    text-decoration: none;
   }
 
   .section {
@@ -1068,10 +1074,12 @@ if (!hasAccess) {
       // Initialize display style
       if (styleSelect && photoGallery) {
         const albumStyle = styleSelect.dataset.albumStyle || 'grid';
+        // 'slideshow' is a behavior, not a grid layout — the grid renders as 'grid'
+        const layoutDefault = albumStyle === 'slideshow' ? 'grid' : albumStyle;
         const savedStyle = localStorage.getItem('photo-display-style');
 
         // Use saved style or fall back to album's configured style
-        const currentStyle = savedStyle || albumStyle;
+        const currentStyle = savedStyle || layoutDefault;
         styleSelect.value = currentStyle;
         applyDisplayStyle(currentStyle);
 

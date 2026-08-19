@@ -1,0 +1,106 @@
+---
+// Tag page — lists all non-hidden albums carrying a tag.
+// Prerendered: one static page per tag found in the collection.
+export const prerender = true;
+
+import { getAllAlbums, getAlbumCoverPhoto, type Album } from '../../../lib/albums';
+import Layout from '../../../layouts/Layout.astro';
+import SEO from '../../../components/SEO.astro';
+import AlbumGrid from '../../../components/AlbumGrid.astro';
+import Footer from '../../../components/Footer.astro';
+import { siteConfig } from '../../../config';
+
+export async function getStaticPaths() {
+  const albums = await getAllAlbums();
+  const tags = new Set<string>();
+  for (const album of albums) {
+    if (album.data.hidden) continue;
+    for (const tag of album.data.tags || []) {
+      const clean = tag.trim();
+      if (clean) tags.add(clean);
+    }
+  }
+  return [...tags].map(tag => ({ params: { tag } }));
+}
+
+const { tag } = Astro.params;
+
+const isLocked = (a: Album) => !!a.data.password || !!a.data.shareToken;
+
+const albums = (await getAllAlbums())
+  .filter(a => !a.data.hidden && (a.data.tags || []).some(t => t.trim() === tag))
+  .sort((a, b) => {
+    const orderA = a.data.order ?? Infinity;
+    const orderB = b.data.order ?? Infinity;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.data.title.localeCompare(b.data.title);
+  });
+
+// SECURITY: prerendered page — locked albums get no cover photo baked in
+const albumsWithCovers = await Promise.all(
+  albums.map(async (album) => {
+    if (isLocked(album)) {
+      return { album, coverPhotoUrl: null as string | null };
+    }
+    const albumPath = album.id.replace('/index.md', '');
+    const coverPhotoUrl = await getAlbumCoverPhoto(albumPath, album.data.thumbnail);
+    return { album, coverPhotoUrl };
+  })
+);
+---
+
+<Layout title={`Tag: ${tag}`}>
+  <SEO
+    slot="head"
+    title={`Tag: ${tag}`}
+    description={`Albums tagged "${tag}" — ${siteConfig.name}`}
+    image={siteConfig.defaultOgImage}
+  />
+  <div class="container">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <ol>
+        <li><a href="/home">Home</a><span class="separator">/</span></li>
+        <li><a href="/photos">Photos</a><span class="separator">/</span></li>
+        <li><span class="current">#{tag}</span></li>
+      </ol>
+    </nav>
+
+    <div class="tag-header">
+      <h1>#{tag}</h1>
+      <p class="tag-count">{albums.length} album{albums.length === 1 ? '' : 's'}</p>
+    </div>
+
+    {albumsWithCovers.length > 0 ? (
+      <AlbumGrid albums={albumsWithCovers} isParentProtected={false} hasParentAccess={false} />
+    ) : (
+      <p class="empty">No albums with this tag.</p>
+    )}
+
+    <Footer />
+  </div>
+</Layout>
+
+<style>
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+  }
+  .breadcrumbs ol {
+    display: flex;
+    gap: 0.5rem;
+    list-style: none;
+    padding: 0;
+    margin: 0 0 1.5rem;
+    font-size: var(--text-sm, 0.9rem);
+  }
+  .breadcrumbs a { color: var(--color-text-secondary, #404040); text-decoration: none; }
+  .breadcrumbs a:hover { text-decoration: underline; }
+  .breadcrumbs .separator { margin-left: 0.5rem; color: var(--color-text-muted, #666); }
+  .breadcrumbs .current { color: var(--color-text, #0a0a0a); font-weight: 600; }
+
+  .tag-header { margin-bottom: 2rem; }
+  .tag-header h1 { margin: 0; font-size: var(--text-3xl, 2rem); }
+  .tag-count { color: var(--color-text-secondary, #404040); margin-top: 0.25rem; }
+  .empty { color: var(--color-text-muted, #666); padding: 2rem 0; }
+</style>

@@ -220,8 +220,10 @@ The site has three main sections:
 |-------|------|-------------|
 | `/` | `src/pages/index.astro` | Landing page - full-screen background with shutter button |
 | `/home` | `src/pages/home.astro` | Digital home - hero slider, intro text, content cards |
-| `/photos` | `src/pages/photos/index.astro` | Gallery root - top-level album list |
+| `/photos` | `src/pages/photos/index.astro` | Gallery root - album list with Public/Locked toggle and live search box |
 | `/photos/*` | `src/pages/photos/[...path].astro` | Album/Collection view - dynamic route for all albums |
+| `/photos/tags/[tag]` | `src/pages/photos/tags/[tag].astro` | Prerendered tag page - non-hidden albums with the tag (locked = no cover) |
+| `/photos/search` | `src/pages/photos/search.astro` | SSR search - albums (title/description/tags) + photos (filename/camera/EXIF date); PUBLIC content only |
 
 ### Components
 
@@ -358,6 +360,16 @@ Albums support sort options via dropdown (persisted to localStorage):
 - Name (A-Z / Z-A)
 - Date taken / EXIF date (Oldest / Newest)
 - File size (Smallest / Largest)
+
+### Tags & Search
+
+- Tag pills on album pages link to prerendered `/photos/tags/<tag>` pages (non-hidden albums; locked ones render title + lock placeholder only).
+- The `/photos` search box filters album cards live (via `data-search` on cards); submitting goes to `/photos/search?q=`.
+- `/photos/search` matches albums by title/description/tags and photos by filename, camera and EXIF date (ISO `2025-06-14` or `14.06.2025`) using the per-album metadata cache. Only fully public chains are searchable — hidden/locked albums and their content never appear. Pure matching logic: `src/lib/search-core.ts` (unit-tested).
+
+### Slideshow
+
+`style: slideshow` renders the grid as `grid` and auto-opens an auto-advancing lightbox (interval: `siteConfig.features.slideshowIntervalMs`, default 5 s; disabled under `prefers-reduced-motion`; `?photo=` deep links take priority). Every lightbox has a play/pause toolbar button (`P` key); manual navigation or tapping pauses.
 
 ### Client Proofing
 

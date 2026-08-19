@@ -63,6 +63,7 @@ function formatCroatianDate(date: Date): string {
         data-title={displayTitle}
         data-date={album.data.date ? new Date(album.data.date).getTime().toString() : ""}
         data-order={album.data.order?.toString() ?? "999"}
+        data-search={`${displayTitle} ${album.data.description || ''} ${(album.data.tags || []).join(' ')}`.toLowerCase()}
       >
         <div class="album-thumbnail">
           {hasCoverPhoto ? (

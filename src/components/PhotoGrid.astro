@@ -45,6 +45,12 @@ const gridSizes = '(max-width: 768px) 50vw, 33vw';
 const singleColumnSizes = '(max-width: 1400px) 100vw, 1400px';
 const initialSizes = style === 'single-column' ? singleColumnSizes : gridSizes;
 
+// 'slideshow' is a behavior (auto-opening, auto-advancing lightbox), not a
+// grid layout — the grid behind it renders as the standard grid.
+const layoutStyle = style === 'slideshow' ? 'grid' : style;
+const isSlideshow = style === 'slideshow';
+const slideshowIntervalMs = siteConfig.features.slideshowIntervalMs;
+
 // Helper function to get video MIME type from filename
 function getVideoMimeType(filename: string): string {
   const ext = filename.split('.').pop()?.toLowerCase();
@@ -60,7 +66,12 @@ function getVideoMimeType(filename: string): string {
 }
 ---
 
-<div class={`photo-grid photo-grid-${style}`} id="photo-gallery">
+<div
+  class={`photo-grid photo-grid-${layoutStyle}`}
+  id="photo-gallery"
+  data-slideshow={isSlideshow ? 'true' : undefined}
+  data-slideshow-interval={slideshowIntervalMs}
+>
   {photos.map((photo, index) => (
     <div class={`photo-item ${photo.isVideo ? 'is-video' : ''}`}
          data-index={index}
@@ -1404,6 +1415,13 @@ function getVideoMimeType(filename: string): string {
   const photoItems = document.querySelectorAll('.photo-item');
   const photoLinks = document.querySelectorAll('.photo-link');
 
+  // Slideshow state
+  const galleryEl = document.getElementById('photo-gallery');
+  const isSlideshowAlbum = galleryEl?.dataset.slideshow === 'true';
+  const slideshowInterval = parseInt(galleryEl?.dataset.slideshowInterval || '5000') || 5000;
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let autoStartSlideshow = false;
+
   // Video info cache
   const videoInfoCache = new Map();
 
@@ -2051,6 +2069,7 @@ function getVideoMimeType(filename: string): string {
       </div>
       <div class="pswp-toolbar">
         ${proofingEnabled ? '<span class="pswp-btn pswp-btn-heart" title="Select photo (L)">♥</span>' : ''}
+        <span class="pswp-btn pswp-btn-play" title="Slideshow (P)">▶</span>
         <span class="pswp-btn pswp-btn-info" title="Photo info (I)">i</span>
         <span class="pswp-btn pswp-btn-share" title="Share (S)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -2079,6 +2098,7 @@ function getVideoMimeType(filename: string): string {
           <tr><td>O</td><td>Toggle original quality</td></tr>
           <tr><td>I</td><td>Toggle photo info</td></tr>
           <tr><td>S</td><td>Share photo</td></tr>
+          <tr><td>P</td><td>Play / pause slideshow</td></tr>
           ${proofingEnabled ? '<tr><td>L</td><td>Select / unselect photo</td></tr>' : ''}
           <tr><td>F</td><td>Toggle fullscreen</td></tr>
           <tr><td>H</td><td>Toggle zen mode (hide UI)</td></tr>
@@ -2190,6 +2210,44 @@ function getVideoMimeType(filename: string): string {
       pswpElement.classList.toggle('pswp--zen', isZenMode);
     }
 
+    // === Slideshow (auto-advance) ===
+    const playBtn = customUI.querySelector('.pswp-btn-play') as HTMLElement;
+    let slideshowTimer: ReturnType<typeof setInterval> | null = null;
+
+    function startSlideshow() {
+      if (slideshowTimer || !pswp) return;
+      slideshowTimer = setInterval(() => pswp.next(), slideshowInterval);
+      playBtn.textContent = '❚❚';
+      playBtn.title = 'Pause slideshow (P)';
+      playBtn.classList.add('active');
+    }
+
+    function stopSlideshow() {
+      if (!slideshowTimer) return;
+      clearInterval(slideshowTimer);
+      slideshowTimer = null;
+      playBtn.textContent = '▶';
+      playBtn.title = 'Slideshow (P)';
+      playBtn.classList.remove('active');
+    }
+
+    function toggleSlideshow() {
+      if (slideshowTimer) {
+        stopSlideshow();
+      } else {
+        startSlideshow();
+      }
+    }
+
+    playBtn.addEventListener('click', toggleSlideshow);
+
+    // Any direct interaction with the photo pauses the slideshow
+    pswpElement.addEventListener('pointerdown', (e) => {
+      const target = e.target as HTMLElement;
+      if (target.closest('.pswp-btn-play')) return; // the play button toggles itself
+      stopSlideshow();
+    });
+
     // Button click handlers
     infoBtn.addEventListener('click', () => {
       showInfoOverlay(currentPhotoUrl, false);
@@ -2266,6 +2324,17 @@ function getVideoMimeType(filename: string): string {
       if (proofingEnabled && (event.key === 'l' || event.key === 'L')) {
         event.preventDefault();
         proofingToggle(currentLightboxFilename());
+      }
+
+      // Handle 'p' or 'P' key to toggle the slideshow
+      if (event.key === 'p' || event.key === 'P') {
+        event.preventDefault();
+        toggleSlideshow();
+      }
+
+      // Manual navigation pauses the slideshow
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        stopSlideshow();
       }
 
       // Handle 's' or 'S' key to share
@@ -2369,10 +2438,17 @@ function getVideoMimeType(filename: string): string {
 
       // Initialize custom UI
       updateCustomUI();
+
+      // Slideshow albums auto-play on open (never under reduced motion)
+      if (autoStartSlideshow) {
+        autoStartSlideshow = false;
+        if (!prefersReducedMotion) startSlideshow();
+      }
     });
 
     // Scroll to last viewed photo when closing and reset state
     pswp.on('destroy', () => {
+      stopSlideshow();
       // Reset custom UI state
       isOriginalMode = false;
       isZenMode = false;
@@ -2392,6 +2468,13 @@ function getVideoMimeType(filename: string): string {
   });
 
   lightbox.init();
+
+  // Slideshow albums open the lightbox automatically (a ?photo= deep link
+  // takes priority — the page script opens that photo instead)
+  if (isSlideshowAlbum && photoLinks.length > 0 && !new URLSearchParams(window.location.search).has('photo')) {
+    autoStartSlideshow = true;
+    setTimeout(() => lightbox.loadAndOpen(0), 300);
+  }
 
   // EXIF overlay handling
   const exifOverlay = document.getElementById('exif-overlay');
