@@ -1,0 +1,17 @@
+[package]
+name = "gpp-cli"
+description = "Command-line driver for the Goldplated Photos core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gpp"
+path = "src/main.rs"
+
+[dependencies]
+gpp-core = { path = "../gpp-core" }
+serde_json.workspace = true

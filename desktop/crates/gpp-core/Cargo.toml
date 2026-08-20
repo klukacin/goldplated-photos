@@ -1,0 +1,30 @@
+[package]
+name = "gpp-core"
+description = "Goldplated Photos core: catalog, import, albums, publish, sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NOTE: this crate must stay free of GUI and platform-specific process calls —
+# it compiles for macOS, iOS, Windows and Linux unchanged.
+[dependencies]
+rusqlite.workspace = true
+blake3.workspace = true
+image.workspace = true
+fast_image_resize.workspace = true
+kamadak-exif.workspace = true
+rayon.workspace = true
+walkdir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+base64.workspace = true
+rand.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
