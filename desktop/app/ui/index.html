@@ -24,6 +24,7 @@
       <div class="titlebar-title" id="library-name">Library</div>
       <div class="titlebar-actions">
         <button id="import-btn" class="btn">Import…</button>
+        <button id="sync-btn" class="btn">Sync…</button>
         <button id="publish-btn" class="btn btn-primary">Publish</button>
         <button id="settings-btn" class="btn btn-icon" title="Settings">⚙</button>
       </div>
@@ -191,6 +192,33 @@
       <div class="modal-actions">
         <button class="btn" data-close>Close</button>
         <button id="publish-run-btn" class="btn btn-primary">Publish now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sync / remote -->
+  <div id="sync-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Sync albums</h2>
+      <p class="muted">Each album syncs on its own, in its own direction. Albums
+         you don't track are never touched — on either side.</p>
+      <label>Remote folder <small>network share, external drive, or a folder another tool keeps in sync</small>
+        <div class="row">
+          <input type="text" id="remote-dir" placeholder="/Volumes/gallery">
+          <button id="pick-remote-btn" class="btn btn-sm">Choose…</button>
+        </div>
+      </label>
+      <div class="row" style="margin-bottom:0.75rem">
+        <button id="remote-refresh-btn" class="btn btn-sm">Refresh list</button>
+        <div class="spacer"></div>
+        <button id="sync-all-btn" class="btn btn-sm"
+                title="Sync every tracked album in its own direction. Never deletes anything on the server — use an album's own Push for that.">Sync all tracked</button>
+      </div>
+      <div id="remote-list" class="remote-list"></div>
+      <p class="error" id="sync-error" hidden></p>
+      <pre id="sync-output" class="output" hidden></pre>
+      <div class="modal-actions">
+        <button class="btn" data-close>Close</button>
       </div>
     </div>
   </div>

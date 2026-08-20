@@ -48,6 +48,10 @@ where
 pub struct AlbumUpdate {
     #[serde(default)]
     pub title: Option<String>,
+    /// Internal album id. Only set when adopting an album from another machine —
+    /// the id must match across machines or the access cookie breaks.
+    #[serde(default)]
+    pub token: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     pub description: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -245,6 +249,9 @@ impl Library {
             // `None` clears the column. Untouched fields keep their value.
             if let Some(v) = &update.title {
                 c.execute("UPDATE albums SET title = ?1 WHERE id = ?2", params![v, id])?;
+            }
+            if let Some(v) = &update.token {
+                c.execute("UPDATE albums SET token = ?1 WHERE id = ?2", params![v, id])?;
             }
             if let Some(v) = &update.description {
                 c.execute("UPDATE albums SET description = ?1 WHERE id = ?2", params![v, id])?;

@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::{Error, Result};
 use crate::model::{Album, Flag, Photo, PhotoFilter, PhotoKind, PhotoSort};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Directory (relative to the library root) holding all derived data.
 pub const GPP_DIR: &str = ".gpp";
@@ -385,15 +385,35 @@ fn migrate(conn: &Connection) -> Result<()> {
         })
         .optional()?;
 
-    if current.is_none() {
-        conn.execute_batch(SCHEMA_V1)?;
-        conn.execute(
-            "INSERT INTO schema_version(version) VALUES(?1)",
-            params![SCHEMA_VERSION],
-        )?;
+    match current {
+        None => {
+            // Fresh catalog: create at the current version directly.
+            conn.execute_batch(SCHEMA_V1)?;
+            conn.execute_batch(SCHEMA_V2)?;
+            conn.execute_batch(SCHEMA_V3)?;
+            conn.execute(
+                "INSERT INTO schema_version(version) VALUES(?1)",
+                params![SCHEMA_VERSION],
+            )?;
+        }
+        Some(v) => {
+            // Stepped: a catalog two versions behind runs both migrations.
+            if v < 2 {
+                conn.execute_batch(SCHEMA_V2)?;
+            }
+            if v < 3 {
+                conn.execute_batch(SCHEMA_V3)?;
+            }
+            if v < SCHEMA_VERSION {
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    params![SCHEMA_VERSION],
+                )?;
+            }
+        }
     }
-    // Future migrations: match on `current` and step forward. The catalog is
-    // rebuildable, so a failed migration is recoverable by re-import.
+    // Further migrations step forward from here. The catalog is a rebuildable
+    // index, so a failed migration is recoverable by re-importing.
     Ok(())
 }
 
@@ -494,6 +514,32 @@ CREATE TABLE sync_state (
 CREATE TABLE settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+"#;
+
+/// v2 — per-album sync subscriptions.
+///
+/// A machine only touches albums listed here. An album absent from this table
+/// is invisible to sync: never pushed, never pulled, never deleted. That is
+/// what lets one machine hold three albums out of two hundred safely.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE album_sync (
+  album_path     TEXT PRIMARY KEY,
+  direction      TEXT NOT NULL DEFAULT 'both',   -- push | pull | both
+  last_synced_at TEXT
+);
+"#;
+
+const SCHEMA_V3: &str = r#"
+-- What this library last wrote into the published tree, per album.
+--
+-- Publishing prunes a file only if it appears here: that is how a photo removed
+-- from an album disappears from the gallery, while anything another tool put in
+-- the same folder is left strictly alone.
+CREATE TABLE published_files (
+  album_path TEXT NOT NULL,
+  filename   TEXT NOT NULL,
+  PRIMARY KEY (album_path, filename)
 );
 "#;
 

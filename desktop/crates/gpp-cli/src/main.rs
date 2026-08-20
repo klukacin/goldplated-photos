@@ -14,7 +14,8 @@ use gpp_core::albums::{AlbumUpdate, NewAlbum};
 use gpp_core::import::{import_dir, ImportOptions};
 use gpp_core::model::{Flag, PhotoFilter, PhotoSort};
 use gpp_core::publish::{publish_album, PublishOptions};
-use gpp_core::{sync, Library, Result};
+use gpp_core::sync::SyncDirection;
+use gpp_core::{remote, sync, Library, Result};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,6 +46,9 @@ fn run(args: &[String]) -> Result<()> {
         "album" => cmd_album(rest),
         "publish" => cmd_publish(rest),
         "sync" => cmd_sync(rest),
+        "remote" => cmd_remote(rest),
+        "pull" => cmd_pull(rest),
+        "push" => cmd_push(rest),
         "stats" => cmd_stats(rest),
         other => Err(gpp_core::Error::other(format!(
             "unknown command '{other}' — run `gpp help`"
@@ -77,6 +81,10 @@ fn positional(args: &[String]) -> Option<&str> {
             let takes_value = !matches!(
                 a.as_str(),
                 "--recursive" | "--no-thumbs" | "--force" | "--json" | "--apply" | "--allow-deletes"
+                    | "--push" | "--pull" | "--both" | "--record" | "--collection"
+                    | "--share-link" | "--no-share-link" | "--proofing" | "--no-proofing"
+                    | "--allow-download" | "--metadata-only" | "--include-rejected"
+                    | "--no-recursive"
             );
             skip_next = takes_value;
             continue;
@@ -377,9 +385,19 @@ fn cmd_publish(args: &[String]) -> Result<()> {
         let r = publish_album(&lib, path, dest, &opts)?;
         copied += r.photos_copied;
         println!(
-            "{:<40} {} copied, {} unchanged",
-            r.album_path, r.photos_copied, r.photos_skipped
+            "{:<40} {} copied, {} unchanged{}",
+            r.album_path,
+            r.photos_copied,
+            r.photos_skipped,
+            if r.missing.is_empty() {
+                String::new()
+            } else {
+                format!(", {} missing on disk", r.missing.len())
+            }
         );
+        for m in &r.missing {
+            println!("    missing: {m}");
+        }
     }
     println!("published {} album(s), {} file(s) copied", targets.len(), copied);
     Ok(())
@@ -387,45 +405,197 @@ fn cmd_publish(args: &[String]) -> Result<()> {
 
 fn cmd_sync(args: &[String]) -> Result<()> {
     let lib = open_library(args)?;
-    let dest = opt(args, "--dest")
-        .ok_or_else(|| gpp_core::Error::other("--dest <published tree> is required"))?;
-    let dest = Path::new(dest);
+    let root = published_root_for(&lib, args)?;
+    let direction = direction_from(args);
+    let allow_deletes = has(args, "--allow-deletes");
 
-    let local = gpp_core::publish::manifest_of(dest)?;
-    let synced = lib.synced_manifest()?;
+    // With an album named, sync just that one. Without, sync everything this
+    // machine has subscribed to — each album in its own direction.
+    match positional(args) {
+        Some(album) => {
+            let transport = transport_for(&lib, args)?;
+            if has(args, "--plan") {
+                let plan = remote::plan_album_sync(&lib, &transport, album, direction, &root)?;
+                print_plan(&plan);
+                return Ok(());
+            }
+            let opts = PublishOptions::default();
+            let outcome = remote::sync_album(
+                &lib, &transport, album, direction, &root, &opts, allow_deletes,
+            )?;
+            println!(
+                "{album}: pushed {} · pulled {} · deleted {} · skipped {}",
+                outcome.pushed, outcome.pulled, outcome.deleted, outcome.skipped
+            );
+            for c in &outcome.conflicts {
+                println!("  conflict: {c}");
+            }
+        }
+        None => {
+            let transport = transport_for(&lib, args)?;
+            let subs = lib.album_subscriptions()?;
+            if subs.is_empty() {
+                println!("No albums tracked. Track one with:  gpp sync <album> --pull");
+                return Ok(());
+            }
+            let opts = PublishOptions::default();
+            let results =
+                remote::sync_tracked_albums(&lib, &transport, &root, &opts, allow_deletes)?;
+            for (album, outcome) in &results {
+                println!(
+                    "{album}: pushed {} · pulled {} · deleted {} · skipped {}",
+                    outcome.pushed, outcome.pulled, outcome.deleted, outcome.skipped
+                );
+                for c in &outcome.conflicts {
+                    println!("  conflict: {c}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
-    // Without a configured transport we can still show what the local side
-    // believes; a real remote manifest arrives once a transport is wired up.
-    let remote = synced.clone();
-    let scope = match opt(args, "--scope") {
-        Some(s) => sync::SyncScope::with(s.split(',').map(|p| p.trim().to_string()).collect()),
-        None => sync::SyncScope::everything(),
+fn print_plan(plan: &sync::SyncPlan) {
+    println!("push          {}", plan.count(sync::Action::Push));
+    println!("pull          {}", plan.count(sync::Action::Pull));
+    println!("delete remote {}", plan.count(sync::Action::DeleteRemote));
+    println!("conflicts     {}", plan.count(sync::Action::Conflict));
+    println!("left alone    {}", plan.count(sync::Action::LeaveAlone));
+    println!("skipped       {}", plan.count(sync::Action::Skip));
+    if plan.has_conflicts() {
+        println!("\nconflicts:");
+        for c in plan.of(sync::Action::Conflict) {
+            println!("  {}", c.path);
+        }
+    }
+    if plan.is_destructive() {
+        println!("\nwould delete on the server (needs --allow-deletes):");
+        for c in plan.of(sync::Action::DeleteRemote) {
+            println!("  {}", c.path);
+        }
+    }
+}
+
+/// Remote directory: `--remote <dir>`, else the value stored in the catalog.
+fn transport_for(lib: &Library, args: &[String]) -> Result<gpp_core::sync::FsTransport> {
+    let dir = match opt(args, "--remote") {
+        Some(d) => {
+            lib.set_setting("remote.dir", d)?;
+            d.to_string()
+        }
+        None => lib
+            .get_setting("remote.dir")?
+            .ok_or_else(|| gpp_core::Error::other("no remote set — pass --remote <dir> once"))?,
     };
+    Ok(gpp_core::sync::FsTransport::new(dir))
+}
 
-    let p = sync::plan(&scope.filter(&local), &scope.filter(&synced), &scope.filter(&remote));
+fn published_root_for(lib: &Library, args: &[String]) -> Result<PathBuf> {
+    match opt(args, "--dest") {
+        Some(d) => {
+            lib.set_setting("publish.dest", d)?;
+            Ok(PathBuf::from(d))
+        }
+        None => lib
+            .get_setting("publish.dest")?
+            .map(PathBuf::from)
+            .ok_or_else(|| gpp_core::Error::other("no publish destination — pass --dest <dir> once")),
+    }
+}
 
-    println!("push          {}", p.count(sync::Action::Push));
-    println!("pull          {}", p.count(sync::Action::Pull));
-    println!("delete remote {}", p.count(sync::Action::DeleteRemote));
-    println!("conflicts     {}", p.count(sync::Action::Conflict));
-    println!("left alone    {}", p.count(sync::Action::LeaveAlone));
+fn direction_from(args: &[String]) -> SyncDirection {
+    if has(args, "--push") {
+        SyncDirection::Push
+    } else if has(args, "--pull") {
+        SyncDirection::Pull
+    } else {
+        SyncDirection::Both
+    }
+}
 
-    if p.has_conflicts() {
-        println!("\nconflicts need a decision:");
-        for c in p.of(sync::Action::Conflict) {
-            println!("  {}", c.path);
+/// `gpp remote` — what the server has, and what this machine tracks.
+fn cmd_remote(args: &[String]) -> Result<()> {
+    let lib = open_library(args)?;
+    let transport = transport_for(&lib, args)?;
+
+    let albums = remote::remote_albums(&lib, &transport)?;
+    if albums.is_empty() {
+        println!("No albums here or on the remote yet.");
+        return Ok(());
+    }
+
+    println!("{:<36} {:>5}  {:<7} {:<7} SYNC", "ALBUM", "FILES", "LOCAL", "REMOTE");
+    for a in &albums {
+        println!(
+            "{:<36} {:>5}  {:<7} {:<7} {}",
+            a.path,
+            a.file_count,
+            if a.local { "yes" } else { "—" },
+            if a.remote { "yes" } else { "—" },
+            a.tracked.map(|d| d.as_str()).unwrap_or("not tracked")
+        );
+    }
+    println!("\nAdopt one with:  gpp pull <album>");
+    println!("Contribute one:  gpp push <album>");
+    Ok(())
+}
+
+/// `gpp pull <album>` — adopt an album from the remote.
+fn cmd_pull(args: &[String]) -> Result<()> {
+    let lib = open_library(args)?;
+    let transport = transport_for(&lib, args)?;
+    let root = published_root_for(&lib, args)?;
+    let album = positional(args)
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp pull <album> [--remote D] [--dest D]"))?;
+
+    let outcome = remote::pull_album(&lib, &transport, album, &root)?;
+    println!(
+        "pulled {} file(s), catalogued {} photo(s)",
+        outcome.files_pulled, outcome.photos_imported
+    );
+    if !outcome.conflicts.is_empty() {
+        println!("conflicts (nothing overwritten):");
+        for c in &outcome.conflicts {
+            println!("  {c}");
         }
     }
-    if p.is_destructive() {
-        println!("\nwould delete on the server (requires --allow-deletes):");
-        for c in p.of(sync::Action::DeleteRemote) {
-            println!("  {}", c.path);
-        }
-    }
+    Ok(())
+}
 
-    if has(args, "--record") {
-        lib.record_synced_all(&local)?;
-        println!("\nrecorded {} path(s) as synced", local.len());
+/// `gpp push <album>` — publish an album and upload it.
+fn cmd_push(args: &[String]) -> Result<()> {
+    let lib = open_library(args)?;
+    let transport = transport_for(&lib, args)?;
+    let root = published_root_for(&lib, args)?;
+    let album = positional(args)
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp push <album> [--allow-deletes]"))?;
+
+    let opts = PublishOptions {
+        min_rating: opt(args, "--min-rating").and_then(|v| v.parse().ok()),
+        ..Default::default()
+    };
+    let outcome = remote::push_album(
+        &lib, &transport, album, &root, &opts, has(args, "--allow-deletes"),
+    )?;
+    println!(
+        "pushed {} file(s), deleted {} remotely, skipped {}",
+        outcome.files_pushed, outcome.deleted_remote, outcome.skipped
+    );
+    if !outcome.withheld_deletes.is_empty() {
+        println!(
+            "{} file(s) on the server that this album no longer has:",
+            outcome.withheld_deletes.len()
+        );
+        for p in &outcome.withheld_deletes {
+            println!("  {p}");
+        }
+        println!("re-run with --allow-deletes to remove them");
+    }
+    if !outcome.conflicts.is_empty() {
+        println!("conflicts (nothing overwritten):");
+        for c in &outcome.conflicts {
+            println!("  {c}");
+        }
     }
     Ok(())
 }
@@ -475,7 +645,12 @@ COMMANDS
   publish [album] --dest <dir>    Write the gallery content tree
                                   [--min-rating N] [--metadata-only]
                                   [--include-rejected]
-  sync --dest <dir> [--scope a,b] Show the sync plan [--record]
+
+  remote [--remote <dir>]         List albums on the remote and what you track
+  pull <album>                    Adopt an album from the remote into this library
+  push <album> [--allow-deletes]  Publish an album and upload it
+  sync [album] [--push|--pull|--both] [--plan] [--allow-deletes]
+                                  Sync one album, or every tracked album
 
 EXAMPLES
   gpp init ~/Photos
@@ -484,6 +659,12 @@ EXAMPLES
   gpp album create 2026/ana --title "Ana & Ivan"
   gpp album set 2026/ana --password tajna --share-link --proofing
   gpp publish 2026/ana --dest ../src/content/albums --min-rating 3
+
+  # Two machines, one server (a share, a drive, or a synced folder)
+  gpp push 2026/ana --remote /Volumes/gallery --dest ../src/content/albums
+  gpp remote                            # on the other machine: what's there?
+  gpp pull 2026/ana                     # adopt it, photos and settings
+  gpp sync 2026/ana --both              # thereafter: reconcile both ways
 "#
     );
 }

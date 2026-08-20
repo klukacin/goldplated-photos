@@ -8,7 +8,8 @@ use gpp_core::albums::{AlbumUpdate, NewAlbum};
 use gpp_core::model::{Flag, ImportSummary, Photo, PhotoFilter};
 use gpp_core::publish::PublishResult;
 use gpp_core::session::{AlbumSummary, LibraryStatus, PublishTarget, Session};
-use gpp_core::sync::SyncPlan;
+use gpp_core::remote::{PullOutcome, PushOutcome, RemoteAlbum};
+use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan};
 use tauri::{Emitter, Manager, State};
 
 /// Commands return `Result<T, String>`: the webview only needs the message.
@@ -184,6 +185,106 @@ fn sync_plan(state: State<'_, Session>) -> CmdResult<SyncPlan> {
     state.sync_plan().map_err(to_msg)
 }
 
+// -------------------------------------------------------------------- remote
+
+#[tauri::command]
+fn get_remote_dir(state: State<'_, Session>) -> CmdResult<Option<String>> {
+    state.remote_dir().map_err(to_msg)
+}
+
+#[tauri::command]
+fn set_remote_dir(state: State<'_, Session>, dir: String) -> CmdResult<()> {
+    state.set_remote_dir(dir).map_err(to_msg)
+}
+
+#[tauri::command]
+fn remote_albums(state: State<'_, Session>) -> CmdResult<Vec<RemoteAlbum>> {
+    state.remote_albums().map_err(to_msg)
+}
+
+#[tauri::command]
+fn album_subscriptions(state: State<'_, Session>) -> CmdResult<Vec<AlbumSubscription>> {
+    state.album_subscriptions().map_err(to_msg)
+}
+
+#[tauri::command]
+fn track_album(
+    state: State<'_, Session>,
+    path: String,
+    direction: SyncDirection,
+) -> CmdResult<()> {
+    state.track_album(path, direction).map_err(to_msg)
+}
+
+#[tauri::command]
+fn untrack_album(state: State<'_, Session>, path: String) -> CmdResult<()> {
+    state.untrack_album(path).map_err(to_msg)
+}
+
+#[tauri::command]
+fn plan_album_sync(
+    state: State<'_, Session>,
+    path: String,
+    direction: SyncDirection,
+) -> CmdResult<SyncPlan> {
+    state.plan_album_sync(path, direction).map_err(to_msg)
+}
+
+#[tauri::command]
+async fn pull_album(app: tauri::AppHandle, path: String) -> CmdResult<PullOutcome> {
+    // Network/disk bound: keep it off the UI thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().pull_album(path).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn push_album(
+    app: tauri::AppHandle,
+    path: String,
+    allow_deletes: bool,
+) -> CmdResult<PushOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .push_album(path, allow_deletes)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sync_album(
+    app: tauri::AppHandle,
+    path: String,
+    direction: SyncDirection,
+    allow_deletes: bool,
+) -> CmdResult<SyncOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .sync_album(path, direction, allow_deletes)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sync_all_tracked(
+    app: tauri::AppHandle,
+    allow_deletes: bool,
+) -> CmdResult<Vec<(String, SyncOutcome)>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .sync_all_tracked(allow_deletes)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Entry point shared by the desktop binary and (later) the mobile target.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -217,6 +318,17 @@ pub fn run() {
             set_publish_target,
             publish,
             sync_plan,
+            get_remote_dir,
+            set_remote_dir,
+            remote_albums,
+            album_subscriptions,
+            track_album,
+            untrack_album,
+            plan_album_sync,
+            pull_album,
+            push_album,
+            sync_album,
+            sync_all_tracked,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Goldplated Photos");

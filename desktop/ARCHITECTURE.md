@@ -246,6 +246,46 @@ generation is a small endpoint or a one-line `find`+hash over SSH.
 pull-only. (This is a live bug in the current bash deploy — every deploy deletes
 them — and the new engine fixes it by construction.)
 
+### 6.1 Per-album subscriptions
+
+The table above decides *files*. What decides *scope* is one row per album in
+`album_sync(album_path, direction, last_synced_at)`, where direction is
+`push`, `pull` or `both`. An album with no row is not synced at all: not
+pushed, not pulled, not deleted, not even listed as changed.
+
+That is what makes a machine safe to use anywhere. A laptop holding three
+albums out of two hundred subscribes to those three; the other 197 are simply
+not its business. `SyncDirection` then filters the decision table:
+
+- `push` — local wins; a remote-side change is reported as skipped, never applied.
+- `pull` — remote wins; the server is never written to, not even deletions.
+- `both` — the full three-way table above, with conflicts surfaced, never guessed.
+
+`remote_albums()` answers both halves of the question a machine has: what the
+server holds that this machine lacks (adopt it with `pull_album`), and what this
+machine authored that the server lacks (contribute it with `push_album`). A pull
+adopts the server's `token`, so an access cookie issued by the gallery keeps
+working no matter which machine last published the album.
+
+A one-off pull or push starts tracking an album only when nothing was chosen for
+it yet — an operation never overrules a direction the user set.
+
+### 6.2 Removing a photo, safely
+
+Deleting is the one thing three-way state can get catastrophically wrong, so it
+goes through two gates.
+
+The published tree is shared ground: the desktop app writes there, and so does
+the web admin. Publishing therefore prunes a file only when
+`published_files(album_path, filename)` says *this* library put it there. A file
+another tool added is never ours to remove; sub-albums and dotfiles are not even
+read.
+
+Only then does the sync layer see the file as locally deleted, and it still
+withholds the deletion unless `allow_deletes` was explicitly passed. Withheld
+deletions come back in `withheld_deletes` so the caller can name the files, ask,
+and re-run — which is exactly what the desktop panel does.
+
 ---
 
 ## 7. Publish — what actually lands on the server

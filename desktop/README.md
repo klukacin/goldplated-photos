@@ -21,6 +21,7 @@ desktop/
 | Albums: hierarchy, membership, ordering, tags, rename/move | done |
 | Publish to the Astro gallery (access, proofing, download flags) | done |
 | Sync planning that cannot wipe another machine's albums | done |
+| Per-album two-way sync: adopt an album, contribute one, from any machine | done |
 | RAW decoding, develop pipeline | not yet — `RawDecoder` trait is in place |
 
 ---
@@ -32,7 +33,7 @@ containers — that is the point of keeping the GUI out of the core:
 
 ```bash
 cd desktop
-cargo test          # 61 tests
+cargo test          # 83 tests
 cargo clippy --all-targets
 cargo build --release -p gpp-cli
 ```
@@ -40,9 +41,9 @@ cargo build --release -p gpp-cli
 The **Tauri shell has not been compiled here**. It needs a platform webview
 toolkit (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux) which
 this development container does not have. What *was* verified mechanically:
-the config parses, the UI's JavaScript parses, and every one of the 16
-`invoke()` calls in the UI matches a `#[tauri::command]` that is registered in
-`generate_handler!`. First compile on a Mac may still surface something.
+the config parses, the UI's JavaScript parses, every `invoke()` call in the UI
+matches a `#[tauri::command]` registered in `generate_handler!`, and every
+element id the UI reaches for exists in the markup. First compile on a Mac may still surface something.
 
 ---
 
@@ -99,6 +100,49 @@ afterwards.
 
 ---
 
+## Working from more than one machine
+
+Every album syncs on its own, in the direction you choose for it. Albums you
+haven't chosen a direction for are never touched — not pushed, not pulled, not
+deleted — which is what lets a laptop carry three albums out of two hundred.
+
+```bash
+# --remote and --dest are remembered in the catalog after the first use
+gpp remote --remote /Volumes/gallery --dest ../src/content/albums
+
+gpp remote                                 # what's here, what's there
+# ALBUM                  FILES  LOCAL   REMOTE  SYNC
+# 2026/ana-ivan              7  —       yes     not tracked      ← can adopt
+# 2026/marko                 0  yes     —       not tracked      ← can contribute
+
+gpp pull 2026/ana-ivan                     # adopt: settings, photos, order
+gpp push 2026/marko                        # contribute one of your own
+gpp sync 2026/ana-ivan --both              # from then on, both ways
+gpp sync                                   # every tracked album, its own way
+```
+
+A pulled album keeps the server's `token`, so gallery access cookies and share
+links stay valid across machines. A one-off `pull` or `push` won't overrule a
+direction you already set.
+
+Nothing is removed from the server unless you say so:
+
+```bash
+gpp push 2026/ana-ivan
+# 1 file(s) on the server that this album no longer has:
+#   2026/ana-ivan/reject.jpg
+# re-run with --allow-deletes to remove them
+```
+
+In the app this is the **Sync…** panel: pick the folder, choose a direction per
+album, and Pull / Push / Sync per row. Deletions ask first, by name.
+
+The remote is a directory today — a network share, an external drive, or a
+folder something else keeps in sync. `SftpTransport` and `HttpTransport` slot in
+behind the same trait without touching any of the logic above.
+
+---
+
 ## How this fits the web gallery
 
 The desktop app **feeds** the existing Astro site; it does not replace it.
@@ -114,6 +158,8 @@ Two things the app deliberately never touches:
   pull-only and excluded from every manifest.
 - **Files this machine has never seen** — the sync planner marks them
   `LeaveAlone`. A laptop holding one year of work cannot delete the rest.
+- **Files this library did not publish** — the web admin and the app share the
+  content folder, so publishing prunes only what it wrote itself.
 
 ---
 

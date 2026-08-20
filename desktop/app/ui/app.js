@@ -19,6 +19,7 @@ const state = {
   currentAlbum: '',
   filter: { minRating: null, flag: null, text: '' },
   editingAlbum: null,
+  remoteAlbums: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -641,5 +642,278 @@ $('publish-run-btn').addEventListener('click', async () => {
     status('Publish failed');
   }
 });
+
+// -------------------------------------------------------------------- sync
+//
+// One album at a time, in the direction chosen for that album. Albums with no
+// direction set are never touched — not pushed, not pulled, not deleted.
+
+$('sync-btn').addEventListener('click', async () => {
+  showError('sync-error', '');
+  $('sync-output').hidden = true;
+  openModal('sync-modal');
+  try {
+    $('remote-dir').value = (await invoke('get_remote_dir')) || '';
+  } catch { /* no library open */ }
+  if ($('remote-dir').value) await refreshRemote();
+});
+
+$('pick-remote-btn').addEventListener('click', async () => {
+  const dir = await openDialog({ directory: true, title: 'Choose the shared album folder' });
+  if (!dir) return;
+  $('remote-dir').value = dir;
+  await saveRemoteDir();
+  await refreshRemote();
+});
+
+/// Typing a path by hand is allowed too — persist it on blur.
+$('remote-dir').addEventListener('change', () => saveRemoteDir());
+
+async function saveRemoteDir() {
+  const dir = $('remote-dir').value.trim();
+  if (!dir) return;
+  try {
+    await invoke('set_remote_dir', { dir });
+    showError('sync-error', '');
+  } catch (err) {
+    showError('sync-error', String(err));
+  }
+}
+
+$('remote-refresh-btn').addEventListener('click', async () => {
+  await saveRemoteDir();
+  await refreshRemote();
+});
+
+async function refreshRemote() {
+  const list = $('remote-list');
+  list.innerHTML = '<p class="muted">Reading…</p>';
+  try {
+    state.remoteAlbums = await invoke('remote_albums');
+  } catch (err) {
+    list.innerHTML = '';
+    showError('sync-error', String(err));
+    return;
+  }
+  showError('sync-error', '');
+  renderRemoteList();
+}
+
+function renderRemoteList() {
+  const list = $('remote-list');
+  list.innerHTML = '';
+
+  if (!state.remoteAlbums.length) {
+    list.innerHTML = '<p class="muted">No albums here or on the remote yet.</p>';
+    return;
+  }
+
+  state.remoteAlbums.forEach((album) => {
+    const row = document.createElement('div');
+    row.className = 'remote-row';
+
+    const info = document.createElement('div');
+    info.className = 'remote-info';
+    const title = document.createElement('strong');
+    title.textContent = album.title || album.path;
+    info.appendChild(title);
+
+    // The two states a fresh machine cares about, named plainly.
+    if (!album.local) {
+      const badge = document.createElement('span');
+      badge.className = 'badge-new';
+      badge.textContent = 'not here yet';
+      info.appendChild(badge);
+    } else if (!album.remote) {
+      const badge = document.createElement('span');
+      badge.className = 'badge-new';
+      badge.textContent = 'not on server';
+      info.appendChild(badge);
+    }
+
+    const sub = document.createElement('div');
+    sub.className = 'remote-sub muted';
+    sub.textContent = album.remote
+      ? `${album.path} · ${album.file_count} file(s) on server`
+      : `${album.path} · local only`;
+    info.appendChild(sub);
+    row.appendChild(info);
+
+    const direction = document.createElement('select');
+    direction.title = 'How this album syncs';
+    [
+      ['', 'Not tracked'],
+      ['both', 'Both ways'],
+      ['push', 'Push only'],
+      ['pull', 'Pull only'],
+    ].forEach(([value, label]) => {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      direction.appendChild(opt);
+    });
+    direction.value = album.tracked || '';
+    direction.addEventListener('change', async () => {
+      try {
+        if (direction.value) {
+          await invoke('track_album', { path: album.path, direction: direction.value });
+        } else {
+          await invoke('untrack_album', { path: album.path });
+        }
+        album.tracked = direction.value || null;
+        status(direction.value
+          ? `${album.path} syncs ${direction.value}`
+          : `${album.path} is no longer synced`);
+      } catch (err) {
+        showError('sync-error', String(err));
+        direction.value = album.tracked || '';
+      }
+    });
+    row.appendChild(direction);
+
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+
+    const pull = document.createElement('button');
+    pull.className = 'btn btn-sm';
+    pull.textContent = album.local ? 'Pull' : 'Get';
+    pull.disabled = !album.remote;
+    pull.title = album.remote
+      ? 'Download the server’s version into this library'
+      : 'The server does not have this album';
+    pull.addEventListener('click', () => runSync(row, album.path, () =>
+      invoke('pull_album', { path: album.path })));
+    actions.appendChild(pull);
+
+    const push = document.createElement('button');
+    push.className = 'btn btn-sm';
+    push.textContent = album.remote ? 'Push' : 'Add to server';
+    push.disabled = !album.local;
+    push.addEventListener('click', () => runSync(row, album.path, () =>
+      pushWithDeleteCheck('push_album', album.path)));
+    actions.appendChild(push);
+
+    // Both-ways in one click, only for albums that are tracked both ways.
+    if (album.tracked === 'both') {
+      const sync = document.createElement('button');
+      sync.className = 'btn btn-sm btn-primary';
+      sync.textContent = 'Sync';
+      sync.title = 'Pull the server’s changes, then push this machine’s';
+      sync.addEventListener('click', () => runSync(row, album.path, () =>
+        pushWithDeleteCheck('sync_album', album.path, { direction: 'both' })));
+      actions.appendChild(sync);
+    }
+
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+/// Upload an album, then ask about anything the server still holds that the
+/// album no longer has.
+///
+/// The safe pass runs first and reports what it withheld, so the question names
+/// the real files. A plan made beforehand would be guessing: it reads the
+/// published tree as it was *before* this push rewrote it.
+async function pushWithDeleteCheck(command, path, extra = {}) {
+  const first = await invoke(command, { path, allowDeletes: false, ...extra });
+  const gone = first.withheld_deletes || [];
+  if (!gone.length) return first;
+
+  const ok = confirm(
+    `${gone.length} file(s) are on the server but no longer in this album:\n\n` +
+    `${gone.slice(0, 12).join('\n')}` +
+    `${gone.length > 12 ? `\n…and ${gone.length - 12} more` : ''}\n\n` +
+    'Remove them from the server? Cancel leaves them online.'
+  );
+  if (!ok) return first;
+
+  const second = await invoke(command, { path, allowDeletes: true, ...extra });
+  // The uploads happened in the first pass; report both halves as one result.
+  return {
+    ...second,
+    files_pushed: (first.files_pushed || 0) + (second.files_pushed || 0),
+    pushed: (first.pushed || 0) + (second.pushed || 0),
+    pulled: (first.pulled || 0) + (second.pulled || 0),
+    withheld_deletes: [],
+  };
+}
+
+/// Run one sync call with the row disabled, then report and refresh.
+async function runSync(row, path, fn) {
+  const buttons = [...row.querySelectorAll('button')];
+  buttons.forEach((b) => (b.disabled = true));
+  showError('sync-error', '');
+  status('Syncing…');
+  try {
+    const outcome = await fn();
+    reportOutcome(path, outcome);
+    await refreshAll();
+    await refreshRemote();
+  } catch (err) {
+    showError('sync-error', String(err));
+    status('Sync failed');
+    buttons.forEach((b) => (b.disabled = false));
+  }
+}
+
+$('sync-all-btn').addEventListener('click', async () => {
+  await saveRemoteDir();
+  showError('sync-error', '');
+  status('Syncing tracked albums…');
+  $('sync-all-btn').disabled = true;
+  try {
+    const results = await invoke('sync_all_tracked', { allowDeletes: false });
+    if (!results.length) {
+      $('sync-output').hidden = false;
+      $('sync-output').textContent =
+        'Nothing is tracked yet. Pick a direction for an album first.';
+      status('Nothing to sync');
+      return;
+    }
+    $('sync-output').hidden = false;
+    $('sync-output').textContent = results
+      .map(([path, o]) => `${path}: ${describeOutcome(o)}`)
+      .join('\n');
+    status(`Synced ${results.length} album(s)`);
+    await refreshAll();
+    await refreshRemote();
+  } catch (err) {
+    showError('sync-error', String(err));
+    status('Sync failed');
+  } finally {
+    $('sync-all-btn').disabled = false;
+  }
+});
+
+function describeOutcome(o) {
+  const bits = [];
+  // Pull and push outcomes carry different field names; both are shown here.
+  if (o.files_pulled) bits.push(`${o.files_pulled} pulled`);
+  if (o.photos_imported) bits.push(`${o.photos_imported} catalogued`);
+  if (o.files_pushed) bits.push(`${o.files_pushed} pushed`);
+  if (o.pulled) bits.push(`${o.pulled} pulled`);
+  if (o.pushed) bits.push(`${o.pushed} pushed`);
+  if (o.deleted) bits.push(`${o.deleted} deleted on server`);
+  if (o.deleted_remote) bits.push(`${o.deleted_remote} deleted on server`);
+  if (o.left_alone) bits.push(`${o.left_alone} left alone`);
+  if (o.skipped) bits.push(`${o.skipped} skipped`);
+  if (o.skipped_unchanged) bits.push(`${o.skipped_unchanged} unchanged`);
+  if (o.withheld_deletes?.length) bits.push(`${o.withheld_deletes.length} left on server`);
+  if (o.conflicts?.length) bits.push(`${o.conflicts.length} conflict(s)`);
+  if (o.failed?.length) bits.push(`${o.failed.length} failed`);
+  return bits.join(', ') || 'already up to date';
+}
+
+function reportOutcome(path, o) {
+  const summary = describeOutcome(o);
+  $('sync-output').hidden = false;
+  $('sync-output').textContent = `${path}: ${summary}` +
+    // Conflicts are never resolved for you — name the files so they can be.
+    (o.conflicts?.length
+      ? `\n\nChanged on both sides, nothing overwritten:\n  ${o.conflicts.join('\n  ')}`
+      : '');
+  status(summary);
+}
 
 boot();

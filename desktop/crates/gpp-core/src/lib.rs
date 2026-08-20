@@ -20,6 +20,7 @@ pub mod import;
 pub mod media;
 pub mod model;
 pub mod publish;
+pub mod remote;
 pub mod session;
 pub mod sync;
 

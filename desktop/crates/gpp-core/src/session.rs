@@ -51,6 +51,7 @@ pub struct PublishTarget {
 
 const SETTING_PUBLISH_DEST: &str = "publish.dest";
 const SETTING_PUBLISH_MIN_RATING: &str = "publish.min_rating";
+const SETTING_REMOTE_DIR: &str = "remote.dir";
 
 impl Session {
     pub fn new() -> Self {
@@ -266,6 +267,119 @@ impl Session {
         })
     }
 
+    // -------------------------------------------------------------- remote
+
+    /// Where the remote lives. A directory today (network share, external
+    /// drive, or a folder another tool keeps in sync); SFTP/HTTP transports
+    /// slot in behind the same trait later.
+    pub fn remote_dir(&self) -> Result<Option<String>> {
+        self.with(|lib| lib.get_setting(SETTING_REMOTE_DIR))
+    }
+
+    pub fn set_remote_dir(&self, dir: String) -> Result<()> {
+        self.with(|lib| lib.set_setting(SETTING_REMOTE_DIR, &dir))
+    }
+
+    fn transport(&self) -> Result<crate::sync::FsTransport> {
+        let dir = self
+            .remote_dir()?
+            .ok_or_else(|| Error::other("no remote configured"))?;
+        Ok(crate::sync::FsTransport::new(dir))
+    }
+
+    fn published_root(&self) -> Result<PathBuf> {
+        let target = self.publish_target()?;
+        target.dest.map(PathBuf::from).ok_or_else(|| {
+            // Sync goes through the published tree, so this error shows up in
+            // the sync panel too — say where to fix it.
+            Error::other(
+                "no publish destination configured — choose the gallery content folder \
+                 under Publish first",
+            )
+        })
+    }
+
+    /// Albums on the remote, annotated with what this machine knows about them.
+    pub fn remote_albums(&self) -> Result<Vec<crate::remote::RemoteAlbum>> {
+        let transport = self.transport()?;
+        self.with(|lib| crate::remote::remote_albums(lib, &transport))
+    }
+
+    /// Which albums this machine syncs, and in which direction.
+    pub fn album_subscriptions(&self) -> Result<Vec<crate::sync::AlbumSubscription>> {
+        self.with(|lib| lib.album_subscriptions())
+    }
+
+    pub fn track_album(&self, album_path: String, direction: crate::sync::SyncDirection) -> Result<()> {
+        self.with(|lib| lib.track_album(&album_path, direction))
+    }
+
+    pub fn untrack_album(&self, album_path: String) -> Result<()> {
+        self.with(|lib| lib.untrack_album(&album_path))
+    }
+
+    /// Preview one album's sync without moving anything.
+    pub fn plan_album_sync(
+        &self,
+        album_path: String,
+        direction: crate::sync::SyncDirection,
+    ) -> Result<crate::sync::SyncPlan> {
+        let transport = self.transport()?;
+        let root = self.published_root()?;
+        self.with(|lib| crate::remote::plan_album_sync(lib, &transport, &album_path, direction, &root))
+    }
+
+    /// Adopt an album from the remote into this library.
+    pub fn pull_album(&self, album_path: String) -> Result<crate::remote::PullOutcome> {
+        let transport = self.transport()?;
+        let root = self.published_root()?;
+        self.with(|lib| crate::remote::pull_album(lib, &transport, &album_path, &root))
+    }
+
+    /// Publish one album and upload it.
+    pub fn push_album(&self, album_path: String, allow_deletes: bool) -> Result<crate::remote::PushOutcome> {
+        let transport = self.transport()?;
+        let root = self.published_root()?;
+        let opts = self.publish_options()?;
+        self.with(|lib| {
+            crate::remote::push_album(lib, &transport, &album_path, &root, &opts, allow_deletes)
+        })
+    }
+
+    /// Sync one album in the requested direction.
+    pub fn sync_album(
+        &self,
+        album_path: String,
+        direction: crate::sync::SyncDirection,
+        allow_deletes: bool,
+    ) -> Result<crate::sync::SyncOutcome> {
+        let transport = self.transport()?;
+        let root = self.published_root()?;
+        let opts = self.publish_options()?;
+        self.with(|lib| {
+            crate::remote::sync_album(
+                lib, &transport, &album_path, direction, &root, &opts, allow_deletes,
+            )
+        })
+    }
+
+    /// Sync every subscribed album, each in its own direction.
+    pub fn sync_all_tracked(&self, allow_deletes: bool) -> Result<Vec<(String, crate::sync::SyncOutcome)>> {
+        let transport = self.transport()?;
+        let root = self.published_root()?;
+        let opts = self.publish_options()?;
+        self.with(|lib| {
+            crate::remote::sync_tracked_albums(lib, &transport, &root, &opts, allow_deletes)
+        })
+    }
+
+    fn publish_options(&self) -> Result<PublishOptions> {
+        Ok(PublishOptions {
+            min_rating: self.publish_target()?.min_rating,
+            ..Default::default()
+        })
+    }
+
     /// What a sync would do, without doing it.
     pub fn sync_plan(&self) -> Result<crate::sync::SyncPlan> {
         let target = self.publish_target()?;
@@ -413,5 +527,155 @@ mod tests {
 
         let plan = s.sync_plan().unwrap();
         assert!(!plan.is_destructive());
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use crate::sync::SyncDirection;
+
+    fn write_jpeg(path: &Path, w: u32, h: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::DynamicImage::new_rgb8(w, h)
+            .save_with_format(path, image::ImageFormat::Jpeg)
+            .unwrap();
+    }
+
+    /// A session wired to its own library, published tree and shared remote.
+    fn session_with(remote: &Path) -> (Session, tempfile::TempDir, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let published = tempfile::tempdir().unwrap();
+        let s = Session::new();
+        s.open_library(root.path()).unwrap();
+        s.set_publish_target(PublishTarget {
+            dest: Some(published.path().display().to_string()),
+            min_rating: None,
+        })
+        .unwrap();
+        s.set_remote_dir(remote.display().to_string()).unwrap();
+        (s, root, published)
+    }
+
+    #[test]
+    fn remote_operations_require_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let s = Session::new();
+        s.open_library(root.path()).unwrap();
+        // No remote set yet.
+        assert!(s.remote_albums().is_err());
+        assert!(s.pull_album("a".into()).is_err());
+    }
+
+    #[test]
+    fn session_drives_a_full_two_machine_exchange() {
+        let remote = tempfile::tempdir().unwrap();
+
+        // --- Machine A authors and pushes ---------------------------------
+        let (a, a_root, _a_pub) = session_with(remote.path());
+        write_jpeg(&a_root.path().join("2026/x/one.jpg"), 90, 60);
+        a.import(None, None).unwrap();
+        a.create_album(NewAlbum { path: "2026/x".into(), title: Some("Ex".into()), ..Default::default() })
+            .unwrap();
+        let ids: Vec<i64> = a.photos(PhotoFilter::default()).unwrap().iter().map(|p| p.id).collect();
+        a.add_to_album("2026/x".into(), ids).unwrap();
+        a.push_album("2026/x".into(), false).unwrap();
+
+        // A is now subscribed to the album it pushed.
+        let subs = a.album_subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].direction, SyncDirection::Push);
+
+        // --- Machine B discovers and pulls --------------------------------
+        let (b, _b_root, _b_pub) = session_with(remote.path());
+        let found = b.remote_albums().unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].local);
+        assert_eq!(found[0].title.as_deref(), Some("Ex"));
+
+        let pulled = b.pull_album("2026/x".into()).unwrap();
+        assert!(pulled.files_pulled >= 2);
+        assert_eq!(b.albums().unwrap().len(), 1);
+        assert_eq!(b.album_photos("2026/x".into()).unwrap().len(), 1);
+
+        // After pulling, B tracks it bidirectionally and sees it as local.
+        let after = b.remote_albums().unwrap();
+        assert!(after[0].local);
+        assert_eq!(after[0].tracked, Some(SyncDirection::Both));
+    }
+
+    #[test]
+    fn tracking_can_be_changed_and_removed() {
+        let remote = tempfile::tempdir().unwrap();
+        let (s, _root, _pub) = session_with(remote.path());
+
+        s.track_album("a".into(), SyncDirection::Pull).unwrap();
+        assert_eq!(s.album_subscriptions().unwrap()[0].direction, SyncDirection::Pull);
+
+        s.track_album("a".into(), SyncDirection::Push).unwrap();
+        assert_eq!(s.album_subscriptions().unwrap()[0].direction, SyncDirection::Push);
+
+        s.untrack_album("a".into()).unwrap();
+        assert!(s.album_subscriptions().unwrap().is_empty());
+    }
+
+    /// A chosen direction is the user's, not something an operation rewrites:
+    /// a pull-only machine must stay pull-only after it pulls.
+    #[test]
+    fn a_one_off_operation_never_overrules_the_chosen_direction() {
+        let remote = tempfile::tempdir().unwrap();
+
+        let (a, a_root, _a_pub) = session_with(remote.path());
+        write_jpeg(&a_root.path().join("2026/x/one.jpg"), 90, 60);
+        a.import(None, None).unwrap();
+        a.create_album(NewAlbum { path: "2026/x".into(), ..Default::default() }).unwrap();
+        let ids: Vec<i64> = a.photos(PhotoFilter::default()).unwrap().iter().map(|p| p.id).collect();
+        a.add_to_album("2026/x".into(), ids).unwrap();
+
+        // A tracks it both ways, then does a one-off push.
+        a.track_album("2026/x".into(), SyncDirection::Both).unwrap();
+        a.push_album("2026/x".into(), false).unwrap();
+        assert_eq!(
+            a.album_subscriptions().unwrap()[0].direction,
+            SyncDirection::Both,
+            "a push must not downgrade a both-ways album"
+        );
+
+        // B declares itself read-only, then pulls.
+        let (b, _b_root, _b_pub) = session_with(remote.path());
+        b.track_album("2026/x".into(), SyncDirection::Pull).unwrap();
+        b.pull_album("2026/x".into()).unwrap();
+        assert_eq!(
+            b.album_subscriptions().unwrap()[0].direction,
+            SyncDirection::Pull,
+            "a pull must not turn a read-only machine into one that pushes"
+        );
+    }
+
+    /// A local album the server has never seen must still be offered, or
+    /// "add an album from anywhere" would mean typing paths by hand.
+    #[test]
+    fn local_only_albums_are_listed_as_pushable() {
+        let remote = tempfile::tempdir().unwrap();
+        let (s, root, _pub) = session_with(remote.path());
+
+        write_jpeg(&root.path().join("2026/new/one.jpg"), 60, 40);
+        s.import(None, None).unwrap();
+        s.create_album(NewAlbum {
+            path: "2026/new".into(),
+            title: Some("Fresh".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let listed = s.remote_albums().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "2026/new");
+        assert!(listed[0].local, "it is in this catalog");
+        assert!(!listed[0].remote, "the server has never seen it");
+        assert_eq!(listed[0].file_count, 0);
+        // Listing is read-only: nothing was tracked or uploaded by looking.
+        assert!(s.album_subscriptions().unwrap().is_empty());
+        assert!(std::fs::read_dir(remote.path()).unwrap().next().is_none());
     }
 }
