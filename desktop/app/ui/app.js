@@ -909,6 +909,9 @@ function describeOutcome(o) {
   if (o.skipped) bits.push(`${o.skipped} skipped`);
   if (o.skipped_unchanged) bits.push(`${o.skipped_unchanged} unchanged`);
   if (o.withheld_deletes?.length) bits.push(`${o.withheld_deletes.length} left on server`);
+  if (o.folders_left_alone?.length) {
+    bits.push(`${o.folders_left_alone.length} shared folder(s) untouched`);
+  }
   if (o.conflicts?.length) bits.push(`${o.conflicts.length} conflict(s)`);
   if (o.failed?.length) bits.push(`${o.failed.length} failed`);
   return bits.join(', ') || 'already up to date';
@@ -921,6 +924,12 @@ function reportOutcome(path, o) {
     // Conflicts are never resolved for you — name the files so they can be.
     (o.conflicts?.length
       ? `\n\nChanged on both sides, nothing overwritten:\n  ${o.conflicts.join('\n  ')}`
+      : '') +
+    // A parent folder someone else configured is not this push's to rewrite.
+    (o.folders_left_alone?.length
+      ? `\n\nAlready on the server and configured elsewhere — left as they are:\n  ` +
+        `${o.folders_left_alone.join('\n  ')}\n` +
+        `Push a folder on its own row to change it.`
       : '');
   status(summary);
 }

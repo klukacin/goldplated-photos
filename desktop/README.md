@@ -34,7 +34,7 @@ containers — that is the point of keeping the GUI out of the core:
 
 ```bash
 cd desktop
-cargo test          # 86 tests
+cargo test          # 87 tests
 cargo clippy --all-targets
 cargo build --release -p gpp-cli
 ```
@@ -134,6 +134,22 @@ lands in its own directory — nothing is flattened.
 Only the path you name is subscribed. Pulling `2026/weddings` tracks
 `2026/weddings`; the `2026` folder comes along because the site needs it, not
 because this machine now wants every album of the year.
+
+A push creates a missing parent folder but never rewrites one the server
+already has — another machine may have named or password-protected it, and a
+leaf push makes no claim about that:
+
+```bash
+gpp push 2026/weddings/ivona-petar
+# 2 parent folder(s) already on the server, configured elsewhere — left alone:
+#   2026
+#   2026/weddings
+# push a folder directly to change it: gpp push <folder>
+```
+
+To change a shared folder, pull it first (adopting what is online), edit, then
+push — otherwise the two versions are a genuine conflict and nothing is
+overwritten.
 
 A pulled album keeps the server's `token`, so gallery access cookies and share
 links stay valid across machines. A one-off `pull` or `push` won't overrule a

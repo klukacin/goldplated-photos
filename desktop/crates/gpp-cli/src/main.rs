@@ -592,6 +592,16 @@ fn cmd_push(args: &[String]) -> Result<()> {
     for a in &outcome.albums {
         println!("  {a}");
     }
+    if !outcome.folders_left_alone.is_empty() {
+        println!(
+            "{} parent folder(s) already on the server, configured elsewhere — left alone:",
+            outcome.folders_left_alone.len()
+        );
+        for f in &outcome.folders_left_alone {
+            println!("  {f}");
+        }
+        println!("push a folder directly to change it: gpp push <folder>");
+    }
     if !outcome.withheld_deletes.is_empty() {
         println!(
             "{} file(s) on the server that this path no longer has:",

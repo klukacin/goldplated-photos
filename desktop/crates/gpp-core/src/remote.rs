@@ -71,6 +71,10 @@ pub struct PushOutcome {
     pub skipped: usize,
     /// Every album this operation touched, shallowest first.
     pub albums: Vec<String>,
+    /// Parent folders the server already had, configured differently from this
+    /// machine's copy. Left exactly as they were — push the folder itself to
+    /// change it on purpose.
+    pub folders_left_alone: Vec<String>,
 }
 
 /// List every album this machine could sync, from either side.
@@ -248,16 +252,25 @@ fn pull_one(
         if !is_direct_child(album_path, &change.path) {
             continue;
         }
-        match change.action {
+        let filename = change.path.rsplit('/').next().unwrap_or_default();
+        let is_metadata = filename == "index.md" || filename == "body.md";
+
+        // A pull is an explicit "adopt the server's version". For metadata that
+        // is unambiguous: index.md and body.md are *derived* from the catalog,
+        // which this function has just overwritten from the server anyway, so
+        // keeping the local bytes would only strand the file in a conflict it
+        // could never leave. Media is different — the published copy has a
+        // library original behind it, and that is never overwritten blindly.
+        let action = match &change.action {
+            Action::Conflict if is_metadata => &Action::Pull,
+            other => other,
+        };
+
+        match action {
             Action::Pull => {
                 let bytes = transport.get(&change.path)?;
                 let hash = blake3::hash(&bytes).to_hex().to_string();
 
-                // Media goes into the library; index.md/body.md are metadata we
-                // have already folded into the catalog, so they only need to
-                // exist in the published tree.
-                let filename = change.path.rsplit('/').next().unwrap_or_default();
-                let is_metadata = filename == "index.md" || filename == "body.md";
                 if !is_metadata {
                     let dest = album_dir.join(filename);
                     std::fs::write(&dest, &bytes).map_err(|e| Error::io(&dest, e))?;
@@ -282,28 +295,25 @@ fn pull_one(
     outcome.photos_imported = summary.imported + summary.updated;
 
     // --- 4. Membership and order -----------------------------------------
+    // Only photos sitting directly in this album's folder. A prefix match would
+    // make a collection swallow every photo of every album beneath it, and
+    // publishing would then copy them all into the collection's own directory.
     let photos = lib.photos(&crate::model::PhotoFilter {
         text: None,
         ..Default::default()
     })?;
-    let prefix = format!("{album_path}/");
-    let ids: Vec<i64> = photos
+    let own: Vec<&crate::model::Photo> = photos
         .iter()
-        .filter(|p| p.rel_path.starts_with(&prefix))
-        .map(|p| p.id)
+        .filter(|p| is_direct_child(album_path, &p.rel_path))
         .collect();
-    lib.add_photos_to_album(album_path, &ids)?;
+
+    lib.add_photos_to_album(album_path, &own.iter().map(|p| p.id).collect::<Vec<_>>())?;
 
     if !parsed.photo_order.is_empty() {
         let ordered: Vec<i64> = parsed
             .photo_order
             .iter()
-            .filter_map(|name| {
-                photos
-                    .iter()
-                    .find(|p| p.rel_path.starts_with(&prefix) && &p.filename == name)
-                    .map(|p| p.id)
-            })
+            .filter_map(|name| own.iter().find(|p| &p.filename == name).map(|p| p.id))
             .collect();
         lib.reorder_album(album_path, &ordered)?;
     }
@@ -406,10 +416,16 @@ pub fn push_path(
             continue;
         }
         publish::publish_album(lib, &ancestor, published_root, publish_opts)?;
-        if push_one_file(lib, transport, &format!("{ancestor}/index.md"), published_root)? {
-            total.files_pushed += 1;
+        match create_remote_index_if_absent(
+            lib, transport, &ancestor, published_root,
+        )? {
+            AncestorResult::Created => {
+                total.files_pushed += 1;
+                total.albums.push(ancestor);
+            }
+            AncestorResult::AlreadyThere => total.albums.push(ancestor),
+            AncestorResult::LeftAlone => total.folders_left_alone.push(ancestor),
         }
-        total.albums.push(ancestor);
     }
 
     // 2. The path itself and everything under it, parents first.
@@ -452,24 +468,47 @@ pub fn push_path(
     Ok(total)
 }
 
-/// Upload one published file if the server's copy differs. Returns whether it
-/// was sent. Used for ancestor `index.md` only — it never deletes.
-fn push_one_file(
+/// What happened to one ancestor folder during a push.
+enum AncestorResult {
+    /// The server had no such folder; ours now makes the album reachable.
+    Created,
+    /// The server's copy is byte-identical to ours. Nothing to do.
+    AlreadyThere,
+    /// The server has its own version. Deliberately not touched.
+    LeftAlone,
+}
+
+/// Create an ancestor folder's `index.md` on the server **only if it is absent**.
+///
+/// Pushing `2026/weddings/ana-ivan` needs `2026/weddings` to exist, and that is
+/// the entire claim it makes. It is not a claim about that folder's title,
+/// password or internal token — another machine may have configured those, and
+/// this one auto-generated its own when it created the album locally.
+/// Overwriting would silently reset a shared folder's settings and invalidate
+/// the access cookies that reference its token.
+///
+/// To change a folder deliberately, push that folder: `gpp push 2026/weddings`
+/// puts it inside the plan's scope, where three-way reconciliation applies.
+fn create_remote_index_if_absent(
     lib: &Library,
     transport: &dyn RemoteTransport,
-    key: &str,
+    album_path: &str,
     published_root: &Path,
-) -> Result<bool> {
-    let path = published_root.join(key);
+) -> Result<AncestorResult> {
+    let key = format!("{album_path}/index.md");
+    let path = published_root.join(&key);
     let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
     let hash = blake3::hash(&bytes).to_hex().to_string();
 
-    if transport.manifest()?.get(key) == Some(&hash) {
-        return Ok(false);
+    match transport.manifest()?.get(&key) {
+        Some(remote_hash) if *remote_hash == hash => Ok(AncestorResult::AlreadyThere),
+        Some(_) => Ok(AncestorResult::LeftAlone),
+        None => {
+            transport.put(&key, &bytes)?;
+            lib.record_synced(&key, &hash)?;
+            Ok(AncestorResult::Created)
+        }
     }
-    transport.put(key, &bytes)?;
-    lib.record_synced(key, &hash)?;
-    Ok(true)
 }
 
 /// Sync a whole path in the requested direction.
@@ -583,6 +622,7 @@ pub fn push_album(
         conflicts: outcome_inner.conflicts,
         skipped: outcome_inner.skipped,
         albums: vec![album_path.to_string()],
+        folders_left_alone: Vec::new(),
     })
 }
 

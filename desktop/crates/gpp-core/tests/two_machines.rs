@@ -280,6 +280,12 @@ fn pulling_a_folder_brings_its_albums_and_keeps_them_apart() {
     assert_eq!(b.lib.album_photos("2026/weddings/ana-ivan").unwrap().len(), 1);
     assert_eq!(b.lib.album_photos("2026/weddings/mia-luka").unwrap().len(), 1);
 
+    // A collection holds sub-albums, not photos. A prefix match here would make
+    // `2026/weddings` claim every photo beneath it, and publishing would then
+    // copy them all into the collection's own folder.
+    assert_eq!(b.lib.album_photos("2026/weddings").unwrap().len(), 0);
+    assert_eq!(b.lib.album_photos("2026").unwrap().len(), 0);
+
     // The events branch was outside the requested path: not adopted at all.
     assert!(b.lib.album_by_path("2026/events").unwrap().is_none());
     assert!(b.lib.album_by_path("2026/events/konferencija").unwrap().is_none());
@@ -290,4 +296,97 @@ fn pulling_a_folder_brings_its_albums_and_keeps_them_apart() {
     )
     .unwrap();
     assert!(server.get("2026/events/konferencija/k1.jpg").is_ok(), "other branch survived");
+}
+
+/// A machine pushing a deep album needs its parent folders to exist. That is
+/// the whole claim — not a claim about how those folders are configured. Two
+/// machines each auto-create their own `2026`, with different tokens; the one
+/// that pushes second must not reset the first one's folder.
+#[test]
+fn pushing_an_album_never_rewrites_a_shared_parent_folder() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    // A configures the shared folder deliberately and pushes it.
+    let a = machine();
+    author_album(&a, "2026/weddings/ana-ivan", &["a1.jpg"]);
+    a.lib
+        .update_album(
+            "2026/weddings",
+            &gpp_core::albums::AlbumUpdate {
+                title: Some("Vjenčanja 2026".into()),
+                password: Some(Some("tajna".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    remote::push_path(&a.lib, &server, "2026/weddings", a.published_root(), &opts, false).unwrap();
+
+    let before = String::from_utf8(server.get("2026/weddings/index.md").unwrap()).unwrap();
+    assert!(before.contains("Vjenčanja 2026"));
+    assert!(before.contains("tajna"));
+
+    // B has never pulled. It authored its own album in the same tree, so it has
+    // its own `2026/weddings` row with its own token, title and no password.
+    let b = machine();
+    author_album(&b, "2026/weddings/mia-luka", &["m1.jpg"]);
+    let pushed = remote::push_path(
+        &b.lib, &server, "2026/weddings/mia-luka", b.published_root(), &opts, false,
+    )
+    .unwrap();
+
+    // B's album is there…
+    assert!(server.get("2026/weddings/mia-luka/m1.jpg").is_ok());
+    // …and A's folder settings are untouched, byte for byte.
+    let after = String::from_utf8(server.get("2026/weddings/index.md").unwrap()).unwrap();
+    assert_eq!(before, after, "a leaf push must not reconfigure the folder");
+    // Both shared folders are reported: B generated its own token for each of
+    // them locally, so neither matches what the server already holds.
+    assert_eq!(
+        pushed.folders_left_alone,
+        vec!["2026".to_string(), "2026/weddings".to_string()]
+    );
+    // The album itself is not a "folder left alone" — it was pushed.
+    assert!(pushed.albums.contains(&"2026/weddings/mia-luka".to_string()));
+
+    // Pushing the folder itself puts it inside the plan's scope, where the two
+    // divergent versions are a genuine conflict. The engine refuses to pick a
+    // winner rather than overwriting A's settings.
+    let direct = remote::push_path(
+        &b.lib, &server, "2026/weddings", b.published_root(), &opts, false,
+    )
+    .unwrap();
+    assert_eq!(direct.conflicts, vec!["2026/weddings/index.md".to_string()]);
+    assert_eq!(
+        before,
+        String::from_utf8(server.get("2026/weddings/index.md").unwrap()).unwrap(),
+        "a conflict resolves to leaving the server alone"
+    );
+
+    // The way to take over a folder is to adopt it first, then edit and push —
+    // so the change is made on top of what is actually online.
+    remote::pull_path(&b.lib, &server, "2026/weddings", b.published_root()).unwrap();
+    assert_eq!(
+        b.lib.album_by_path("2026/weddings").unwrap().unwrap().title,
+        "Vjenčanja 2026",
+        "B adopted A's folder settings"
+    );
+    b.lib
+        .update_album(
+            "2026/weddings",
+            &gpp_core::albums::AlbumUpdate {
+                title: Some("Vjenčanja".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let edited = remote::push_path(
+        &b.lib, &server, "2026/weddings", b.published_root(), &opts, false,
+    )
+    .unwrap();
+    assert!(edited.conflicts.is_empty(), "no conflict once B is up to date");
+    let now = String::from_utf8(server.get("2026/weddings/index.md").unwrap()).unwrap();
+    assert!(now.contains("title: \"Vjenčanja\""));
+    assert!(now.contains("tajna"), "A's password survived B's rename");
 }
