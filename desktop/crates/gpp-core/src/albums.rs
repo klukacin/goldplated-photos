@@ -6,40 +6,75 @@
 
 use rand::Rng;
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::catalog::{album_from_row, Library, ALBUM_COLS};
 use crate::error::{Error, Result};
 use crate::model::Album;
 
 /// Fields settable when creating an album. Everything else takes a default.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NewAlbum {
     pub path: String,
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub date: Option<String>,
+    #[serde(default)]
     pub is_collection: bool,
+}
+
+/// Distinguish "field absent" from "field explicitly null" when deserializing.
+///
+/// Plain `Option<Option<T>>` collapses `null` to the outer `None`, which would
+/// make clearing a field impossible over JSON. With this, the UI can send
+/// `{"password": null}` to clear and omit the key to leave it alone.
+fn double_option<'de, T, D>(de: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
 }
 
 /// Partial update. `None` leaves a field untouched; `Some(None)` clears it.
 /// This mirrors the merge semantics the web admin uses, so a partial form can
 /// never wipe a field it doesn't know about.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AlbumUpdate {
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
     pub description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub date: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub password: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub share_token: Option<Option<String>>,
+    #[serde(default)]
     pub sort: Option<String>,
+    #[serde(default)]
     pub style: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
     pub cover_photo_id: Option<Option<i64>>,
+    #[serde(default)]
     pub is_collection: Option<bool>,
+    #[serde(default)]
     pub hidden: Option<bool>,
+    #[serde(default)]
     pub allow_download: Option<bool>,
+    #[serde(default)]
     pub proofing: Option<bool>,
+    #[serde(default, deserialize_with = "double_option")]
     pub sort_order: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
     pub body: Option<Option<String>>,
+    #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
 
@@ -583,5 +618,33 @@ mod tests {
         // Explicit order wins
         l.reorder_siblings(&["b".into(), "a".into()]).unwrap();
         assert_eq!(l.albums().unwrap()[0].path, "b");
+    }
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    /// The UI must be able to say "leave it alone" and "clear it" distinctly.
+    #[test]
+    fn absent_field_differs_from_explicit_null() {
+        let untouched: AlbumUpdate = serde_json::from_str(r#"{"title":"X"}"#).unwrap();
+        assert_eq!(untouched.title.as_deref(), Some("X"));
+        assert!(untouched.password.is_none(), "absent = leave alone");
+
+        let cleared: AlbumUpdate = serde_json::from_str(r#"{"password":null}"#).unwrap();
+        assert_eq!(cleared.password, Some(None), "null = clear");
+
+        let set: AlbumUpdate = serde_json::from_str(r#"{"password":"s3cret"}"#).unwrap();
+        assert_eq!(set.password, Some(Some("s3cret".into())));
+    }
+
+    #[test]
+    fn new_album_accepts_camel_case_from_the_ui() {
+        let a: NewAlbum =
+            serde_json::from_str(r#"{"path":"2026/x","isCollection":true}"#).unwrap();
+        assert_eq!(a.path, "2026/x");
+        assert!(a.is_collection);
+        assert!(a.title.is_none());
     }
 }

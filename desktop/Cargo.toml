@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/gpp-core", "crates/gpp-cli"]
+# The Tauri shell needs platform webview toolkits (WKWebView on macOS,
+# WebView2 on Windows, WebKitGTK on Linux). Keeping it out of the workspace
+# means `cargo test` still runs the core anywhere, including CI containers
+# without those libraries.
+exclude = ["app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

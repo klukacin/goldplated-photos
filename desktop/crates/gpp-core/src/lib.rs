@@ -20,6 +20,7 @@ pub mod import;
 pub mod media;
 pub mod model;
 pub mod publish;
+pub mod session;
 pub mod sync;
 
 pub use error::{Error, Result};
@@ -27,3 +28,7 @@ pub use model::{Album, Flag, Photo, PhotoFilter, PhotoKind};
 
 /// Library handle — the entry point for everything.
 pub use catalog::Library;
+
+/// Application session — one method per UI command. The desktop and mobile
+/// shells are thin wrappers over this.
+pub use session::Session;

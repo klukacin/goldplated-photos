@@ -7,6 +7,7 @@ on:
 
 jobs:
   ci:
+    name: Web gallery
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,3 +35,31 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  desktop-core:
+    name: Desktop core (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      # The Tauri shell is excluded from the workspace on purpose — it needs a
+      # platform webview toolkit. The core and CLI build anywhere.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Release build (CLI)
+        run: cargo build --release -p gpp-cli
