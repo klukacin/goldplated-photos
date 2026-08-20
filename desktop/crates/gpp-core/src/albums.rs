@@ -146,6 +146,11 @@ impl Library {
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| title_from_path(&path));
 
+        // The folders above this album have to exist as collections, or the
+        // gallery cannot navigate to it. Recursion terminates: each call is one
+        // segment shorter, and a one-segment path has no ancestors.
+        self.ensure_collection_chain(&path)?;
+
         self.with_conn(|c| {
             c.execute(
                 "INSERT INTO albums(path, parent_path, title, description, date, token, \
@@ -167,6 +172,36 @@ impl Library {
 
         self.album_by_path(&path)?
             .ok_or_else(|| Error::AlbumNotFound(path))
+    }
+
+    /// Create a collection row for every missing folder above `path`.
+    ///
+    /// The gallery navigates by folder: `/photos` lists direct children of the
+    /// root, each collection lists its own. An album at `2026/weddings/ana` with
+    /// no `2026` and no `2026/weddings` is reachable only by typing its URL, and
+    /// access inheritance has no ancestor to inherit from. So the chain is not
+    /// decoration — it is what makes the album part of the site.
+    ///
+    /// Returns the paths it created, shallowest first.
+    pub fn ensure_collection_chain(&self, path: &str) -> Result<Vec<String>> {
+        let path = normalize_path(path)?;
+        let segments: Vec<&str> = path.split('/').collect();
+        let mut created = Vec::new();
+
+        // Every prefix except the path itself — the leaf is the caller's own.
+        for depth in 1..segments.len() {
+            let ancestor = segments[..depth].join("/");
+            if self.album_by_path(&ancestor)?.is_some() {
+                continue;
+            }
+            self.create_album(&NewAlbum {
+                path: ancestor.clone(),
+                is_collection: true,
+                ..Default::default()
+            })?;
+            created.push(ancestor);
+        }
+        Ok(created)
     }
 
     pub fn album_by_path(&self, path: &str) -> Result<Option<Album>> {
@@ -317,6 +352,10 @@ impl Library {
                 "cannot move {from} inside itself"
             )));
         }
+
+        // Moving into a folder that doesn't exist yet must create it, same as
+        // creating an album there would.
+        self.ensure_collection_chain(&to)?;
 
         let descendant_prefix = format!("{from}/");
         self.with_tx(|tx| {
@@ -508,6 +547,34 @@ mod tests {
         assert_eq!(a.title, "Ana i ivan");
         assert_eq!(a.parent_path.as_deref(), Some("2026"));
         assert!(!a.token.is_empty());
+    }
+
+    /// The gallery navigates by folder, so the folders have to exist. Creating
+    /// a deep album creates them, and a second album in the same tree reuses
+    /// them rather than failing on the duplicate.
+    #[test]
+    fn creating_a_deep_album_creates_the_folders_above_it() {
+        let l = lib();
+        l.create_album(&new_album("2026/weddings/ana-ivan")).unwrap();
+
+        let year = l.album_by_path("2026").unwrap().expect("2026 exists");
+        let weddings = l
+            .album_by_path("2026/weddings")
+            .unwrap()
+            .expect("2026/weddings exists");
+        assert!(year.is_collection);
+        assert!(weddings.is_collection);
+        assert_eq!(weddings.parent_path.as_deref(), Some("2026"));
+        assert_eq!(weddings.title, "Weddings");
+
+        // A sibling reuses the same folders.
+        l.create_album(&new_album("2026/weddings/mia-luka")).unwrap();
+        assert_eq!(l.albums().unwrap().len(), 4);
+
+        // Moving into a new branch creates that branch too.
+        l.move_album("2026/weddings/mia-luka", "2027/spring/mia-luka")
+            .unwrap();
+        assert!(l.album_by_path("2027/spring").unwrap().unwrap().is_collection);
     }
 
     #[test]

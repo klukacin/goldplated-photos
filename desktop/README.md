@@ -22,6 +22,7 @@ desktop/
 | Publish to the Astro gallery (access, proofing, download flags) | done |
 | Sync planning that cannot wipe another machine's albums | done |
 | Per-album two-way sync: adopt an album, contribute one, from any machine | done |
+| Paths stay whole: folders travel with their albums, both directions | done |
 | RAW decoding, develop pipeline | not yet — `RawDecoder` trait is in place |
 
 ---
@@ -33,7 +34,7 @@ containers — that is the point of keeping the GUI out of the core:
 
 ```bash
 cd desktop
-cargo test          # 83 tests
+cargo test          # 86 tests
 cargo clippy --all-targets
 cargo build --release -p gpp-cli
 ```
@@ -111,15 +112,28 @@ deleted — which is what lets a laptop carry three albums out of two hundred.
 gpp remote --remote /Volumes/gallery --dest ../src/content/albums
 
 gpp remote                                 # what's here, what's there
-# ALBUM                  FILES  LOCAL   REMOTE  SYNC
-# 2026/ana-ivan              7  —       yes     not tracked      ← can adopt
-# 2026/marko                 0  yes     —       not tracked      ← can contribute
+# ALBUM                       FILES  LOCAL   REMOTE  SYNC
+# 2026                           10  —       yes     not tracked
+# 2026/weddings                   6  —       yes     not tracked   ← a folder
+# 2026/weddings/ana-ivan          3  —       yes     not tracked   ← can adopt
+# 2026/marko                      0  yes     —       not tracked   ← can contribute
 
-gpp pull 2026/ana-ivan                     # adopt: settings, photos, order
+gpp pull 2026/weddings/ana-ivan            # adopt: settings, photos, order
+gpp pull 2026/weddings                     # or a whole folder at once
 gpp push 2026/marko                        # contribute one of your own
-gpp sync 2026/ana-ivan --both              # from then on, both ways
-gpp sync                                   # every tracked album, its own way
+gpp sync 2026/weddings --both              # from then on, both ways
+gpp sync                                   # every tracked path, its own way
 ```
+
+**Paths stay whole.** `pull` and `push` take a path, not just a leaf, and always
+carry the folders above it: pushing `2026/weddings/ana-ivan` puts `2026/index.md`
+and `2026/weddings/index.md` on the server too, because without them the gallery
+cannot navigate to the album. Pulling brings those folders back, and every album
+lands in its own directory — nothing is flattened.
+
+Only the path you name is subscribed. Pulling `2026/weddings` tracks
+`2026/weddings`; the `2026` folder comes along because the site needs it, not
+because this machine now wants every album of the year.
 
 A pulled album keeps the server's `token`, so gallery access cookies and share
 links stay valid across machines. A one-off `pull` or `push` won't overrule a
@@ -152,7 +166,7 @@ asserted by a test (`publish::tests::emitted_fields_are_a_subset_of_the_site_sch
 so a drift fails the build instead of producing an album the site refuses to
 render.
 
-Two things the app deliberately never touches:
+Three things the app deliberately never touches:
 
 - **`.meta/proofing/`** — client selections are written on the server. They are
   pull-only and excluded from every manifest.

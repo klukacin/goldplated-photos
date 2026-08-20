@@ -270,7 +270,30 @@ working no matter which machine last published the album.
 A one-off pull or push starts tracking an album only when nothing was chosen for
 it yet — an operation never overrules a direction the user set.
 
-### 6.2 Removing a photo, safely
+### 6.2 Paths travel whole
+
+The gallery navigates by folder: `/photos` lists the root's direct children,
+each collection lists its own. An album at `2026/weddings/ana-ivan` whose
+`2026` and `2026/weddings` do not exist is reachable only by typing its URL,
+and access inheritance has no ancestor to inherit from. The folder chain is
+therefore part of the album, not decoration around it.
+
+Three places enforce that:
+
+- **Authoring** — `create_album` (and `move_album`) call
+  `ensure_collection_chain`, so a deep path creates its folders as collections.
+- **Pushing** — `push_path` sends each ancestor's `index.md` before the subtree.
+  Ancestors are sent one file at a time, never as a prefix scope: a scope on
+  `2026` would sweep in albums belonging to other machines.
+- **Pulling** — `pull_path` walks parents first, then the path, then everything
+  under it, giving each album its own folder. Pulling a collection can never
+  flatten its sub-albums into one directory.
+
+Subscriptions stay narrow while paths stay whole: only the path the user named
+is tracked. Its folders come along because the site needs them, not because the
+machine now wants every album underneath them.
+
+### 6.3 Removing a photo, safely
 
 Deleting is the one thing three-way state can get catastrophically wrong, so it
 goes through two gates.

@@ -4,9 +4,13 @@
 //! server holds, *adopt* an album it has never seen, and *contribute* one of
 //! its own — all without either side mirroring the other.
 //!
-//! Everything here is scoped to a single album. Nothing outside the album's
-//! subtree is read, written or deleted, which is what keeps a machine holding
-//! three albums out of two hundred safe.
+//! Two levels of granularity: `*_album` works on one album's own files, and
+//! `*_path` works on a whole path — the folders above it, the album or
+//! collection itself, and everything under it. The path form is the one the UI
+//! uses, because an album without its folders is unreachable in the gallery.
+//!
+//! Nothing outside the requested path is read, written or deleted, which is
+//! what keeps a machine holding three albums out of two hundred safe.
 
 use std::path::Path;
 
@@ -34,6 +38,11 @@ pub struct RemoteAlbum {
     pub remote: bool,
     /// Whether this machine syncs it, and in which direction.
     pub tracked: Option<SyncDirection>,
+    /// A folder that holds sub-albums rather than photos. Shown as part of the
+    /// tree so a path can be synced whole.
+    pub is_collection: bool,
+    /// How deep the path sits, for indentation.
+    pub depth: usize,
 }
 
 /// What a pull produced.
@@ -44,6 +53,9 @@ pub struct PullOutcome {
     pub photos_imported: usize,
     pub skipped_unchanged: usize,
     pub conflicts: Vec<String>,
+    /// Every album this operation touched, shallowest first: the folders above
+    /// the path, the path itself, and everything under it.
+    pub albums: Vec<String>,
 }
 
 /// What a push produced.
@@ -57,6 +69,8 @@ pub struct PushOutcome {
     pub withheld_deletes: Vec<String>,
     pub conflicts: Vec<String>,
     pub skipped: usize,
+    /// Every album this operation touched, shallowest first.
+    pub albums: Vec<String>,
 }
 
 /// List every album this machine could sync, from either side.
@@ -74,13 +88,14 @@ pub fn remote_albums(lib: &Library, transport: &dyn RemoteTransport) -> Result<V
         let scope = SyncScope::with(vec![path.clone()]);
         let file_count = scope.filter(&manifest).len();
 
-        // Read the title straight from the remote index.md — cheap and it means
-        // the picker shows real names, not slugs.
-        let title = transport
+        // Read straight from the remote index.md — cheap, and it means the
+        // picker shows real names and real folders, not slugs and guesses.
+        let parsed = transport
             .get(&format!("{path}/index.md"))
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| parse_frontmatter(&text).title);
+            .map(|text| parse_frontmatter(&text))
+            .unwrap_or_default();
 
         out.push(RemoteAlbum {
             local: lib.album_by_path(&path)?.is_some(),
@@ -89,8 +104,10 @@ pub fn remote_albums(lib: &Library, transport: &dyn RemoteTransport) -> Result<V
                 .iter()
                 .find(|s| s.album_path == path)
                 .map(|s| s.direction),
+            is_collection: parsed.is_collection,
+            depth: path.matches('/').count(),
+            title: parsed.title,
             path,
-            title,
             file_count,
         });
     }
@@ -99,7 +116,7 @@ pub fn remote_albums(lib: &Library, transport: &dyn RemoteTransport) -> Result<V
     // is what makes "add an album from anywhere" a one-click push instead of a
     // path typed by hand.
     for album in lib.albums()? {
-        if album.is_collection || out.iter().any(|a| a.path == album.path) {
+        if out.iter().any(|a| a.path == album.path) {
             continue;
         }
         out.push(RemoteAlbum {
@@ -107,6 +124,8 @@ pub fn remote_albums(lib: &Library, transport: &dyn RemoteTransport) -> Result<V
                 .iter()
                 .find(|s| s.album_path == album.path)
                 .map(|s| s.direction),
+            is_collection: album.is_collection,
+            depth: album.path.matches('/').count(),
             path: album.path,
             title: Some(album.title),
             file_count: 0,
@@ -140,6 +159,22 @@ pub fn plan_album_sync(
 /// download the photos into `<library>/<album-path>/`, import them so they are
 /// first-class catalog entries, then restore the album's photo order.
 pub fn pull_album(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    album_path: &str,
+    published_root: &Path,
+) -> Result<PullOutcome> {
+    let outcome = pull_one(lib, transport, album_path, published_root)?;
+    track_default(lib, album_path, SyncDirection::Both)?;
+    Ok(outcome)
+}
+
+/// Pull one album without subscribing to it.
+///
+/// Separate from [`pull_album`] because pulling a path also pulls the folders
+/// above it, and those folders must not quietly become subscriptions — a
+/// subscription on `2026` would drag in every album of the year.
+fn pull_one(
     lib: &Library,
     transport: &dyn RemoteTransport,
     album_path: &str,
@@ -207,6 +242,12 @@ pub fn pull_album(
     let plan = sync::plan_album(album_path, SyncDirection::Pull, &local, &synced, &remote);
 
     for change in &plan.changes {
+        // This album's own files only. A sub-album's photos belong in the
+        // sub-album's folder, not flattened into this one — `pull_path` walks
+        // the tree and gives each album its own turn.
+        if !is_direct_child(album_path, &change.path) {
+            continue;
+        }
         match change.action {
             Action::Pull => {
                 let bytes = transport.get(&change.path)?;
@@ -267,9 +308,236 @@ pub fn pull_album(
         lib.reorder_album(album_path, &ordered)?;
     }
 
-    track_default(lib, album_path, SyncDirection::Both)?;
     lib.mark_album_synced(album_path)?;
+    outcome.albums.push(album_path.to_string());
     Ok(outcome)
+}
+
+// ------------------------------------------------------------- whole paths
+//
+// Everything above works on one album. These work on a *path*: the folders
+// above it, the album or collection itself, and everything under it — because
+// an album without its folders is not reachable in the gallery, and a folder
+// without its albums is empty.
+
+/// Folder paths above `path`, shallowest first. `2026/weddings/ana` yields
+/// `["2026", "2026/weddings"]`.
+pub fn ancestors_of(path: &str) -> Vec<String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    (1..segments.len())
+        .map(|depth| segments[..depth].join("/"))
+        .collect()
+}
+
+/// True when `candidate` is `path` itself or lives under it.
+fn at_or_under(path: &str, candidate: &str) -> bool {
+    candidate == path || candidate.starts_with(&format!("{path}/"))
+}
+
+/// Sort album paths so a parent always comes before its children.
+fn shallowest_first(paths: &mut [String]) {
+    paths.sort_by_key(|p| (p.matches('/').count(), p.clone()));
+}
+
+/// Adopt a whole path: its folders, itself, and everything under it.
+///
+/// Ordering matters — a child album created before its parent collection would
+/// leave the gallery unable to navigate to it, so parents are pulled first.
+pub fn pull_path(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    published_root: &Path,
+) -> Result<PullOutcome> {
+    let remote = transport.manifest()?;
+    let on_server = sync::albums_in_manifest(&remote);
+
+    let mut targets: Vec<String> = ancestors_of(path)
+        .into_iter()
+        .filter(|a| on_server.contains(a))
+        .collect();
+    targets.extend(on_server.iter().filter(|a| at_or_under(path, a)).cloned());
+    targets.dedup();
+    shallowest_first(&mut targets);
+
+    if targets.is_empty() {
+        return Err(Error::AlbumNotFound(format!("{path} (on the remote)")));
+    }
+
+    let mut total = PullOutcome {
+        album_path: path.to_string(),
+        ..Default::default()
+    };
+    for album in targets {
+        let one = pull_one(lib, transport, &album, published_root)?;
+        total.files_pulled += one.files_pulled;
+        total.photos_imported += one.photos_imported;
+        total.skipped_unchanged += one.skipped_unchanged;
+        total.conflicts.extend(one.conflicts);
+        total.albums.push(album);
+    }
+
+    // Only the path the caller named is subscribed. Its folders came along
+    // because the gallery needs them, not because this machine wants the rest
+    // of what lives under them.
+    track_default(lib, path, SyncDirection::Both)?;
+    Ok(total)
+}
+
+/// Contribute a whole path: its folders, itself, and everything under it.
+pub fn push_path(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+) -> Result<PushOutcome> {
+    let mut total = PushOutcome {
+        album_path: path.to_string(),
+        ..Default::default()
+    };
+
+    // 1. The folders above the path. Only their index.md is sent, one file at a
+    //    time — never a prefix scope, which would sweep in albums under the same
+    //    folder that belong to other machines.
+    for ancestor in ancestors_of(path) {
+        if lib.album_by_path(&ancestor)?.is_none() {
+            continue;
+        }
+        publish::publish_album(lib, &ancestor, published_root, publish_opts)?;
+        if push_one_file(lib, transport, &format!("{ancestor}/index.md"), published_root)? {
+            total.files_pushed += 1;
+        }
+        total.albums.push(ancestor);
+    }
+
+    // 2. The path itself and everything under it, parents first.
+    let mut subtree: Vec<String> = lib
+        .albums()?
+        .into_iter()
+        .map(|a| a.path)
+        .filter(|p| at_or_under(path, p))
+        .collect();
+    shallowest_first(&mut subtree);
+
+    if subtree.is_empty() {
+        return Err(Error::AlbumNotFound(path.to_string()));
+    }
+    for album in &subtree {
+        publish::publish_album(lib, album, published_root, publish_opts)?;
+    }
+
+    // One plan for the whole subtree: the scope is the path, so nothing outside
+    // it is even considered, let alone deleted.
+    let local = publish::manifest_of(published_root)?;
+    let synced = lib.synced_manifest()?;
+    let remote = transport.manifest()?;
+    let plan = sync::plan_album(path, SyncDirection::Push, &local, &synced, &remote);
+    let applied = sync::apply(lib, transport, &plan, published_root, allow_deletes)?;
+
+    for album in &subtree {
+        lib.mark_album_synced(album)?;
+    }
+    // One subscription, for the path that was asked for — not one per album
+    // underneath it.
+    track_default(lib, path, SyncDirection::Push)?;
+
+    total.files_pushed += applied.pushed;
+    total.deleted_remote = applied.deleted;
+    total.withheld_deletes = applied.withheld_deletes;
+    total.conflicts = applied.conflicts;
+    total.skipped = applied.skipped;
+    total.albums.extend(subtree);
+    Ok(total)
+}
+
+/// Upload one published file if the server's copy differs. Returns whether it
+/// was sent. Used for ancestor `index.md` only — it never deletes.
+fn push_one_file(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    key: &str,
+    published_root: &Path,
+) -> Result<bool> {
+    let path = published_root.join(key);
+    let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+
+    if transport.manifest()?.get(key) == Some(&hash) {
+        return Ok(false);
+    }
+    transport.put(key, &bytes)?;
+    lib.record_synced(key, &hash)?;
+    Ok(true)
+}
+
+/// Sync a whole path in the requested direction.
+pub fn sync_path(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    direction: SyncDirection,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+) -> Result<sync::SyncOutcome> {
+    match direction {
+        SyncDirection::Pull => {
+            let pulled = pull_path(lib, transport, path, published_root)?;
+            Ok(sync::SyncOutcome {
+                pulled: pulled.files_pulled,
+                conflicts: pulled.conflicts,
+                ..Default::default()
+            })
+        }
+        SyncDirection::Push => {
+            let pushed = push_path(
+                lib, transport, path, published_root, publish_opts, allow_deletes,
+            )?;
+            Ok(sync::SyncOutcome {
+                pushed: pushed.files_pushed,
+                deleted: pushed.deleted_remote,
+                withheld_deletes: pushed.withheld_deletes,
+                conflicts: pushed.conflicts,
+                skipped: pushed.skipped,
+                ..Default::default()
+            })
+        }
+        SyncDirection::Both => {
+            // Pull first so local edits land on top of the newest remote state.
+            // A path absent from the server is not an error here: it just means
+            // this machine is the one contributing it.
+            let pulled = match pull_path(lib, transport, path, published_root) {
+                Ok(p) => p,
+                Err(Error::AlbumNotFound(_)) => PullOutcome::default(),
+                Err(e) => return Err(e),
+            };
+            let pushed = push_path(
+                lib, transport, path, published_root, publish_opts, allow_deletes,
+            )?;
+            lib.track_album(path, SyncDirection::Both)?;
+
+            let mut conflicts = pulled.conflicts;
+            conflicts.extend(pushed.conflicts);
+            Ok(sync::SyncOutcome {
+                pulled: pulled.files_pulled,
+                pushed: pushed.files_pushed,
+                deleted: pushed.deleted_remote,
+                withheld_deletes: pushed.withheld_deletes,
+                conflicts,
+                skipped: pushed.skipped,
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// True when `file` sits directly inside `album_path`, not in a sub-album.
+fn is_direct_child(album_path: &str, file: &str) -> bool {
+    file.strip_prefix(album_path)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| !name.contains('/'))
 }
 
 /// Start tracking an album, without overruling a direction already chosen.
@@ -314,6 +582,7 @@ pub fn push_album(
         withheld_deletes: outcome_inner.withheld_deletes,
         conflicts: outcome_inner.conflicts,
         skipped: outcome_inner.skipped,
+        albums: vec![album_path.to_string()],
     })
 }
 
@@ -383,9 +652,23 @@ pub fn sync_tracked_albums(
     publish_opts: &PublishOptions,
     allow_deletes: bool,
 ) -> Result<Vec<(String, sync::SyncOutcome)>> {
+    let subs = lib.album_subscriptions()?;
     let mut out = Vec::new();
-    for sub in lib.album_subscriptions()? {
-        let outcome = sync_album(
+
+    for sub in &subs {
+        // A tracked folder already carries its albums, so syncing a child that
+        // sits under another subscription with the same direction would just
+        // repeat the work.
+        let covered_by_parent = subs.iter().any(|other| {
+            other.album_path != sub.album_path
+                && other.direction == sub.direction
+                && sub.album_path.starts_with(&format!("{}/", other.album_path))
+        });
+        if covered_by_parent {
+            continue;
+        }
+
+        let outcome = sync_path(
             lib,
             transport,
             &sub.album_path,
@@ -394,7 +677,7 @@ pub fn sync_tracked_albums(
             publish_opts,
             allow_deletes,
         )?;
-        out.push((sub.album_path, outcome));
+        out.push((sub.album_path.clone(), outcome));
     }
     Ok(out)
 }

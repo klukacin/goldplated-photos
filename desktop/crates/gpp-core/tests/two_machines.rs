@@ -131,7 +131,8 @@ fn two_machines_exchange_albums_without_data_loss() {
     // --- A adopts B's album ---------------------------------------------
     remote::pull_album(&a.lib, &server, "2026/marko", a.published_root()).unwrap();
     assert_eq!(a.lib.album_photos("2026/marko").unwrap().len(), 1);
-    assert_eq!(a.lib.albums().unwrap().len(), 2);
+    // Two albums plus the `2026` folder they both live in.
+    assert_eq!(a.lib.albums().unwrap().len(), 3);
 
     // Both machines now agree on both albums.
     let server_albums = gpp_core::sync::albums_in_manifest(&server.manifest().unwrap());
@@ -187,4 +188,106 @@ fn album_scope_isolates_sync_completely() {
 
     let other = remote::remote_album_manifest(&server, "2026/other").unwrap();
     assert!(!other.is_empty(), "an unrelated album must survive a scoped push");
+}
+
+/// Deep paths must survive the trip. An album at `2026/weddings/ana-ivan`
+/// is only reachable in the gallery if `2026` and `2026/weddings` exist as
+/// collections too — on the server, and on every machine that adopts it.
+#[test]
+fn a_nested_path_arrives_whole_on_the_other_machine() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/weddings/ana-ivan", &["a1.jpg", "a2.jpg"]);
+
+    // Authoring a deep album creates the folders above it.
+    let folders: Vec<String> = a
+        .lib
+        .albums()
+        .unwrap()
+        .into_iter()
+        .filter(|x| x.is_collection)
+        .map(|x| x.path)
+        .collect();
+    assert_eq!(folders, vec!["2026".to_string(), "2026/weddings".to_string()]);
+
+    remote::push_path(
+        &a.lib, &server, "2026/weddings/ana-ivan", a.published_root(), &opts, false,
+    )
+    .unwrap();
+
+    // The server has the whole chain, not just the leaf.
+    for key in ["2026/index.md", "2026/weddings/index.md", "2026/weddings/ana-ivan/index.md"] {
+        assert!(server.get(key).is_ok(), "server is missing {key}");
+    }
+
+    // --- B adopts the leaf and gets the folders with it -------------------
+    let b = machine();
+    let pulled = remote::pull_path(
+        &b.lib, &server, "2026/weddings/ana-ivan", b.published_root(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        pulled.albums,
+        vec![
+            "2026".to_string(),
+            "2026/weddings".to_string(),
+            "2026/weddings/ana-ivan".to_string()
+        ],
+        "parents first, then the album"
+    );
+    assert!(b.lib.album_by_path("2026").unwrap().unwrap().is_collection);
+    assert!(b.lib.album_by_path("2026/weddings").unwrap().unwrap().is_collection);
+    assert_eq!(b.lib.album_photos("2026/weddings/ana-ivan").unwrap().len(), 2);
+
+    // Photos landed under the full path, not flattened into the library root.
+    assert!(b.lib.resolve("2026/weddings/ana-ivan/a1.jpg").unwrap().exists());
+}
+
+/// Pulling a folder brings every album under it, each into its own folder.
+#[test]
+fn pulling_a_folder_brings_its_albums_and_keeps_them_apart() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/weddings/ana-ivan", &["a1.jpg"]);
+    author_album(&a, "2026/weddings/mia-luka", &["m1.jpg"]);
+    author_album(&a, "2026/events/konferencija", &["k1.jpg"]);
+    remote::push_path(&a.lib, &server, "2026", a.published_root(), &opts, false).unwrap();
+
+    // B wants the weddings only.
+    let b = machine();
+    let pulled =
+        remote::pull_path(&b.lib, &server, "2026/weddings", b.published_root()).unwrap();
+
+    assert_eq!(
+        pulled.albums,
+        vec![
+            "2026".to_string(),
+            "2026/weddings".to_string(),
+            "2026/weddings/ana-ivan".to_string(),
+            "2026/weddings/mia-luka".to_string(),
+        ]
+    );
+    // Each album's photo is in its own folder — nothing flattened.
+    assert!(b.lib.resolve("2026/weddings/ana-ivan/a1.jpg").unwrap().exists());
+    assert!(b.lib.resolve("2026/weddings/mia-luka/m1.jpg").unwrap().exists());
+    assert_eq!(b.lib.album_photos("2026/weddings/ana-ivan").unwrap().len(), 1);
+    assert_eq!(b.lib.album_photos("2026/weddings/mia-luka").unwrap().len(), 1);
+
+    // The events branch was outside the requested path: not adopted at all.
+    assert!(b.lib.album_by_path("2026/events").unwrap().is_none());
+    assert!(b.lib.album_by_path("2026/events/konferencija").unwrap().is_none());
+
+    // And B pushing its branch back must not disturb the events branch.
+    remote::push_path(
+        &b.lib, &server, "2026/weddings", b.published_root(), &opts, true,
+    )
+    .unwrap();
+    assert!(server.get("2026/events/konferencija/k1.jpg").is_ok(), "other branch survived");
 }

@@ -330,19 +330,22 @@ impl Session {
     }
 
     /// Adopt an album from the remote into this library.
+    /// Adopt a path from the remote: the folders above it, the album or
+    /// collection itself, and everything under it.
     pub fn pull_album(&self, album_path: String) -> Result<crate::remote::PullOutcome> {
         let transport = self.transport()?;
         let root = self.published_root()?;
-        self.with(|lib| crate::remote::pull_album(lib, &transport, &album_path, &root))
+        self.with(|lib| crate::remote::pull_path(lib, &transport, &album_path, &root))
     }
 
     /// Publish one album and upload it.
+    /// Contribute a path to the remote: its folders, itself, everything under it.
     pub fn push_album(&self, album_path: String, allow_deletes: bool) -> Result<crate::remote::PushOutcome> {
         let transport = self.transport()?;
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
-            crate::remote::push_album(lib, &transport, &album_path, &root, &opts, allow_deletes)
+            crate::remote::push_path(lib, &transport, &album_path, &root, &opts, allow_deletes)
         })
     }
 
@@ -357,7 +360,7 @@ impl Session {
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
-            crate::remote::sync_album(
+            crate::remote::sync_path(
                 lib, &transport, &album_path, direction, &root, &opts, allow_deletes,
             )
         })
@@ -447,15 +450,17 @@ mod tests {
         s.add_to_album("2026/test".into(), photos.iter().map(|p| p.id).collect())
             .unwrap();
 
+        // The album, plus the `2026` folder created to hold it.
         let albums = s.albums().unwrap();
-        assert_eq!(albums.len(), 1);
-        assert_eq!(albums[0].photo_count, 2);
-        assert!(!albums[0].is_locked);
+        assert_eq!(albums.len(), 2);
+        let album = albums.iter().find(|a| a.album.path == "2026/test").unwrap();
+        assert_eq!(album.photo_count, 2);
+        assert!(!album.is_locked);
 
         // Share link makes it locked
         let token = s.generate_share_link("2026/test".into()).unwrap();
         assert!(!token.is_empty());
-        assert!(s.albums().unwrap()[0].is_locked);
+        assert!(s.albums().unwrap().iter().any(|a| a.album.path == "2026/test" && a.is_locked));
 
         // Publish, filtered to 4★+ — the rejected photo must not ship
         s.set_publish_target(PublishTarget {
@@ -589,19 +594,21 @@ mod remote_tests {
         // --- Machine B discovers and pulls --------------------------------
         let (b, _b_root, _b_pub) = session_with(remote.path());
         let found = b.remote_albums().unwrap();
-        assert_eq!(found.len(), 1);
-        assert!(!found[0].local);
-        assert_eq!(found[0].title.as_deref(), Some("Ex"));
+        let ex = found.iter().find(|a| a.path == "2026/x").unwrap();
+        assert!(!ex.local);
+        assert_eq!(ex.title.as_deref(), Some("Ex"));
 
         let pulled = b.pull_album("2026/x".into()).unwrap();
         assert!(pulled.files_pulled >= 2);
-        assert_eq!(b.albums().unwrap().len(), 1);
+        // The album plus the `2026` folder it needs to be reachable.
+        assert_eq!(b.albums().unwrap().len(), 2);
         assert_eq!(b.album_photos("2026/x".into()).unwrap().len(), 1);
 
         // After pulling, B tracks it bidirectionally and sees it as local.
         let after = b.remote_albums().unwrap();
-        assert!(after[0].local);
-        assert_eq!(after[0].tracked, Some(SyncDirection::Both));
+        let ex = after.iter().find(|a| a.path == "2026/x").unwrap();
+        assert!(ex.local);
+        assert_eq!(ex.tracked, Some(SyncDirection::Both));
     }
 
     #[test]
@@ -645,11 +652,15 @@ mod remote_tests {
         let (b, _b_root, _b_pub) = session_with(remote.path());
         b.track_album("2026/x".into(), SyncDirection::Pull).unwrap();
         b.pull_album("2026/x".into()).unwrap();
+        let subs = b.album_subscriptions().unwrap();
         assert_eq!(
-            b.album_subscriptions().unwrap()[0].direction,
-            SyncDirection::Pull,
+            subs.iter().find(|s| s.album_path == "2026/x").map(|s| s.direction),
+            Some(SyncDirection::Pull),
             "a pull must not turn a read-only machine into one that pushes"
         );
+        // The `2026` folder came along for navigation, but was not subscribed:
+        // a subscription there would drag in every album of the year.
+        assert!(subs.iter().all(|s| s.album_path != "2026"));
     }
 
     /// A local album the server has never seen must still be offered, or
@@ -669,11 +680,17 @@ mod remote_tests {
         .unwrap();
 
         let listed = s.remote_albums().unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].path, "2026/new");
-        assert!(listed[0].local, "it is in this catalog");
-        assert!(!listed[0].remote, "the server has never seen it");
-        assert_eq!(listed[0].file_count, 0);
+        // The album and the folder above it — the folder is part of the path,
+        // so it is offered too.
+        assert_eq!(
+            listed.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(),
+            vec!["2026", "2026/new"]
+        );
+        let new = listed.iter().find(|a| a.path == "2026/new").unwrap();
+        assert!(new.local, "it is in this catalog");
+        assert!(!new.remote, "the server has never seen it");
+        assert_eq!(new.file_count, 0);
+        assert!(listed[0].is_collection, "2026 is a folder");
         // Listing is read-only: nothing was tracked or uploaded by looking.
         assert!(s.album_subscriptions().unwrap().is_empty());
         assert!(std::fs::read_dir(remote.path()).unwrap().next().is_none());

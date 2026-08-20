@@ -710,12 +710,15 @@ function renderRemoteList() {
 
   state.remoteAlbums.forEach((album) => {
     const row = document.createElement('div');
-    row.className = 'remote-row';
+    row.className = 'remote-row' + (album.is_collection ? ' is-folder' : '');
+    // The list is a tree: indentation is what makes "2026 / weddings / ana"
+    // legible as a path rather than three unrelated rows.
+    row.style.marginLeft = `${album.depth * 1.1}rem`;
 
     const info = document.createElement('div');
     info.className = 'remote-info';
     const title = document.createElement('strong');
-    title.textContent = album.title || album.path;
+    title.textContent = (album.is_collection ? '📁 ' : '') + (album.title || album.path);
     info.appendChild(title);
 
     // The two states a fresh machine cares about, named plainly.
@@ -733,14 +736,19 @@ function renderRemoteList() {
 
     const sub = document.createElement('div');
     sub.className = 'remote-sub muted';
-    sub.textContent = album.remote
-      ? `${album.path} · ${album.file_count} file(s) on server`
-      : `${album.path} · local only`;
+    const where = album.remote
+      ? `${album.file_count} file(s) on server`
+      : 'local only';
+    sub.textContent = album.is_collection
+      ? `${album.path} · folder · ${where}`
+      : `${album.path} · ${where}`;
     info.appendChild(sub);
     row.appendChild(info);
 
     const direction = document.createElement('select');
-    direction.title = 'How this album syncs';
+    direction.title = album.is_collection
+      ? 'How this folder and everything under it syncs'
+      : 'How this album syncs';
     [
       ['', 'Not tracked'],
       ['both', 'Both ways'],
@@ -779,8 +787,8 @@ function renderRemoteList() {
     pull.textContent = album.local ? 'Pull' : 'Get';
     pull.disabled = !album.remote;
     pull.title = album.remote
-      ? 'Download the server’s version into this library'
-      : 'The server does not have this album';
+      ? 'Download this path — its folders, itself, and everything under it'
+      : 'The server does not have this path';
     pull.addEventListener('click', () => runSync(row, album.path, () =>
       invoke('pull_album', { path: album.path })));
     actions.appendChild(pull);
@@ -789,6 +797,7 @@ function renderRemoteList() {
     push.className = 'btn btn-sm';
     push.textContent = album.remote ? 'Push' : 'Add to server';
     push.disabled = !album.local;
+    push.title = 'Upload this path — its folders, itself, and everything under it';
     push.addEventListener('click', () => runSync(row, album.path, () =>
       pushWithDeleteCheck('push_album', album.path)));
     actions.appendChild(push);
@@ -798,7 +807,7 @@ function renderRemoteList() {
       const sync = document.createElement('button');
       sync.className = 'btn btn-sm btn-primary';
       sync.textContent = 'Sync';
-      sync.title = 'Pull the server’s changes, then push this machine’s';
+      sync.title = 'Pull the server’s changes for this whole path, then push this machine’s';
       sync.addEventListener('click', () => runSync(row, album.path, () =>
         pushWithDeleteCheck('sync_album', album.path, { direction: 'both' })));
       actions.appendChild(sync);

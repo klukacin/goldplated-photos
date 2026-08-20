@@ -420,7 +420,7 @@ fn cmd_sync(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             let opts = PublishOptions::default();
-            let outcome = remote::sync_album(
+            let outcome = remote::sync_path(
                 &lib, &transport, album, direction, &root, &opts, allow_deletes,
             )?;
             println!(
@@ -540,19 +540,24 @@ fn cmd_remote(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `gpp pull <album>` — adopt an album from the remote.
+/// `gpp pull <path>` — adopt a path from the remote, folders and all.
 fn cmd_pull(args: &[String]) -> Result<()> {
     let lib = open_library(args)?;
     let transport = transport_for(&lib, args)?;
     let root = published_root_for(&lib, args)?;
     let album = positional(args)
-        .ok_or_else(|| gpp_core::Error::other("usage: gpp pull <album> [--remote D] [--dest D]"))?;
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp pull <path> [--remote D] [--dest D]"))?;
 
-    let outcome = remote::pull_album(&lib, &transport, album, &root)?;
+    let outcome = remote::pull_path(&lib, &transport, album, &root)?;
     println!(
-        "pulled {} file(s), catalogued {} photo(s)",
-        outcome.files_pulled, outcome.photos_imported
+        "pulled {} file(s) into {} album(s), catalogued {} photo(s)",
+        outcome.files_pulled,
+        outcome.albums.len(),
+        outcome.photos_imported
     );
+    for a in &outcome.albums {
+        println!("  {a}");
+    }
     if !outcome.conflicts.is_empty() {
         println!("conflicts (nothing overwritten):");
         for c in &outcome.conflicts {
@@ -562,28 +567,34 @@ fn cmd_pull(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `gpp push <album>` — publish an album and upload it.
+/// `gpp push <path>` — publish a path and upload it, folders and all.
 fn cmd_push(args: &[String]) -> Result<()> {
     let lib = open_library(args)?;
     let transport = transport_for(&lib, args)?;
     let root = published_root_for(&lib, args)?;
     let album = positional(args)
-        .ok_or_else(|| gpp_core::Error::other("usage: gpp push <album> [--allow-deletes]"))?;
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp push <path> [--allow-deletes]"))?;
 
     let opts = PublishOptions {
         min_rating: opt(args, "--min-rating").and_then(|v| v.parse().ok()),
         ..Default::default()
     };
-    let outcome = remote::push_album(
+    let outcome = remote::push_path(
         &lib, &transport, album, &root, &opts, has(args, "--allow-deletes"),
     )?;
     println!(
-        "pushed {} file(s), deleted {} remotely, skipped {}",
-        outcome.files_pushed, outcome.deleted_remote, outcome.skipped
+        "pushed {} file(s) from {} album(s), deleted {} remotely, skipped {}",
+        outcome.files_pushed,
+        outcome.albums.len(),
+        outcome.deleted_remote,
+        outcome.skipped
     );
+    for a in &outcome.albums {
+        println!("  {a}");
+    }
     if !outcome.withheld_deletes.is_empty() {
         println!(
-            "{} file(s) on the server that this album no longer has:",
+            "{} file(s) on the server that this path no longer has:",
             outcome.withheld_deletes.len()
         );
         for p in &outcome.withheld_deletes {
@@ -647,10 +658,11 @@ COMMANDS
                                   [--include-rejected]
 
   remote [--remote <dir>]         List albums on the remote and what you track
-  pull <album>                    Adopt an album from the remote into this library
-  push <album> [--allow-deletes]  Publish an album and upload it
-  sync [album] [--push|--pull|--both] [--plan] [--allow-deletes]
-                                  Sync one album, or every tracked album
+  pull <path>                     Adopt a path (album or folder) and everything
+                                  under it, plus the folders above it
+  push <path> [--allow-deletes]   Publish a path and upload it, folders and all
+  sync [path] [--push|--pull|--both] [--plan] [--allow-deletes]
+                                  Sync one path, or every tracked path
 
 EXAMPLES
   gpp init ~/Photos

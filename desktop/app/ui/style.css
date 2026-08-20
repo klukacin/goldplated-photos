@@ -356,6 +356,7 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+.remote-row.is-folder { background: transparent; border-style: dashed; }
 .remote-info { flex: 1; min-width: 0; }
 .remote-info strong { font-weight: 600; margin-right: 0.35rem; }
 .remote-sub {

@@ -16,7 +16,7 @@ const { items } = Astro.props;
             <span class="separator">/</span>
           </>
         ) : (
-          <span class="current">.</span>
+          <span class="current" aria-current="page">{item.label}</span>
         )}
       </li>
     ))}
