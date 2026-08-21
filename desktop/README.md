@@ -239,6 +239,13 @@ The remote is a directory today — a network share, an external drive, or a
 folder something else keeps in sync. `SftpTransport` and `HttpTransport` slot in
 behind the same trait without touching any of the logic above.
 
+[UPLOAD-TRANSPORT.md](UPLOAD-TRANSPORT.md) works out which protocol to reach for
+when SSH is not available, and why. Short version: HTTP/1.1 with 4–8 parallel
+connections and one manifest exchange — pinned to 1.1, because stock Apache and
+nginx both cap HTTP/2 request bodies at a 64 KB flow-control window, which on a
+100 Mbit/s line at 40 ms RTT is an eighth of the pipe per stream. The largest win
+available is not the protocol at all: `sync::apply` still uploads serially.
+
 ---
 
 ## Working on the core in parallel
