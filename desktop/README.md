@@ -57,16 +57,28 @@ and the UI's own logic.
 To reproduce the run on a headless Linux box:
 
 ```bash
-apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-                   patchelf xvfb openbox
-Xvfb :77 -screen 0 1400x900x24 &
-DISPLAY=:77 openbox &
+.claude/hooks/session-start.sh          # installs the toolkit (see below)
 cd desktop/app/src-tauri && cargo build
-DISPLAY=:77 ./target/debug/gpp-desktop ~/Photos     # opens that library directly
+cd .. && ./run-headless.sh ~/Photos     # display, WM, bus, portal, then the app
+./run-headless.sh --shot out.png ~/Photos   # or just take a picture of it
 ```
 
-A library path on the command line skips the folder picker — handy for scripts
-and for exactly this kind of testing.
+`run-headless.sh` exists because assembling that stack by hand is where the
+time goes: without a window manager `xdotool` cannot focus the window and
+clicks land nowhere, and without an XDG portal the folder picker opens nothing
+and reports no error — which looks exactly like a broken button.
+
+A library path on the command line skips the picker entirely, which is the
+short way past all of it.
+
+### A fresh container
+
+`.claude/hooks/session-start.sh` installs what the base image lacks: WebKitGTK
+and GTK for the shell, Xvfb/openbox/dbus/xdg-desktop-portal to run it headless,
+xdotool and ImageMagick to drive and photograph it, and ffmpeg for the
+`ffprobe` the gallery's `/api/video-info` shells out to. It is idempotent —
+about a second when everything is already there — and does nothing at all
+outside a remote session, so it never installs packages on your own machine.
 
 ---
 
