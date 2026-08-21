@@ -25,6 +25,21 @@ chrono.workspace = true
 base64.workspace = true
 rand.workspace = true
 tracing.workspace = true
+# Blocking HTTP for the sync transport. The sync engine is blocking by design
+# (rayon, no async runtime), so a small blocking client fits where reqwest's
+# async machinery would not.
+#
+# `platform-verifier` rather than the default bundled roots: a desktop app
+# should trust what the operating system trusts — corporate CAs, user-added
+# certificates — and it keeps the vendored Mozilla root bundle, which carries a
+# CDLA-Permissive licence, out of the dependency tree.
+ureq = { version = "3", default-features = false, features = [
+  "json",
+  "gzip",
+  "rustls-no-provider",
+  "_ring",
+  "platform-verifier",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

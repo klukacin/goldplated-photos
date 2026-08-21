@@ -518,13 +518,13 @@ fn cmd_sync(args: &[String]) -> Result<()> {
         Some(album) => {
             let transport = transport_for(&lib, args)?;
             if has(args, "--plan") {
-                let plan = remote::plan_album_sync(&lib, &transport, album, direction, &root)?;
+                let plan = remote::plan_album_sync(&lib, transport.as_ref(), album, direction, &root)?;
                 print_plan(&plan);
                 return Ok(());
             }
             let opts = PublishOptions::default();
             let outcome = remote::sync_path(
-                &lib, &transport, album, direction, &root, &opts, allow_deletes,
+                &lib, transport.as_ref(), album, direction, &root, &opts, allow_deletes,
             )?;
             println!(
                 "{album}: pushed {} · pulled {} · deleted {} · skipped {}",
@@ -543,7 +543,7 @@ fn cmd_sync(args: &[String]) -> Result<()> {
             }
             let opts = PublishOptions::default();
             let results =
-                remote::sync_tracked_albums(&lib, &transport, &root, &opts, allow_deletes)?;
+                remote::sync_tracked_albums(&lib, transport.as_ref(), &root, &opts, allow_deletes)?;
             for (album, outcome) in &results {
                 println!(
                     "{album}: pushed {} · pulled {} · deleted {} · skipped {}",
@@ -580,17 +580,41 @@ fn print_plan(plan: &sync::SyncPlan) {
 }
 
 /// Remote directory: `--remote <dir>`, else the value stored in the catalog.
-fn transport_for(lib: &Library, args: &[String]) -> Result<gpp_core::sync::FsTransport> {
-    let dir = match opt(args, "--remote") {
+/// Persist an HTTP remote's access token, if one was given.
+fn store_remote_token(args: &[String], lib: &Library) -> Result<()> {
+    if let Some(token) = opt(args, "--remote-token") {
+        lib.set_setting("remote.token", token)?;
+    }
+    Ok(())
+}
+
+/// The remote, chosen by what it looks like: a path is a directory, an
+/// `http(s)` URL is the sync API. Same rule the desktop app uses, so a library
+/// configured by one is configured for the other.
+fn transport_for(
+    lib: &Library,
+    args: &[String],
+) -> Result<Box<dyn gpp_core::sync::RemoteTransport>> {
+    let target = match opt(args, "--remote") {
         Some(d) => {
             lib.set_setting("remote.dir", d)?;
             d.to_string()
         }
-        None => lib
-            .get_setting("remote.dir")?
-            .ok_or_else(|| gpp_core::Error::other("no remote set — pass --remote <dir> once"))?,
+        None => lib.get_setting("remote.dir")?.ok_or_else(|| {
+            gpp_core::Error::other("no remote set — pass --remote <dir-or-url> once")
+        })?,
     };
-    Ok(gpp_core::sync::FsTransport::new(dir))
+    store_remote_token(args, lib)?;
+
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let token = lib.get_setting("remote.token")?.ok_or_else(|| {
+            gpp_core::Error::other(
+                "this remote needs an access token — pass --remote-token <token> once",
+            )
+        })?;
+        return Ok(Box::new(gpp_core::sync::HttpTransport::new(target, token)));
+    }
+    Ok(Box::new(gpp_core::sync::FsTransport::new(target)))
 }
 
 fn published_root_for(lib: &Library, args: &[String]) -> Result<PathBuf> {
@@ -621,7 +645,7 @@ fn cmd_remote(args: &[String]) -> Result<()> {
     let lib = open_library(args)?;
     let transport = transport_for(&lib, args)?;
 
-    let albums = remote::remote_albums(&lib, &transport)?;
+    let albums = remote::remote_albums(&lib, transport.as_ref())?;
     if albums.is_empty() {
         println!("No albums here or on the remote yet.");
         return Ok(());
@@ -651,7 +675,7 @@ fn cmd_pull(args: &[String]) -> Result<()> {
     let album = positional(args)
         .ok_or_else(|| gpp_core::Error::other("usage: gpp pull <path> [--remote D] [--dest D]"))?;
 
-    let outcome = remote::pull_path(&lib, &transport, album, &root)?;
+    let outcome = remote::pull_path(&lib, transport.as_ref(), album, &root)?;
     println!(
         "pulled {} file(s) into {} album(s), catalogued {} photo(s)",
         outcome.files_pulled,
@@ -683,7 +707,7 @@ fn cmd_push(args: &[String]) -> Result<()> {
         ..Default::default()
     };
     let outcome = remote::push_path(
-        &lib, &transport, album, &root, &opts, has(args, "--allow-deletes"),
+        &lib, transport.as_ref(), album, &root, &opts, has(args, "--allow-deletes"),
     )?;
     println!(
         "pushed {} file(s) from {} album(s), deleted {} remotely, skipped {}",

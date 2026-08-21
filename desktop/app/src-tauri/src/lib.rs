@@ -269,6 +269,18 @@ fn set_remote_dir(state: State<'_, Session>, dir: String) -> CmdResult<()> {
     state.set_remote_dir(dir).map_err(to_msg)
 }
 
+/// Whether a token is on file — never the token itself, which stays in the
+/// catalog and has no reason to travel back into a web view.
+#[tauri::command]
+fn has_remote_token(state: State<'_, Session>) -> CmdResult<bool> {
+    Ok(state.remote_token().map_err(to_msg)?.is_some())
+}
+
+#[tauri::command]
+fn set_remote_token(state: State<'_, Session>, token: String) -> CmdResult<()> {
+    state.set_remote_token(token).map_err(to_msg)
+}
+
 #[tauri::command]
 fn remote_albums(state: State<'_, Session>) -> CmdResult<Vec<RemoteAlbum>> {
     state.remote_albums().map_err(to_msg)
@@ -415,6 +427,8 @@ pub fn run() {
             sync_plan,
             get_remote_dir,
             set_remote_dir,
+            has_remote_token,
+            set_remote_token,
             remote_albums,
             album_subscriptions,
             track_album,

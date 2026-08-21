@@ -51,6 +51,7 @@
   "dependencies": {
     "@astrojs/node": "^9.5.1",
     "@ffprobe-installer/ffprobe": "^2.1.2",
+    "@noble/hashes": "^2.3.0",
     "archiver": "^8.0.0",
     "astro": "^5.16.6",
     "cors": "^2.8.5",

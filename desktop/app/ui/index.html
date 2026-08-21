@@ -82,6 +82,21 @@
         <div class="inspector-body">
           <h3 id="inspector-name"></h3>
           <div class="rating-row" id="inspector-rating"></div>
+
+          <!-- Develop. Adjustments are recorded, never written into the
+               original; the grid re-renders from the new render key. -->
+          <details class="develop" id="develop" open>
+            <summary>
+              Develop
+              <span id="develop-scope" class="muted"></span>
+            </summary>
+            <div id="develop-sliders" class="sliders"></div>
+            <div class="develop-actions">
+              <label class="check"><input type="checkbox" id="dev-bw"> Black &amp; white</label>
+              <button id="develop-reset" class="btn btn-sm">Reset</button>
+            </div>
+          </details>
+
           <dl id="inspector-meta" class="meta"></dl>
         </div>
       </aside>
@@ -202,11 +217,16 @@
       <h2>Sync albums</h2>
       <p class="muted">Each album syncs on its own, in its own direction. Albums
          you don't track are never touched — on either side.</p>
-      <label>Remote folder <small>network share, external drive, or a folder another tool keeps in sync</small>
+      <label>Remote <small>a folder — network share, external drive — or the gallery's sync URL</small>
         <div class="row">
-          <input type="text" id="remote-dir" placeholder="/Volumes/gallery">
-          <button id="pick-remote-btn" class="btn btn-sm">Choose…</button>
+          <input type="text" id="remote-dir" placeholder="/Volumes/gallery or https://gallery.example/api/sync">
+          <button id="pick-remote-btn" class="btn btn-sm">Choose folder…</button>
         </div>
+      </label>
+      <!-- Only a URL remote needs one; a folder is reached through the file system. -->
+      <label id="remote-token-row" hidden>Access token <small>from the server's SYNC_TOKEN</small>
+        <input type="password" id="remote-token" placeholder="paste once — it is kept in the catalog"
+               autocomplete="off">
       </label>
       <div class="row" style="margin-bottom:0.75rem">
         <button id="remote-refresh-btn" class="btn btn-sm">Refresh list</button>

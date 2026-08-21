@@ -52,6 +52,7 @@ pub struct PublishTarget {
 const SETTING_PUBLISH_DEST: &str = "publish.dest";
 const SETTING_PUBLISH_MIN_RATING: &str = "publish.min_rating";
 const SETTING_REMOTE_DIR: &str = "remote.dir";
+const SETTING_REMOTE_TOKEN: &str = "remote.token";
 
 impl Session {
     pub fn new() -> Self {
@@ -208,7 +209,12 @@ impl Session {
         change: impl Fn(&mut crate::develop::EditStack),
     ) -> Result<usize> {
         self.with(|lib| {
-            let mut changed = 0;
+            // Record every stack first — that is the part the catalog has to be
+            // consistent about, and it is cheap. Rendering is the expensive
+            // part, so it happens afterwards and in parallel: a bulk edit over
+            // a selected shoot is otherwise one CPU core doing hundreds of
+            // full-size renders in a row while the app looks frozen.
+            let mut pending = Vec::new();
             for id in ids {
                 let photo = lib.photo_by_id(id)?;
                 let mut stack = lib.edits(id)?;
@@ -218,10 +224,17 @@ impl Session {
                     continue;
                 }
                 lib.set_edits(id, &stack)?;
-                let _ = crate::develop::render_derived(lib, &photo, &stack);
-                changed += 1;
+                pending.push((photo, stack));
             }
-            Ok(changed)
+
+            use rayon::prelude::*;
+            pending.par_iter().for_each(|(photo, stack)| {
+                // A render that fails leaves the edit recorded and the old
+                // thumbnail in place; the next request renders it again.
+                let _ = crate::develop::render_derived(lib, photo, stack);
+            });
+
+            Ok(pending.len())
         })
     }
 
@@ -352,11 +365,36 @@ impl Session {
         self.with(|lib| lib.set_setting(SETTING_REMOTE_DIR, &dir))
     }
 
-    fn transport(&self) -> Result<crate::sync::FsTransport> {
-        let dir = self
+    /// The remote, whatever kind it is.
+    ///
+    /// Chosen by what the setting looks like rather than by a separate type
+    /// field, so the UI keeps one text box: a path is a directory, an `http(s)`
+    /// URL is the sync API. Adding SFTP later is another arm here and no UI
+    /// change.
+    fn transport(&self) -> Result<Box<dyn crate::sync::RemoteTransport>> {
+        let target = self
             .remote_dir()?
             .ok_or_else(|| Error::other("no remote configured"))?;
-        Ok(crate::sync::FsTransport::new(dir))
+
+        if target.starts_with("http://") || target.starts_with("https://") {
+            let token = self.remote_token()?.ok_or_else(|| {
+                Error::other(
+                    "this remote needs an access token — set it in the sync panel, \
+                     or with `gpp sync --remote-token <token>`",
+                )
+            })?;
+            return Ok(Box::new(crate::sync::HttpTransport::new(target, token)));
+        }
+        Ok(Box::new(crate::sync::FsTransport::new(target)))
+    }
+
+    /// Shared secret for an HTTP remote. Stored in the catalog beside the URL.
+    pub fn remote_token(&self) -> Result<Option<String>> {
+        self.with(|lib| lib.get_setting(SETTING_REMOTE_TOKEN))
+    }
+
+    pub fn set_remote_token(&self, token: String) -> Result<()> {
+        self.with(|lib| lib.set_setting(SETTING_REMOTE_TOKEN, &token))
     }
 
     fn published_root(&self) -> Result<PathBuf> {
@@ -374,7 +412,8 @@ impl Session {
     /// Albums on the remote, annotated with what this machine knows about them.
     pub fn remote_albums(&self) -> Result<Vec<crate::remote::RemoteAlbum>> {
         let transport = self.transport()?;
-        self.with(|lib| crate::remote::remote_albums(lib, &transport))
+        let transport = transport.as_ref();
+        self.with(|lib| crate::remote::remote_albums(lib, transport))
     }
 
     /// Which albums this machine syncs, and in which direction.
@@ -397,8 +436,9 @@ impl Session {
         direction: crate::sync::SyncDirection,
     ) -> Result<crate::sync::SyncPlan> {
         let transport = self.transport()?;
+        let transport = transport.as_ref();
         let root = self.published_root()?;
-        self.with(|lib| crate::remote::plan_album_sync(lib, &transport, &album_path, direction, &root))
+        self.with(|lib| crate::remote::plan_album_sync(lib, transport, &album_path, direction, &root))
     }
 
     /// Adopt an album from the remote into this library.
@@ -406,18 +446,20 @@ impl Session {
     /// collection itself, and everything under it.
     pub fn pull_album(&self, album_path: String) -> Result<crate::remote::PullOutcome> {
         let transport = self.transport()?;
+        let transport = transport.as_ref();
         let root = self.published_root()?;
-        self.with(|lib| crate::remote::pull_path(lib, &transport, &album_path, &root))
+        self.with(|lib| crate::remote::pull_path(lib, transport, &album_path, &root))
     }
 
     /// Publish one album and upload it.
     /// Contribute a path to the remote: its folders, itself, everything under it.
     pub fn push_album(&self, album_path: String, allow_deletes: bool) -> Result<crate::remote::PushOutcome> {
         let transport = self.transport()?;
+        let transport = transport.as_ref();
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
-            crate::remote::push_path(lib, &transport, &album_path, &root, &opts, allow_deletes)
+            crate::remote::push_path(lib, transport, &album_path, &root, &opts, allow_deletes)
         })
     }
 
@@ -429,11 +471,12 @@ impl Session {
         allow_deletes: bool,
     ) -> Result<crate::sync::SyncOutcome> {
         let transport = self.transport()?;
+        let transport = transport.as_ref();
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
             crate::remote::sync_path(
-                lib, &transport, &album_path, direction, &root, &opts, allow_deletes,
+                lib, transport, &album_path, direction, &root, &opts, allow_deletes,
             )
         })
     }
@@ -441,10 +484,11 @@ impl Session {
     /// Sync every subscribed album, each in its own direction.
     pub fn sync_all_tracked(&self, allow_deletes: bool) -> Result<Vec<(String, crate::sync::SyncOutcome)>> {
         let transport = self.transport()?;
+        let transport = transport.as_ref();
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
-            crate::remote::sync_tracked_albums(lib, &transport, &root, &opts, allow_deletes)
+            crate::remote::sync_tracked_albums(lib, transport, &root, &opts, allow_deletes)
         })
     }
 

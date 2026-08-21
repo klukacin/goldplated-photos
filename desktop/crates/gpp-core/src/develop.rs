@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::media;
 use crate::model::Photo;
 
@@ -371,18 +371,10 @@ pub fn ensure_rendered(
     if dest.exists() {
         return Ok(dest);
     }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    }
 
     let img = media::load_oriented(original, photo.orientation)?;
     let developed = apply(&img, stack);
-
-    let mut file = std::fs::File::create(&dest).map_err(|e| Error::io(&dest, e))?;
-    developed
-        .to_rgb8()
-        .write_to(&mut file, image::ImageFormat::Jpeg)
-        .map_err(Error::Image)?;
+    media::write_atomic(&dest, &media::encode_jpeg(&developed)?)?;
     Ok(dest)
 }
 

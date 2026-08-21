@@ -239,6 +239,10 @@ function updateSelectionUI() {
   const n = state.selected.size;
   $('selection-info').textContent = n ? `${n} selected` : '';
   $('add-to-album-btn').disabled = n === 0;
+  // The develop panel acts on the selection, so it has to say so here too —
+  // otherwise Select All leaves it reading "one photo" while a slider drag
+  // would repaint the whole shoot.
+  updateDevelopScope();
 }
 
 /// Ids the next action applies to: the selection, or the cursor when empty.
@@ -317,15 +321,23 @@ function moveCursor(delta) {
 
 // --------------------------------------------------------------- inspector
 
+/// Bumped on every inspector paint. Held arrow keys start several of these at
+/// once, and the slowest must not be allowed to finish last and leave one
+/// photo's preview beside another photo's adjustments.
+let inspectorGeneration = 0;
+
 async function showInspector(photo) {
+  const generation = ++inspectorGeneration;
   const panel = $('inspector');
   panel.hidden = false;
   $('inspector-name').textContent = photo.filename;
 
   try {
     const p = await invoke('thumbnail_path', { id: photo.id, size: 'medium' });
+    if (generation !== inspectorGeneration) return;
     $('inspector-img').src = convertFileSrc(p);
   } catch {
+    if (generation !== inspectorGeneration) return;
     $('inspector-img').removeAttribute('src');
   }
 
@@ -358,6 +370,188 @@ async function showInspector(photo) {
   $('inspector-meta').innerHTML = rows
     .map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`)
     .join('');
+
+  renderDevelop(photo, generation);
+}
+
+// ----------------------------------------------------------------- develop
+//
+// Adjustments are recorded, never written into the original. Every change goes
+// to the core, which re-renders the thumbnails under a new render key; the grid
+// then simply asks for the thumbnail again and gets the adjusted one.
+
+/** Slider definitions. `ev` is in stops; the rest are the -100..100 the core takes. */
+const ADJUSTMENTS = [
+  { kind: 'exposure',    label: 'Exposure',    min: -5,   max: 5,   step: 0.05, field: 'ev', unit: ' EV' },
+  { kind: 'contrast',    label: 'Contrast',    min: -100, max: 100, step: 1,    field: 'amount' },
+  { kind: 'highlights',  label: 'Highlights',  min: -100, max: 100, step: 1,    field: 'amount' },
+  { kind: 'shadows',     label: 'Shadows',     min: -100, max: 100, step: 1,    field: 'amount' },
+  { kind: 'saturation',  label: 'Saturation',  min: -100, max: 100, step: 1,    field: 'amount' },
+  { kind: 'temperature', label: 'Temperature', min: -100, max: 100, step: 1,    field: 'amount' },
+  { kind: 'tint',        label: 'Tint',        min: -100, max: 100, step: 1,    field: 'amount' },
+];
+
+/// Photos an adjustment applies to: the whole selection, or the cursor alone.
+function developTargets() {
+  return targetIds();
+}
+
+/// How many photos the next adjustment would hit. Rendered in the panel header
+/// so a bulk edit can never come as a surprise.
+function updateDevelopScope() {
+  const n = developTargets().length;
+  $('develop-scope').textContent = n > 1 ? `· ${n} photos` : '';
+}
+
+async function renderDevelop(photo, generation = inspectorGeneration) {
+  const panel = $('develop-sliders');
+  let stack;
+  try {
+    stack = await invoke('photo_edits', { id: photo.id });
+  } catch {
+    if (generation !== inspectorGeneration) return;
+    panel.innerHTML = '';
+    return;
+  }
+  if (generation !== inspectorGeneration) return;
+
+  updateDevelopScope();
+
+  const valueOf = (kind, field) => {
+    const op = stack.ops.find((o) => opKind(o) === kind);
+    return op ? op[field] : 0;
+  };
+
+  // A keyboard nudge on a range input fires `change` on every press, which
+  // rebuilds this panel and would otherwise throw the focus away — the next
+  // arrow key would then reach the grid and jump to another photo.
+  const hadFocus = document.activeElement?.closest?.('.slider-row')?.dataset.kind;
+
+  panel.innerHTML = '';
+  for (const adj of ADJUSTMENTS) {
+    const value = valueOf(adj.kind, adj.field);
+
+    const row = document.createElement('div');
+    row.className = 'slider-row' + (value !== 0 ? ' touched' : '');
+    row.dataset.kind = adj.kind;
+
+    const label = document.createElement('label');
+    label.textContent = adj.label;
+    // Double-clicking a label is the usual way back to neutral.
+    label.title = 'Double-click to reset';
+    label.addEventListener('dblclick', () => applyAdjustment(adj, 0));
+
+    const input = document.createElement('input');
+    input.type = 'range';
+    Object.assign(input, { min: adj.min, max: adj.max, step: adj.step, value });
+
+    const out = document.createElement('output');
+    out.textContent = formatAmount(value, adj);
+
+    // Update the readout while dragging, but only hit the core on release:
+    // every change re-renders thumbnails, which is far too much work per pixel
+    // of slider travel.
+    input.addEventListener('input', () => {
+      out.textContent = formatAmount(Number(input.value), adj);
+      row.classList.toggle('touched', Number(input.value) !== 0);
+    });
+    input.addEventListener('change', () => applyAdjustment(adj, Number(input.value)));
+
+    row.append(label, input, out);
+    panel.appendChild(row);
+  }
+
+  $('dev-bw').checked = stack.ops.some((o) => opKind(o) === 'black-and-white');
+
+  if (hadFocus) {
+    panel.querySelector(`.slider-row[data-kind="${hadFocus}"] input`)?.focus();
+  }
+}
+
+/// serde tags the enum with `op`, so that field is the kind.
+function opKind(op) {
+  return op.op;
+}
+
+function formatAmount(value, adj) {
+  const sign = value > 0 ? '+' : '';
+  return adj.unit ? `${sign}${value.toFixed(2)}${adj.unit}` : `${sign}${value}`;
+}
+
+// Every applied adjustment re-renders each selected photo, so the core must
+// not be handed one job per keystroke: holding an arrow key on a slider would
+// queue a dozen full renders of the whole selection and leave the grid showing
+// pixels from several values ago. Work is queued by adjustment instead — a
+// newer value for the same slider replaces the pending one, a different slider
+// gets its own entry, so nothing a user asked for is ever dropped or repeated.
+const developPending = new Map();
+let developDraining = false;
+
+function queueDevelop(key, run) {
+  developPending.set(key, run);
+  drainDevelop();
+}
+
+async function drainDevelop() {
+  if (developDraining) return;
+  developDraining = true;
+  try {
+    while (developPending.size) {
+      const [key, run] = developPending.entries().next().value;
+      developPending.delete(key);
+      try {
+        await run();
+      } catch (err) {
+        status(`Develop failed: ${err}`);
+      }
+    }
+  } finally {
+    developDraining = false;
+  }
+  // One repaint for the whole burst, once the core has caught up.
+  await afterDevelop();
+}
+
+function applyAdjustment(adj, value) {
+  const ids = developTargets();
+  if (!ids.length) return;
+
+  queueDevelop(adj.kind, async () => {
+    // A zero is not stored — the core drops the op and the photo returns to its
+    // original render key, so this doubles as "clear this adjustment".
+    const op = { op: adj.kind, [adj.field]: value };
+    const n = await invoke('set_photo_edit', { ids, op });
+    status(n ? `${adj.label} ${formatAmount(value, adj)} on ${n} photo(s)` : 'No change');
+  });
+}
+
+$('dev-bw').addEventListener('change', (e) => {
+  const ids = developTargets();
+  if (!ids.length) return;
+  const on = e.target.checked;
+  queueDevelop('black-and-white', async () => {
+    const n = on
+      ? await invoke('set_photo_edit', { ids, op: { op: 'black-and-white' } })
+      : await invoke('clear_photo_edit', { ids, kind: 'black-and-white' });
+    status(n ? `${on ? 'Black & white' : 'Colour'} on ${n} photo(s)` : 'No change');
+  });
+});
+
+$('develop-reset').addEventListener('click', () => {
+  const ids = developTargets();
+  if (!ids.length) return;
+  // A reset supersedes everything still queued for these photos.
+  developPending.clear();
+  queueDevelop('reset', async () => {
+    const n = await invoke('reset_photo_edits', { ids });
+    status(`Reset ${n} photo(s) to the original`);
+  });
+});
+
+/// Repaint what an adjustment changed: the grid thumbnails and the panel.
+async function afterDevelop() {
+  renderGrid();
+  if (state.cursor >= 0) await showInspector(state.photos[state.cursor]);
 }
 
 function formatExposure(p) {
@@ -673,14 +867,49 @@ $('sync-btn').addEventListener('click', async () => {
   openModal('sync-modal');
   try {
     $('remote-dir').value = (await invoke('get_remote_dir')) || '';
+    await refreshTokenRow();
   } catch { /* no library open */ }
   if ($('remote-dir').value) await refreshRemote();
+});
+
+/// A URL remote authenticates with a token; a folder does not.
+function remoteIsUrl() {
+  return /^https?:\/\//i.test($('remote-dir').value.trim());
+}
+
+async function refreshTokenRow() {
+  const row = $('remote-token-row');
+  row.hidden = !remoteIsUrl();
+  if (row.hidden) return;
+  try {
+    // The token itself never comes back out of the catalog — only whether one
+    // is stored, so the field can say so without echoing a secret.
+    $('remote-token').placeholder = (await invoke('has_remote_token'))
+      ? 'stored — type to replace'
+      : 'paste once — it is kept in the catalog';
+  } catch { /* no library open */ }
+}
+
+$('remote-dir').addEventListener('input', () => refreshTokenRow());
+
+$('remote-token').addEventListener('change', async () => {
+  const token = $('remote-token').value.trim();
+  if (!token) return;
+  try {
+    await invoke('set_remote_token', { token });
+    $('remote-token').value = '';
+    $('remote-token').placeholder = 'stored — type to replace';
+    showError('sync-error', '');
+  } catch (err) {
+    showError('sync-error', String(err));
+  }
 });
 
 $('pick-remote-btn').addEventListener('click', async () => {
   const dir = await openDialog({ directory: true, title: 'Choose the shared album folder' });
   if (!dir) return;
   $('remote-dir').value = dir;
+  await refreshTokenRow();
   await saveRemoteDir();
   await refreshRemote();
 });

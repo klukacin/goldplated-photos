@@ -27,6 +27,47 @@ pub const RAW_EXTENSIONS: &[&str] = &[
 ];
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv", "m4v"];
 
+/// Write a file so that nothing ever observes it half-finished.
+///
+/// The cache is read while it is being written — the webview loads thumbnails
+/// from disk at the same moment a slider drag is re-rendering them — and a
+/// reader that catches a partially written JPEG shows a broken image. Worse,
+/// the `exists()` guards elsewhere in this module would then accept that
+/// truncated file as a finished render. Writing beside the destination and
+/// renaming into place means readers see either the old file or the new one.
+pub fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+
+    // Unique per process and per call, so two threads rendering the same key
+    // cannot collide on the temp file either.
+    let temp = parent.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&temp, bytes).map_err(|e| Error::io(&temp, e))?;
+    match std::fs::rename(&temp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(Error::io(dest, e))
+        }
+    }
+}
+
+/// Encode an image as JPEG into memory, ready for [`write_atomic`].
+pub(crate) fn encode_jpeg(img: &DynamicImage) -> Result<Vec<u8>> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.to_rgb8()
+        .write_to(&mut buf, ImageFormat::Jpeg)
+        .map_err(Error::Image)?;
+    Ok(buf.into_inner())
+}
+
 /// Classify a file by extension.
 pub fn classify(path: &Path) -> Option<PhotoKind> {
     let ext = path.extension()?.to_str()?.to_lowercase();
@@ -248,15 +289,8 @@ pub fn generate_derived(
         if dest.exists() {
             continue;
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-        }
         let resized = resize_to_fit(&img, max_edge);
-        let mut file = std::fs::File::create(&dest).map_err(|e| Error::io(&dest, e))?;
-        resized
-            .to_rgb8()
-            .write_to(&mut file, ImageFormat::Jpeg)
-            .map_err(Error::Image)?;
+        write_atomic(&dest, &encode_jpeg(&resized)?)?;
     }
 
     out.lqip = Some(make_lqip(&img)?);
@@ -279,6 +313,55 @@ pub fn make_lqip(img: &DynamicImage) -> Result<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A reader must never catch a cache entry mid-write. Streaming straight
+    /// into the destination — what this used to do — showed up in the app as
+    /// broken thumbnails while a slider drag re-rendered the grid.
+    #[test]
+    fn concurrent_writers_never_expose_a_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("shard").join("entry.jpg");
+        const LEN: usize = 512 * 1024;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (dest, stop) = (dest.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(bytes) = std::fs::read(&dest) {
+                        assert_eq!(bytes.len(), LEN, "a reader saw a half-written file");
+                        seen += 1;
+                    }
+                }
+                seen
+            })
+        };
+
+        let writers: Vec<_> = (0u8..8)
+            .map(|n| {
+                let dest = dest.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        write_atomic(&dest, &vec![n; LEN]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // And nothing is left behind beside it.
+        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
 
     #[test]
     fn classifies_by_extension() {

@@ -376,9 +376,64 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .remote-row select { width: auto; font-size: 0.8rem; padding: 0.2rem 0.4rem; }
 .remote-row .badge-new {
   font-size: 0.7rem;
+  /* Two words that must stay on one line: wrapped, the badge splits the row
+     across two lines and pushes the path out of view. */
+  white-space: nowrap;
   background: var(--accent);
   color: var(--accent-text);
   border-radius: 3px;
   padding: 0.1rem 0.35rem;
   font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- develop */
+
+.develop {
+  margin: 0.9rem 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 0.6rem 0;
+}
+.develop > summary {
+  cursor: pointer;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.develop > summary::-webkit-details-marker { display: none; }
+.sliders { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.45rem; }
+
+/* The readout column fits "-3.20 EV", the widest thing it ever holds. */
+.slider-row { display: grid; grid-template-columns: 5.5rem 1fr 3.9rem; align-items: center; gap: 0.4rem; }
+.slider-row label { font-size: 0.8rem; color: var(--text-dim); cursor: pointer; }
+/* A changed adjustment is legible at a glance without reading the numbers. */
+.slider-row.touched label { color: var(--accent); font-weight: 600; }
+.slider-row output { font-size: 0.75rem; text-align: right; font-variant-numeric: tabular-nums; }
+
+.slider-row input[type="range"] {
+  width: 100%;
+  appearance: none;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+}
+.slider-row input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--text);
+  cursor: pointer;
+}
+.slider-row.touched input[type="range"]::-webkit-slider-thumb { background: var(--accent); }
+
+.develop-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.7rem;
 }

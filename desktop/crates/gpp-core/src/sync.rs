@@ -420,6 +420,37 @@ pub struct SyncOutcome {
 ///
 /// `allow_deletes` must be an explicit, confirmed decision by the caller —
 /// nothing is removed from the server without it.
+/// How many transfers run at once.
+///
+/// A single TCP flow starts at a ~14 KB congestion window and ramps
+/// geometrically, so one-at-a-time leaves most of an upstream link idle no
+/// matter how fast it is. Parallel flows ramp independently and fill it. Four
+/// to eight is the useful band — rclone defaults to four — and above that you
+/// mostly buy packet loss. See UPLOAD-TRANSPORT.md §5.
+pub const TRANSFER_CONCURRENCY: usize = 6;
+
+/// What one change turned into. Collected in parallel, folded in order.
+enum Applied {
+    Pushed,
+    Pulled,
+    Deleted,
+    WithheldDelete(String),
+    Conflict(String),
+    LeftAlone,
+    Skipped,
+    Failed(String, String),
+    Nothing,
+}
+
+/// Execute a plan against a transport.
+///
+/// `allow_deletes` must be an explicit, confirmed decision by the caller —
+/// nothing is removed from the server without it.
+///
+/// Transfers run concurrently. The catalog writes they trigger serialize on the
+/// connection mutex, which is fine: they are microseconds against a network
+/// round trip. Results are gathered and folded afterwards so the outcome is
+/// deterministic regardless of the order threads happen to finish in.
 pub fn apply(
     lib: &Library,
     transport: &dyn RemoteTransport,
@@ -427,61 +458,98 @@ pub fn apply(
     local_root: &std::path::Path,
     allow_deletes: bool,
 ) -> Result<SyncOutcome> {
-    let mut out = SyncOutcome::default();
+    use rayon::prelude::*;
 
-    for change in &plan.changes {
-        let local_path = local_root.join(&change.path);
-        match change.action {
-            Action::Push => {
-                match std::fs::read(&local_path) {
-                    Ok(bytes) => match transport.put(&change.path, &bytes) {
-                        Ok(()) => {
-                            let hash = blake3::hash(&bytes).to_hex().to_string();
-                            lib.record_synced(&change.path, &hash)?;
-                            out.pushed += 1;
-                        }
-                        Err(e) => out.failed.push((change.path.clone(), e.to_string())),
-                    },
-                    Err(e) => out.failed.push((change.path.clone(), e.to_string())),
-                }
-            }
-            Action::Pull => match transport.get(&change.path) {
-                Ok(bytes) => {
-                    if let Some(parent) = local_path.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    match std::fs::write(&local_path, &bytes) {
-                        Ok(()) => {
-                            let hash = blake3::hash(&bytes).to_hex().to_string();
-                            lib.record_synced(&change.path, &hash)?;
-                            out.pulled += 1;
-                        }
-                        Err(e) => out.failed.push((change.path.clone(), e.to_string())),
-                    }
-                }
-                Err(e) => out.failed.push((change.path.clone(), e.to_string())),
-            },
-            Action::DeleteRemote => {
-                if !allow_deletes {
-                    out.withheld_deletes.push(change.path.clone());
-                    continue;
-                }
-                match transport.delete(&change.path) {
-                    Ok(()) => {
-                        lib.forget_synced(&change.path)?;
-                        out.deleted += 1;
-                    }
-                    Err(e) => out.failed.push((change.path.clone(), e.to_string())),
-                }
-            }
-            Action::Conflict => out.conflicts.push(change.path.clone()),
-            Action::LeaveAlone => out.left_alone += 1,
-            Action::Skip => out.skipped += 1,
-            Action::ForgetState => {}
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(TRANSFER_CONCURRENCY)
+        .build()
+        .map_err(|e| crate::error::Error::other(format!("thread pool: {e}")))?;
+
+    let applied: Vec<Applied> = pool.install(|| {
+        plan.changes
+            .par_iter()
+            .map(|change| apply_one(lib, transport, change, local_root, allow_deletes))
+            .collect()
+    });
+
+    let mut out = SyncOutcome::default();
+    for result in applied {
+        match result {
+            Applied::Pushed => out.pushed += 1,
+            Applied::Pulled => out.pulled += 1,
+            Applied::Deleted => out.deleted += 1,
+            Applied::WithheldDelete(p) => out.withheld_deletes.push(p),
+            Applied::Conflict(p) => out.conflicts.push(p),
+            Applied::LeftAlone => out.left_alone += 1,
+            Applied::Skipped => out.skipped += 1,
+            Applied::Failed(p, e) => out.failed.push((p, e)),
+            Applied::Nothing => {}
         }
     }
-
     Ok(out)
+}
+
+/// One change, in isolation. Never returns `Err`: a single file failing is
+/// reported and the rest of the transfer continues.
+fn apply_one(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    change: &PlannedChange,
+    local_root: &std::path::Path,
+    allow_deletes: bool,
+) -> Applied {
+    let local_path = local_root.join(&change.path);
+    let failed = |e: crate::error::Error| Applied::Failed(change.path.clone(), e.to_string());
+
+    match change.action {
+        Action::Push => {
+            let bytes = match std::fs::read(&local_path) {
+                Ok(b) => b,
+                Err(e) => return Applied::Failed(change.path.clone(), e.to_string()),
+            };
+            if let Err(e) = transport.put(&change.path, &bytes) {
+                return failed(e);
+            }
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            match lib.record_synced(&change.path, &hash) {
+                Ok(()) => Applied::Pushed,
+                Err(e) => failed(e),
+            }
+        }
+        Action::Pull => {
+            let bytes = match transport.get(&change.path) {
+                Ok(b) => b,
+                Err(e) => return failed(e),
+            };
+            if let Some(parent) = local_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Err(e) = std::fs::write(&local_path, &bytes) {
+                return Applied::Failed(change.path.clone(), e.to_string());
+            }
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            match lib.record_synced(&change.path, &hash) {
+                Ok(()) => Applied::Pulled,
+                Err(e) => failed(e),
+            }
+        }
+        Action::DeleteRemote => {
+            if !allow_deletes {
+                return Applied::WithheldDelete(change.path.clone());
+            }
+            if let Err(e) = transport.delete(&change.path) {
+                return failed(e);
+            }
+            match lib.forget_synced(&change.path) {
+                Ok(()) => Applied::Deleted,
+                Err(e) => failed(e),
+            }
+        }
+        Action::Conflict => Applied::Conflict(change.path.clone()),
+        Action::LeaveAlone => Applied::LeftAlone,
+        Action::Skip => Applied::Skipped,
+        Action::ForgetState => Applied::Nothing,
+    }
 }
 
 #[cfg(test)]
@@ -1013,4 +1081,179 @@ mod direction_tests {
         assert_eq!(m.len(), 1);
         assert!(!m.keys().any(|k| k.contains(".meta")));
     }
+}
+
+// ------------------------------------------------------------ http transport
+
+/// The server half of a sync, over plain HTTP.
+///
+/// Three deliberate choices, all argued in `desktop/UPLOAD-TRANSPORT.md`:
+///
+/// **HTTP/1.1, pinned.** Stock Apache and nginx both cap an HTTP/2 request body
+/// at a 64 KB flow-control window, which puts a per-stream ceiling of
+/// `window ÷ RTT` on uploads — about an eighth of a 100 Mbit/s line at 40 ms.
+/// HTTP/2's multiplexing is a download win; for uploads it trades N congestion
+/// windows for one. `ureq` speaks only HTTP/1.1, so this is free.
+///
+/// **One manifest request for the whole scope.** The client then diffs locally
+/// and sends only what is missing, which is the entire benefit rsync ever gave
+/// us here — a JPEG is new or unchanged, never byte-edited, so block-level
+/// deltas were always dead weight.
+///
+/// **A connection pool, shared across threads.** `sync::apply` runs transfers
+/// concurrently; a pooled agent amortises the TLS handshake to nothing.
+pub struct HttpTransport {
+    agent: ureq::Agent,
+    /// Base URL of the sync endpoints, without a trailing slash.
+    base: String,
+    /// Shared secret proving this client may write. Sent as a bearer token.
+    token: String,
+    /// Restricts every request to one subtree, so a misconfigured client cannot
+    /// enumerate or overwrite the whole gallery.
+    scope: Option<String>,
+}
+
+/// One entry of the manifest the server returns.
+#[derive(Debug, Deserialize)]
+struct RemoteEntry {
+    path: String,
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestResponse {
+    files: Vec<RemoteEntry>,
+}
+
+impl HttpTransport {
+    /// `base` is the URL of the sync API, e.g. `https://example.com/api/sync`.
+    pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
+        let config = ureq::Agent::config_builder()
+            // Long enough for a 50 MB RAW on a slow uplink; short enough that a
+            // dead server does not hang the app forever.
+            .timeout_global(Some(std::time::Duration::from_secs(600)))
+            .build();
+        Self {
+            agent: config.into(),
+            base: base.into().trim_end_matches('/').to_string(),
+            token: token.into(),
+            scope: None,
+        }
+    }
+
+    /// Limit every request to one album subtree.
+    pub fn scoped(mut self, prefix: impl Into<String>) -> Self {
+        self.scope = Some(prefix.into());
+        self
+    }
+
+    fn url(&self, suffix: &str) -> String {
+        format!("{}/{suffix}", self.base)
+    }
+
+    fn auth(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+}
+
+impl RemoteTransport for HttpTransport {
+    fn manifest(&self) -> Result<Manifest> {
+        let mut url = self.url("manifest");
+        if let Some(scope) = &self.scope {
+            url = format!("{url}?scope={}", urlencode(scope));
+        }
+        let body: ManifestResponse = self
+            .agent
+            .get(&url)
+            .header("Authorization", self.auth())
+            .call()
+            .map_err(http_error)?
+            .body_mut()
+            .read_json()
+            .map_err(http_error)?;
+
+        Ok(body
+            .files
+            .into_iter()
+            .map(|e| (e.path, e.hash))
+            .collect())
+    }
+
+    fn put(&self, rel_path: &str, bytes: &[u8]) -> Result<()> {
+        self.agent
+            .put(&self.url(&format!("file?path={}", urlencode(rel_path))))
+            .header("Authorization", self.auth())
+            .header("Content-Type", "application/octet-stream")
+            // The server verifies this before committing the file, so a
+            // truncated or corrupted upload is rejected rather than published.
+            .header("X-Content-Blake3", blake3::hash(bytes).to_hex().as_str())
+            .send(bytes)
+            .map_err(http_error)?;
+        Ok(())
+    }
+
+    fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+        let mut response = self
+            .agent
+            .get(&self.url(&format!("file?path={}", urlencode(rel_path))))
+            .header("Authorization", self.auth())
+            .call()
+            .map_err(http_error)?;
+        response
+            .body_mut()
+            .with_config()
+            // A single gallery file; the cap stops a hostile or broken server
+            // from exhausting memory.
+            .limit(512 * 1024 * 1024)
+            .read_to_vec()
+            .map_err(http_error)
+    }
+
+    fn delete(&self, rel_path: &str) -> Result<()> {
+        self.agent
+            .delete(&self.url(&format!("file?path={}", urlencode(rel_path))))
+            .header("Authorization", self.auth())
+            .call()
+            .map_err(http_error)?;
+        Ok(())
+    }
+}
+
+/// Turn a transport failure into something that names the fix.
+///
+/// ureq renders a rejected request as bare `http status: 401`, which in a sync
+/// panel reads as "broken" rather than "your token is wrong" — and those are
+/// the two failures a new remote actually hits.
+fn http_error(e: impl std::fmt::Display) -> crate::error::Error {
+    let raw = e.to_string();
+    let hint = if raw.contains("401") || raw.contains("403") {
+        Some("the server rejected the access token — check it matches SYNC_TOKEN")
+    } else if raw.contains("503") {
+        Some("the server has no SYNC_TOKEN configured, so syncing is turned off there")
+    } else if raw.contains("404") {
+        Some("no sync endpoint at this address — the URL should end in /api/sync")
+    } else {
+        None
+    };
+    match hint {
+        Some(hint) => crate::error::Error::other(format!("{raw} — {hint}")),
+        None => crate::error::Error::other(raw),
+    }
+}
+
+/// Percent-encode a query-string value.
+///
+/// Hand-rolled to avoid pulling a URL crate for one job: everything outside the
+/// unreserved set becomes `%XX`, which is what a path or a scope prefix needs.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
