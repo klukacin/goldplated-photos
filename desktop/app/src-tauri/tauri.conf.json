@@ -20,18 +20,25 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'",
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/**"]
+        "scope": [
+          "$HOME/**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app"],
-    "icon": ["icons/icon.png"],
-    "copyright": "© Kristijan Lukacin",
+    "targets": [
+      "dmg",
+      "app"
+    ],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "copyright": "\u00a9 Kristijan Lukacin",
     "category": "Photography",
     "shortDescription": "Photo management and gallery publishing",
     "macOS": {

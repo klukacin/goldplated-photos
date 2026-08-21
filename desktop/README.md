@@ -39,12 +39,33 @@ cargo clippy --all-targets
 cargo build --release -p gpp-cli
 ```
 
-The **Tauri shell has not been compiled here**. It needs a platform webview
-toolkit (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux) which
-this development container does not have. What *was* verified mechanically:
-the config parses, the UI's JavaScript parses, every `invoke()` call in the UI
-matches a `#[tauri::command]` registered in `generate_handler!`, and every
-element id the UI reaches for exists in the markup. First compile on a Mac may still surface something.
+The **Tauri shell has been compiled and run** — on Linux/WebKitGTK, under a
+virtual display. It opens a library, lists albums, renders the grid from the
+thumbnail cache, rates photos from the keyboard, fills the inspector, and
+drives the sync panel against a real remote. That first run found five defects
+no amount of static checking would have: a missing `protocol-asset` feature, a
+`PublishResult` that was never `Serialize`, no `capabilities/` file at all (so
+Tauri v2 denied every plugin and core API), `.welcome`/`.app` CSS overriding
+the `hidden` attribute, and a CSP with no `connect-src ipc:`.
+
+**macOS is still unproven.** WKWebView is a different engine, and codesigning
+and notarization are untested. What is now known to work everywhere is the part
+that was riskiest: the command surface, the permission and CSP configuration,
+and the UI's own logic.
+
+To reproduce the run on a headless Linux box:
+
+```bash
+apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+                   patchelf xvfb openbox
+Xvfb :77 -screen 0 1400x900x24 &
+DISPLAY=:77 openbox &
+cd desktop/app/src-tauri && cargo build
+DISPLAY=:77 ./target/debug/gpp-desktop ~/Photos     # opens that library directly
+```
+
+A library path on the command line skips the folder picker — handy for scripts
+and for exactly this kind of testing.
 
 ---
 

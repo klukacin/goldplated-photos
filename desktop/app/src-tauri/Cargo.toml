@@ -19,7 +19,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 gpp-core = { path = "../../crates/gpp-core" }
-tauri = { version = "2", features = [] }
+# protocol-asset backs `convertFileSrc`, which is how every thumbnail and
+# preview in the grid is loaded from disk. It must match the assetProtocol
+# block in tauri.conf.json or the build refuses to start.
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }

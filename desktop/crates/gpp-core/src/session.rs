@@ -141,6 +141,18 @@ impl Session {
         })
     }
 
+    /// Directories the shell must let the webview read images from: the library
+    /// itself and its thumbnail cache. The cache is separate because it lives in
+    /// a dot-directory, which path globs skip.
+    pub fn image_dirs(&self) -> Result<Vec<String>> {
+        self.with(|lib| {
+            Ok(vec![
+                lib.root().display().to_string(),
+                lib.thumb_dir().display().to_string(),
+            ])
+        })
+    }
+
     pub fn set_rating(&self, ids: Vec<i64>, rating: u8) -> Result<usize> {
         self.with(|lib| lib.set_rating_bulk(&ids, rating))
     }

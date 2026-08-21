@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::params;
+use serde::Serialize;
 
 use crate::catalog::Library;
 use crate::error::{Error, Result};
@@ -95,7 +96,7 @@ impl Default for PublishOptions {
 }
 
 /// What a publish produced (or would produce, for a dry run).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PublishResult {
     pub album_path: String,
     /// Relative paths written, under the destination root.

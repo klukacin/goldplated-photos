@@ -19,6 +19,13 @@
 
 * { box-sizing: border-box; }
 
+/* The UI shows and hides whole panels with the `hidden` attribute. Any class
+   that sets `display` would otherwise win over the browser default of
+   `display: none`, leaving a "hidden" panel on screen — which is exactly what
+   `.welcome` and `.app` did. One rule, applied everywhere, instead of one
+   `.thing[hidden]` per component. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -302,7 +309,6 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   z-index: 100;
   padding: 1rem;
 }
-.modal[hidden] { display: none; }
 .modal-card {
   background: var(--bg-raised);
   border: 1px solid var(--border);

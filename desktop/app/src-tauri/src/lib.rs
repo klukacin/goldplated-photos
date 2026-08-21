@@ -22,8 +22,33 @@ fn to_msg(e: gpp_core::Error) -> String {
 // ------------------------------------------------------------------ library
 
 #[tauri::command]
-fn open_library(state: State<'_, Session>, path: String) -> CmdResult<LibraryStatus> {
-    state.open_library(path).map_err(to_msg)
+fn open_library(app: tauri::AppHandle, path: String) -> CmdResult<LibraryStatus> {
+    let status = app.state::<Session>().open_library(&path).map_err(to_msg)?;
+    allow_reading_library(&app);
+    Ok(status)
+}
+
+/// Let the webview load images out of this library.
+///
+/// The asset protocol is deny-by-default and the static `$HOME/**` scope is
+/// wrong twice over for a photo app: libraries live on external drives and
+/// network volumes as often as under `$HOME`, and the thumbnail cache sits in a
+/// dot-directory that the glob will not match. Granting the directory that was
+/// actually opened is both narrower and correct.
+fn allow_reading_library(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let dirs = match app.state::<Session>().image_dirs() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("could not determine image directories: {e}");
+            return;
+        }
+    };
+    for dir in dirs {
+        if let Err(e) = app.asset_protocol_scope().allow_directory(&dir, true) {
+            eprintln!("could not grant image access for {dir}: {e}");
+        }
+    }
 }
 
 #[tauri::command]
@@ -285,6 +310,14 @@ async fn sync_all_tracked(
     .map_err(|e| e.to_string())?
 }
 
+/// Library path passed on the command line: `gpp-desktop ~/Photos`.
+///
+/// Lets the app be launched straight into a library — from a shell, a shortcut,
+/// or a script — instead of always going through the folder picker.
+fn library_from_args() -> Option<String> {
+    std::env::args().skip(1).find(|a| !a.starts_with('-'))
+}
+
 /// Entry point shared by the desktop binary and (later) the mobile target.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -292,6 +325,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(Session::new())
+        .setup(|app| {
+            if let Some(path) = library_from_args() {
+                // A bad path is not fatal: the window still opens on the
+                // welcome screen, which is where the user can pick another.
+                match app.state::<Session>().open_library(&path) {
+                    Ok(_) => allow_reading_library(app.handle()),
+                    Err(e) => eprintln!("could not open library {path}: {e}"),
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             open_library,
             library_status,

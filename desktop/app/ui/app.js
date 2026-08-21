@@ -56,6 +56,17 @@ document.addEventListener('keydown', (e) => {
 // ----------------------------------------------------------------- startup
 
 async function boot() {
+  // A library named on the command line is already open in the core before the
+  // window appears — adopt it rather than asking again.
+  try {
+    const info = await invoke('library_status');
+    localStorage.setItem(LIBRARY_KEY, info.root);
+    await enterApp(info);
+    return;
+  } catch {
+    // Nothing open yet; fall through to the remembered library.
+  }
+
   const remembered = localStorage.getItem(LIBRARY_KEY);
   if (remembered) {
     try {
@@ -82,6 +93,11 @@ $('open-library-btn').addEventListener('click', async () => {
 async function openLibrary(path) {
   const info = await invoke('open_library', { path });
   localStorage.setItem(LIBRARY_KEY, path);
+  await enterApp(info);
+}
+
+/// Swap the welcome screen for the app and load its contents.
+async function enterApp(info) {
   $('welcome').hidden = true;
   $('app').hidden = false;
   renderStatus(info);
@@ -241,6 +257,8 @@ async function applyRating(rating) {
     if (p) p.rating = rating;
   });
   renderGrid();
+  // Keep the inspector's own star row in step with what the grid now shows.
+  if (state.cursor >= 0) showInspector(state.photos[state.cursor]);
   status(`Rated ${ids.length} photo(s) ${rating}★`);
 }
 
@@ -253,6 +271,7 @@ async function applyFlag(flag) {
     if (p) p.flag = flag;
   });
   renderGrid();
+  if (state.cursor >= 0) showInspector(state.photos[state.cursor]);
   status(`Flagged ${ids.length} photo(s): ${flag}`);
 }
 
