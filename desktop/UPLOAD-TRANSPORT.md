@@ -261,22 +261,47 @@ currently gates `/albums/*` through Node.
 
 ---
 
-## Open questions — do not fill these with plausible numbers
+## What is still unknown, and whether it matters
 
-1. **No upload-direction QUIC benchmark was found.** HTTP/3 upload performance
-   is unmeasured, not proven bad.
-2. **No modern `mod_dav` PUT vs plain POST benchmark was found.** The
-   "no per-byte penalty" claim is reasoning from Apache's filter architecture.
-3. **FTPS handshake cost:** only vendor-blog figures (100–300 ms). The
-   percentages in §7 are arithmetic from first principles, not measurement.
-4. **cPanel WebDAV availability: sources actively contradict each other.**
-   Confirm with the specific host.
-5. **AWS S3 and Backblaze pricing could not be confirmed from vendor pages**
-   (egress-blocked during research). The R2 figures are primary-source.
-6. **Cloudflare's ~100 MB proxied request-body limit on Free/Pro is
-   search-summary only.** It would constrain 50 MB RAWs less than it looks, but
-   verify before designing around it — it applies to anything behind an
-   orange-clouded hostname, including our own Node endpoint.
-7. A search summary claimed **rclone does rsync-style delta transfers. It does
-   not** — zero occurrences of "delta" in its docs. Recorded because it is the
-   kind of confident-and-wrong claim that ends up in a decision.
+Ranked by whether the answer would change the plan. Most of these belong to
+options already rejected for reasons a benchmark cannot overturn, so they are
+recorded rather than owed.
+
+### Blocks the recommended plan — check before writing code
+
+**Cloudflare's proxied request-body limit** (reportedly ~100 MB on Free/Pro,
+200 MB Business). This is the only open item that touches the plan we chose,
+because that plan is `PUT` to our own Node endpoint: if the gallery hostname is
+proxied, the limit applies to our routes too. A 50 MB RAW fits, but the ceiling
+is real and would bite on larger files.
+
+Five-second check, from a machine that can reach the host:
+
+```bash
+curl -sI https://<gallery-host> | grep -iE "server|cf-ray"
+```
+
+`server: cloudflare` or a `cf-ray` header means it applies — then confirm the
+tier's actual limit in the dashboard. No Cloudflare, no question.
+
+### Blocks only the fallback
+
+**AWS S3 and Backblaze pricing** could not be confirmed from vendor pages. Only
+relevant if we take the object-storage route, i.e. if server-side routes turn
+out to be impossible. The R2 figures in §8 *are* primary-source and confirmed.
+
+### Moot — the option was rejected on other grounds
+
+| Unknown | Why an answer would not change anything |
+|---|---|
+| No upload-direction QUIC benchmark exists | HTTP/3 is undeployable for us regardless: no Apache module, nginx's is experimental with `quic_gso off`, reqwest's is behind `reqwest_unstable`, and macOS needs private Apple APIs for batched sends. Revisit only if we control the whole server stack *and* users are mostly on lossy links. |
+| No modern `mod_dav` PUT vs POST benchmark | WebDAV was rejected because Apache must own `src/content/albums/**` exclusively and we have three non-Apache writers. Throughput is irrelevant to that. |
+| FTPS per-connection handshake cost (only vendor figures, 100–300 ms) | FTPS was rejected for having no checksums at all. And §7's arithmetic already puts the handshake under 1% at our file sizes — the missing number would not move the verdict either way. |
+| cPanel WebDAV availability (sources contradict each other) | Downstream of the WebDAV rejection above. |
+
+### Not a question
+
+A search summary claimed rclone does rsync-style delta transfers. **It does
+not** — zero occurrences of "delta" in its docs tree. That is settled, not open;
+it is recorded here only as a reminder that a confident-sounding source was
+flatly wrong, which is the failure mode this section exists to prevent.
