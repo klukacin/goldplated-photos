@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gpp_core::albums::{AlbumUpdate, NewAlbum};
+use gpp_core::develop::EditOp;
 use gpp_core::import::{import_dir, ImportOptions};
 use gpp_core::model::{Flag, PhotoFilter, PhotoSort};
 use gpp_core::publish::{publish_album, PublishOptions};
@@ -44,6 +45,7 @@ fn run(args: &[String]) -> Result<()> {
         "rate" => cmd_rate(rest),
         "flag" => cmd_flag(rest),
         "album" => cmd_album(rest),
+        "develop" => cmd_develop(rest),
         "publish" => cmd_publish(rest),
         "sync" => cmd_sync(rest),
         "remote" => cmd_remote(rest),
@@ -84,7 +86,8 @@ fn positional(args: &[String]) -> Option<&str> {
                     | "--push" | "--pull" | "--both" | "--record" | "--collection"
                     | "--share-link" | "--no-share-link" | "--proofing" | "--no-proofing"
                     | "--allow-download" | "--metadata-only" | "--include-rejected"
-                    | "--no-recursive"
+                    | "--no-recursive" | "--bw" | "--no-bw" | "--flip-h" | "--flip-v"
+                    | "--reset" | "--show"
             );
             skip_next = takes_value;
             continue;
@@ -251,6 +254,106 @@ fn parse_ids(args: &[String]) -> Result<Vec<i64>> {
         return Err(gpp_core::Error::other("no valid photo ids given"));
     }
     Ok(ids)
+}
+
+/// `gpp develop <ids> [adjustments]` — non-destructive adjustments.
+///
+/// Every value is an upsert: passing `--exposure 0` clears exposure rather than
+/// storing a zero, which is what puts the photo back on its original render key.
+fn cmd_develop(args: &[String]) -> Result<()> {
+    let session = open_session(args)?;
+    let ids = parse_ids(args)?;
+
+    if has(args, "--show") {
+        for id in &ids {
+            let stack = session.photo_edits(*id)?;
+            if stack.is_empty() {
+                println!("{id}: no adjustments");
+                continue;
+            }
+            println!("{id}:");
+            for op in &stack.ops {
+                println!("  {}", describe_op(op));
+            }
+        }
+        return Ok(());
+    }
+
+    if has(args, "--reset") {
+        let n = session.reset_photo_edits(ids)?;
+        println!("reset {n} photo(s) to the original");
+        return Ok(());
+    }
+
+    let mut ops: Vec<EditOp> = Vec::new();
+    let amount = |name: &str| opt(args, name).and_then(|v| v.parse::<f32>().ok());
+
+    if let Some(ev) = amount("--exposure") { ops.push(EditOp::Exposure { ev }); }
+    if let Some(a) = amount("--contrast") { ops.push(EditOp::Contrast { amount: a }); }
+    if let Some(a) = amount("--saturation") { ops.push(EditOp::Saturation { amount: a }); }
+    if let Some(a) = amount("--temperature") { ops.push(EditOp::Temperature { amount: a }); }
+    if let Some(a) = amount("--tint") { ops.push(EditOp::Tint { amount: a }); }
+    if let Some(a) = amount("--highlights") { ops.push(EditOp::Highlights { amount: a }); }
+    if let Some(a) = amount("--shadows") { ops.push(EditOp::Shadows { amount: a }); }
+    if let Some(q) = opt(args, "--rotate").and_then(|v| v.parse::<u8>().ok()) {
+        ops.push(EditOp::Rotate { quarter_turns: q });
+    }
+    if let Some(spec) = opt(args, "--crop") {
+        let n: Vec<f32> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if n.len() != 4 {
+            return Err(gpp_core::Error::other("--crop wants x,y,w,h as fractions, e.g. 0.1,0,0.8,1"));
+        }
+        ops.push(EditOp::Crop { x: n[0], y: n[1], w: n[2], h: n[3] });
+    }
+    if has(args, "--bw") { ops.push(EditOp::BlackAndWhite); }
+    if has(args, "--flip-h") { ops.push(EditOp::FlipHorizontal); }
+    if has(args, "--flip-v") { ops.push(EditOp::FlipVertical); }
+
+    let mut clears: Vec<&str> = Vec::new();
+    if has(args, "--no-bw") { clears.push("black-and-white"); }
+
+    if ops.is_empty() && clears.is_empty() {
+        return Err(gpp_core::Error::other(
+            "nothing to do — pass an adjustment, --show or --reset (see `gpp help`)",
+        ));
+    }
+
+    let mut touched = 0;
+    for op in ops {
+        touched = touched.max(session.set_photo_edit(ids.clone(), op)?);
+    }
+    for kind in clears {
+        touched = touched.max(session.clear_photo_edit(ids.clone(), kind.to_string())?);
+    }
+    println!("adjusted {touched} photo(s)");
+    Ok(())
+}
+
+fn describe_op(op: &EditOp) -> String {
+    match *op {
+        EditOp::Exposure { ev } => format!("exposure     {ev:+.2} EV"),
+        EditOp::Contrast { amount } => format!("contrast     {amount:+.0}"),
+        EditOp::Saturation { amount } => format!("saturation   {amount:+.0}"),
+        EditOp::Temperature { amount } => format!("temperature  {amount:+.0}"),
+        EditOp::Tint { amount } => format!("tint         {amount:+.0}"),
+        EditOp::Highlights { amount } => format!("highlights   {amount:+.0}"),
+        EditOp::Shadows { amount } => format!("shadows      {amount:+.0}"),
+        EditOp::BlackAndWhite => "black & white".to_string(),
+        EditOp::Rotate { quarter_turns } => format!("rotate       {}°", quarter_turns as u32 * 90),
+        EditOp::FlipHorizontal => "flip         horizontal".to_string(),
+        EditOp::FlipVertical => "flip         vertical".to_string(),
+        EditOp::Crop { x, y, w, h } => format!("crop         {x:.3},{y:.3} {w:.3}×{h:.3}"),
+    }
+}
+
+/// A session over the same library the other commands open.
+///
+/// Develop goes through `Session` rather than `Library` because rendering the
+/// new thumbnails after an edit is part of the operation, and that lives there.
+fn open_session(args: &[String]) -> Result<gpp_core::Session> {
+    let session = gpp_core::Session::new();
+    session.open_library(library_root(args)?)?;
+    Ok(session)
 }
 
 fn cmd_album(args: &[String]) -> Result<()> {
@@ -652,6 +755,15 @@ COMMANDS
   rate <ids> <0-5>                Set rating (ids comma-separated)
   flag <ids> <pick|reject|none>   Set flag
   stats                           Library summary
+
+  develop <ids> [adjustments]     Non-destructive adjustments (originals untouched)
+                                  [--exposure EV] [--contrast N] [--saturation N]
+                                  [--temperature N] [--tint N]
+                                  [--highlights N] [--shadows N]
+                                  [--bw|--no-bw] [--rotate 0-3]
+                                  [--flip-h] [--flip-v] [--crop x,y,w,h]
+  develop <ids> --show            Show what is applied
+  develop <ids> --reset           Back to the original
 
   album list                      All albums
   album create <path> [--title T] [--collection]

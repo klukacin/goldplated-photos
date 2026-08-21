@@ -5,6 +5,7 @@
 //! file exists to move JSON across the webview boundary.
 
 use gpp_core::albums::{AlbumUpdate, NewAlbum};
+use gpp_core::develop::{EditOp, EditStack};
 use gpp_core::model::{Flag, ImportSummary, Photo, PhotoFilter};
 use gpp_core::publish::PublishResult;
 use gpp_core::session::{AlbumSummary, LibraryStatus, PublishTarget, Session};
@@ -125,6 +126,52 @@ fn set_color_label(
     label: Option<String>,
 ) -> CmdResult<()> {
     state.set_color_label(id, label).map_err(to_msg)
+}
+
+// ------------------------------------------------------------------ develop
+
+#[tauri::command]
+fn photo_edits(state: State<'_, Session>, id: i64) -> CmdResult<EditStack> {
+    state.photo_edits(id).map_err(to_msg)
+}
+
+#[tauri::command]
+async fn set_photo_edit(
+    app: tauri::AppHandle,
+    ids: Vec<i64>,
+    op: EditOp,
+) -> CmdResult<usize> {
+    // Rendering the new thumbnails is CPU-bound; a whole selection of them must
+    // not freeze the slider being dragged.
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().set_photo_edit(ids, op).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn clear_photo_edit(
+    app: tauri::AppHandle,
+    ids: Vec<i64>,
+    kind: String,
+) -> CmdResult<usize> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .clear_photo_edit(ids, kind)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn reset_photo_edits(app: tauri::AppHandle, ids: Vec<i64>) -> CmdResult<usize> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().reset_photo_edits(ids).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ------------------------------------------------------------------- albums
@@ -348,6 +395,10 @@ pub fn run() {
             set_rating,
             set_flag,
             set_color_label,
+            photo_edits,
+            set_photo_edit,
+            clear_photo_edit,
+            reset_photo_edits,
             list_albums,
             create_album,
             update_album,

@@ -23,7 +23,8 @@ desktop/
 | Sync planning that cannot wipe another machine's albums | done |
 | Per-album two-way sync: adopt an album, contribute one, from any machine | done |
 | Paths stay whole: folders travel with their albums, both directions | done |
-| RAW decoding, develop pipeline | not yet — `RawDecoder` trait is in place |
+| Develop: non-destructive adjustments, applied on publish | done |
+| RAW decoding | not yet — `RawDecoder` trait is in place |
 
 ---
 
@@ -34,7 +35,7 @@ containers — that is the point of keeping the GUI out of the core:
 
 ```bash
 cd desktop
-cargo test          # 87 tests
+cargo test          # 109 tests
 cargo clippy --all-targets
 cargo build --release -p gpp-cli
 ```
@@ -122,6 +123,40 @@ afterwards.
 
 ---
 
+## Developing photos
+
+Adjustments are recorded, never baked in. The original file is never opened for
+writing — adjusted pixels only ever appear in derived places: the thumbnail
+cache and whatever gets published.
+
+```bash
+gpp develop 12,13,14 --exposure -0.5 --contrast 20 --shadows 15
+gpp develop 12 --show
+#   exposure     -0.50 EV
+#   contrast     +20
+#   shadows      +15
+gpp develop 12,13,14 --reset      # back to the original
+```
+
+Available: `--exposure` (stops), `--contrast`, `--saturation`, `--temperature`,
+`--tint`, `--highlights`, `--shadows`, `--bw`, `--rotate 0-3`, `--flip-h`,
+`--flip-v`, `--crop x,y,w,h`. Every value is an upsert, so setting a slider
+twice replaces it rather than stacking, and setting it back to zero removes it.
+
+**Why it stays fast.** Every derived image is addressed by a *render key*: the
+content hash for an untouched photo, a hash of content plus edits for an
+adjusted one. So a photo with no edits keeps the thumbnails it already had,
+changing an edit can never show a stale thumbnail, and reverting lands back on
+a key that is usually still cached. Publishing copies a cached full-size render
+rather than re-developing, so an album of adjusted photos costs one render each,
+not one per publish.
+
+Geometry runs before tone, which is why cropping and then adjusting behaves the
+way it looks like it should: the tone operators only see the pixels that
+survived the crop.
+
+---
+
 ## Working from more than one machine
 
 Every album syncs on its own, in the direction you choose for it. Albums you
@@ -191,6 +226,48 @@ album, and Pull / Push / Sync per row. Deletions ask first, by name.
 The remote is a directory today — a network share, an external drive, or a
 folder something else keeps in sync. `SftpTransport` and `HttpTransport` slot in
 behind the same trait without touching any of the logic above.
+
+---
+
+## Working on the core in parallel
+
+The layout is built so several streams of work can run at once without
+colliding. Three properties do the heavy lifting:
+
+**The core has no GUI dependency.** `gpp-core` and `gpp-cli` build and test on
+any machine, in any container, with no display and no webview. Anyone can work
+on catalog, import, albums, publish, sync or develop without ever touching the
+shell.
+
+**The shell is outside the cargo workspace.** `desktop/app/src-tauri` has its
+own `Cargo.lock`, so a platform-specific dependency there cannot break the
+core's build for everyone else.
+
+**The seams are traits and one method per command.** `RemoteTransport`,
+`RawDecoder` and `Session` are the boundaries; work on either side of one only
+needs the signature to stay put.
+
+A worktree per stream keeps builds from fighting over `target/`:
+
+```bash
+git worktree add ../gpp-develop  -b feature/develop-pipeline
+git worktree add ../gpp-raw      -b feature/raw-decoder
+# each has its own target/ and its own catalog fixtures
+```
+
+Before pushing anything that touches the shell:
+
+```bash
+npm run check:shell          # contract checks — no GUI needed, ~50ms
+cd desktop && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+`check:shell` exists because the shell is the one place unit tests cannot
+reach. Every check in it is a bug that actually shipped: an unregistered
+command, a missing element id, a missing capability, a CSP without `ipc:`, an
+asset protocol enabled in config but not compiled in, a `hidden` attribute
+beaten by CSS, and a build script that did not notice the frontend changed. CI
+runs it, then compiles the shell against WebKitGTK.
 
 ---
 

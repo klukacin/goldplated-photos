@@ -127,10 +127,10 @@ tags(id, name UNIQUE)
 photo_tags(photo_id, tag_id)
 album_tags(album_id, tag_id)
 
-edits(                              -- reserved for the develop phase
+edits(                              -- non-destructive develop (see §5.1)
   photo_id INTEGER PRIMARY KEY,
   version INTEGER NOT NULL,
-  stack_json TEXT NOT NULL          -- ordered, non-destructive operation list
+  stack_json TEXT NOT NULL          -- ordered operation list
 )
 
 sync_state(                         -- see §6
@@ -201,6 +201,45 @@ not orphan its thumbnails.
 **Parallelism.** `rayon` over the import set, bounded by available cores. This
 is the single biggest speed win over the Node admin: real threads, no event loop,
 no GC pause.
+
+### 5.1 Develop
+
+Adjustments are a list of ops stored as JSON against a photo. Nothing on disk
+changes when a slider moves; the original is never opened for writing.
+
+The load-bearing idea is the **render key**. Derived images are addressed by the
+content hash for an untouched photo, and by a hash of content plus edit stack
+for an adjusted one:
+
+```
+untouched:  <thumbs>/ab/abcd…_small.jpg      key = content_hash
+adjusted:   <thumbs>/7f/7f01…_small.jpg      key = blake3(content_hash + stack)
+            <thumbs>/7f/7f01…_full.jpg       cached full-size render
+```
+
+Three properties fall out of that, and they are why this feature did not
+invalidate anything that already existed:
+
+| Property | Because |
+|---|---|
+| Adding develop broke no existing cache | an empty stack yields the content hash unchanged |
+| A stale thumbnail can never be shown | different edits are different keys, not the same key rewritten |
+| Undo is a cache hit | a previous edit is a previous key, still on disk |
+| Publish does not re-develop | it copies the cached `_full` render |
+
+An identity value (`--exposure 0`) removes the op rather than storing a zero,
+so a slider returned to neutral puts the photo back on its original key instead
+of leaving it on an "edited" key that renders identically.
+
+Geometry ops run before tone ops regardless of stack order: cropping first is
+what makes the tone operators see only the pixels that survive, which is what a
+crop-then-adjust workflow looks like it should do.
+
+The pixel maths is pure and unit-tested (exposure in stops, contrast pivoting on
+mid grey, highlight/shadow masks weighted by luma with a smoothstep ramp). The
+wiring — catalog, thumbnails, publish, revert — is covered end to end in
+`tests/develop_end_to_end.rs`, including the assertion that the original file is
+byte-identical after being adjusted.
 
 ---
 

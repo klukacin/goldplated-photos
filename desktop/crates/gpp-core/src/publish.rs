@@ -157,7 +157,15 @@ pub fn publish_album(
     // Photos
     if opts.copy_photos {
         for photo in &photos {
-            let src = lib.resolve(&photo.rel_path)?;
+            // What ships is the developed photo. With no adjustments this is the
+            // original file itself — no copy, no render, nothing cached.
+            let original = lib.resolve(&photo.rel_path)?;
+            let src = crate::develop::ensure_rendered(
+                &original,
+                &lib.thumb_dir(),
+                photo,
+                &lib.edits(photo.id)?,
+            )?;
             let dest = album_dir.join(&photo.filename);
 
             // Skip when destination already matches by size — cheap and

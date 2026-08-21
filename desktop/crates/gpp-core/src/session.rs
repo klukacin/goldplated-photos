@@ -136,7 +136,8 @@ impl Session {
     pub fn thumbnail_path(&self, id: i64, size: &str) -> Result<String> {
         self.with(|lib| {
             let photo = lib.photo_by_id(id)?;
-            let p = crate::media::thumb_path(&lib.thumb_dir(), &photo.content_hash, size);
+            let key = crate::develop::render_key(&photo.content_hash, &lib.edits(photo.id)?);
+            let p = crate::media::thumb_path(&lib.thumb_dir(), &key, size);
             Ok(p.display().to_string())
         })
     }
@@ -163,6 +164,65 @@ impl Session {
 
     pub fn set_color_label(&self, id: i64, label: Option<String>) -> Result<()> {
         self.with(|lib| lib.set_color_label(id, label.as_deref()))
+    }
+
+    // ------------------------------------------------------------- develop
+
+    /// The adjustments on one photo. Never absent — an untouched photo has an
+    /// empty stack, so a develop panel has one shape to render.
+    pub fn photo_edits(&self, id: i64) -> Result<crate::develop::EditStack> {
+        self.with(|lib| lib.edits(id))
+    }
+
+    /// Set one adjustment on every selected photo.
+    ///
+    /// Bulk because that is how the panel is used: pick twenty frames from the
+    /// same light and pull them all down half a stop. Returns how many photos
+    /// changed.
+    pub fn set_photo_edit(
+        &self,
+        ids: Vec<i64>,
+        op: crate::develop::EditOp,
+    ) -> Result<usize> {
+        self.edit_each(ids, |stack| stack.set(op.clone()))
+    }
+
+    /// Drop one adjustment, leaving the rest.
+    pub fn clear_photo_edit(&self, ids: Vec<i64>, kind: String) -> Result<usize> {
+        self.edit_each(ids, |stack| stack.remove(&kind))
+    }
+
+    /// Back to the original, for every selected photo.
+    pub fn reset_photo_edits(&self, ids: Vec<i64>) -> Result<usize> {
+        self.edit_each(ids, |stack| *stack = crate::develop::EditStack::new())
+    }
+
+    /// Apply a change to each photo's stack, then rebuild what it derives.
+    ///
+    /// One photo failing to render — an unplugged drive, a corrupt file — must
+    /// not abandon the rest of the selection, so the stack is saved first and
+    /// rendering failures are skipped.
+    fn edit_each(
+        &self,
+        ids: Vec<i64>,
+        change: impl Fn(&mut crate::develop::EditStack),
+    ) -> Result<usize> {
+        self.with(|lib| {
+            let mut changed = 0;
+            for id in ids {
+                let photo = lib.photo_by_id(id)?;
+                let mut stack = lib.edits(id)?;
+                let before = stack.clone();
+                change(&mut stack);
+                if stack == before {
+                    continue;
+                }
+                lib.set_edits(id, &stack)?;
+                let _ = crate::develop::render_derived(lib, &photo, &stack);
+                changed += 1;
+            }
+            Ok(changed)
+        })
     }
 
     // -------------------------------------------------------------- albums

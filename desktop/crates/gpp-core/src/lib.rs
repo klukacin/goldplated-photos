@@ -15,6 +15,7 @@
 
 pub mod albums;
 pub mod catalog;
+pub mod develop;
 pub mod error;
 pub mod import;
 pub mod media;
