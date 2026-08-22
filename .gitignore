@@ -64,3 +64,6 @@ src/content/home/
 *.m4v
 .private/
 docs/site/
+
+# Agent worktrees live here; they are full checkouts of other branches.
+.claude/worktrees/

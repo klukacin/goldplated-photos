@@ -61,6 +61,13 @@ jobs:
       - name: Tests
         run: cargo test
 
+      # The licence rule in Cargo.toml has been broken once by accident — a TLS
+      # backend change pulled in a vendored root bundle under a licence outside
+      # the policy, caught only by reading a dependency list by hand.
+      - name: Licence policy
+        working-directory: .
+        run: node scripts/check-licences.mjs
+
       - name: Release build (CLI)
         run: cargo build --release -p gpp-cli
 
