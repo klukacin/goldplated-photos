@@ -1378,6 +1378,9 @@ function getVideoMimeType(filename: string): string {
   import PhotoSwipeLightbox from 'photoswipe/lightbox';
   import PhotoSwipe from 'photoswipe';
   import 'photoswipe/style.css';
+  // Overlay markup lives in src/lib/media-info.ts so the escaping of
+  // file-supplied EXIF/ffprobe strings can be unit-tested.
+  import { formatExifData, formatVideoInfo } from '../lib/media-info';
 
   // Current photo URL for EXIF data
   let currentPhotoUrl = '';
@@ -1917,61 +1920,6 @@ function getVideoMimeType(filename: string): string {
       console.error('[PhotoGrid] Error fetching video info:', error);
       return null;
     }
-  }
-
-  // Format video info for display
-  function formatVideoInfo(info: any): string {
-    const sections = [];
-
-    // Video section
-    const videoFields = [];
-    if (info.duration) videoFields.push({ label: 'Duration', value: info.duration });
-    if (info.resolution) videoFields.push({ label: 'Resolution', value: info.resolution });
-    if (info.codec) videoFields.push({ label: 'Video Codec', value: info.codec });
-    if (info.frameRate) videoFields.push({ label: 'Frame Rate', value: info.frameRate });
-
-    if (videoFields.length > 0) {
-      sections.push({ title: '🎬 Video', fields: videoFields });
-    }
-
-    // Audio section
-    const audioFields = [];
-    if (info.audioCodec) audioFields.push({ label: 'Audio Codec', value: info.audioCodec });
-
-    if (audioFields.length > 0) {
-      sections.push({ title: '🔊 Audio', fields: audioFields });
-    }
-
-    // File section
-    const fileFields = [];
-    if (info.size) fileFields.push({ label: 'File Size', value: info.size });
-    if (info.bitrate) fileFields.push({ label: 'Bitrate', value: info.bitrate });
-
-    if (fileFields.length > 0) {
-      sections.push({ title: '📁 File', fields: fileFields });
-    }
-
-    if (sections.length === 0) {
-      return '<p style="color: #666;">No video information available.</p>';
-    }
-
-    let html = '';
-    sections.forEach(section => {
-      html += `
-        <div class="exif-section" style="margin-bottom: 1.5rem;">
-          <h4 style="margin-bottom: 0.75rem; color: #333; font-size: 1.1rem;">${section.title}</h4>
-          <dl style="display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; margin: 0;">
-      `;
-      section.fields.forEach((field: any) => {
-        html += `
-          <dt style="font-weight: 500; color: #666;">${field.label}</dt>
-          <dd style="color: #333; margin: 0;">${field.value}</dd>
-        `;
-      });
-      html += `</dl></div>`;
-    });
-
-    return html;
   }
 
   // Helper function to update visual focus
@@ -2984,126 +2932,4 @@ function getVideoMimeType(filename: string): string {
     }
   });
 
-  function formatExifData(exif: any): string {
-    const sections: any[] = [];
-
-    // Rating section - show first if available (from XMP metadata)
-    if (exif.Rating !== undefined && exif.Rating > 0) {
-      const rating = Math.min(5, Math.max(0, Math.round(exif.Rating)));
-      const stars = '★'.repeat(rating) + '☆'.repeat(5 - rating);
-      sections.push({
-        isRating: true,
-        stars: stars
-      });
-    }
-
-    // Camera section
-    const cameraFields = [];
-    if (exif.Make) cameraFields.push({ label: 'Make', value: exif.Make });
-    if (exif.Model) cameraFields.push({ label: 'Model', value: exif.Model });
-    if (exif.LensModel || exif.Lens) cameraFields.push({ label: 'Lens', value: exif.LensModel || exif.Lens });
-
-    if (cameraFields.length > 0) {
-      sections.push({
-        title: '📷 Camera',
-        fields: cameraFields
-      });
-    }
-
-    // Settings section
-    const settingsFields = [];
-    if (exif.ISO) settingsFields.push({ label: 'ISO', value: exif.ISO });
-    if (exif.FNumber) settingsFields.push({ label: 'Aperture', value: `f/${exif.FNumber}` });
-    if (exif.ExposureTime) {
-      const shutterSpeed = exif.ExposureTime < 1
-        ? `1/${Math.round(1/exif.ExposureTime)}s`
-        : `${exif.ExposureTime}s`;
-      settingsFields.push({ label: 'Shutter Speed', value: shutterSpeed });
-    }
-    if (exif.FocalLength) settingsFields.push({ label: 'Focal Length', value: `${exif.FocalLength}mm` });
-    if (exif.ExposureCompensation) settingsFields.push({ label: 'Exposure Comp', value: `${exif.ExposureCompensation > 0 ? '+' : ''}${exif.ExposureCompensation} EV` });
-
-    if (settingsFields.length > 0) {
-      sections.push({
-        title: '⚙️ Settings',
-        fields: settingsFields
-      });
-    }
-
-    // Image info section
-    const imageFields = [];
-    if (exif.ImageWidth && exif.ImageHeight) {
-      imageFields.push({ label: 'Dimensions', value: `${exif.ImageWidth} × ${exif.ImageHeight}` });
-    }
-    if (exif.DateTimeOriginal || exif.DateTime) {
-      const dateStr = exif.DateTimeOriginal || exif.DateTime;
-      imageFields.push({ label: 'Date Taken', value: dateStr });
-    }
-    if (exif.Flash !== undefined) {
-      imageFields.push({ label: 'Flash', value: exif.Flash ? 'Yes' : 'No' });
-    }
-
-    if (imageFields.length > 0) {
-      sections.push({
-        title: 'ℹ️ Image',
-        fields: imageFields
-      });
-    }
-
-    // Location section
-    if (exif.GPSLatitude && exif.GPSLongitude) {
-      const locationFields = [
-        { label: 'Latitude', value: exif.GPSLatitude },
-        { label: 'Longitude', value: exif.GPSLongitude }
-      ];
-      if (exif.GPSAltitude) {
-        locationFields.push({ label: 'Altitude', value: `${exif.GPSAltitude}m` });
-      }
-      sections.push({
-        title: '📍 Location',
-        fields: locationFields
-      });
-    }
-
-    if (sections.length === 0) {
-      return '<p style="color: #666;">No detailed EXIF data available.</p>';
-    }
-
-    let html = '';
-    sections.forEach(section => {
-      if (section.isRating) {
-        // Rating display - elegant gold stars, centered
-        html += `
-          <div class="exif-rating" style="
-            text-align: center;
-            margin-bottom: 1.25rem;
-            padding-bottom: 1rem;
-            border-bottom: 1px solid #eee;
-          ">
-            <span class="rating-stars" style="
-              font-size: 1.4rem;
-              letter-spacing: 3px;
-              color: #d4af37;
-              text-shadow: 0 1px 2px rgba(0,0,0,0.08);
-            ">${section.stars}</span>
-          </div>
-        `;
-      } else {
-        html += `
-          <div class="exif-section" style="margin-bottom: 1.5rem;">
-            <h4 style="margin-bottom: 0.75rem; color: #333; font-size: 1.1rem;">${section.title}</h4>
-            <dl style="display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; margin: 0;">
-        `;
-        section.fields.forEach((field: any) => {
-          html += `
-            <dt style="font-weight: 500; color: #666;">${field.label}</dt>
-            <dd style="color: #333; margin: 0;">${field.value}</dd>
-          `;
-        });
-        html += `</dl></div>`;
-      }
-    });
-
-    return html;
-  }
 </script>

@@ -200,24 +200,24 @@ export function resolveChainAccess(
 
   const unlocked = parseAccessCookie(cookieValue);
 
-  // 1. A valid share token for the album or any ancestor grants access.
-  if (providedToken) {
-    for (const entry of chain) {
-      const shareToken = entry.data.shareToken;
-      if (shareToken && safeCompare(providedToken, shareToken)) {
-        const id = entry.data.token;
-        const grantedTokens = unlocked.includes(id) ? null : [...unlocked, id];
-        return { hasAccess: true, isProtected, blockingAlbum: null, grantedTokens };
-      }
-    }
-  }
-
-  // 2. Cookie-based: walk bottom-up; the nearest unlocked album grants,
-  //    the nearest locked album blocks.
+  // Walk bottom-up and stop at the nearest album that settles the question:
+  // an unlocked one (cookie) or a matching share token grants, a locked one
+  // blocks. Both grants are tested at the same level so they agree — an
+  // ancestor's share link must no more open a separately locked child than
+  // an ancestor's cookie does, or handing a client the collection link hands
+  // them every album inside it that was deliberately locked on its own.
   for (const entry of chain) {
     if (unlocked.includes(entry.data.token)) {
       return { ...GRANTED, isProtected };
     }
+
+    const shareToken = entry.data.shareToken;
+    if (providedToken && shareToken && safeCompare(providedToken, shareToken)) {
+      const id = entry.data.token;
+      const grantedTokens = unlocked.includes(id) ? null : [...unlocked, id];
+      return { hasAccess: true, isProtected, blockingAlbum: null, grantedTokens };
+    }
+
     if (isAlbumLocked(entry)) {
       return {
         hasAccess: false,
@@ -235,6 +235,53 @@ export function resolveChainAccess(
   // No locked album encountered on the way up (unreachable when isProtected
   // is true, but keep a safe default for genuinely unlocked chains).
   return { ...GRANTED, isProtected };
+}
+
+// ---------------------------------------------------------------------------
+// Listing visibility
+// ---------------------------------------------------------------------------
+
+/** Minimal album shape for deciding how a listing should present an album. */
+export interface ListingAlbum {
+  password?: string;
+  shareToken?: string;
+  hidden?: boolean;
+}
+
+export interface ChainVisibility {
+  /** The album or one of its ancestors is locked. */
+  locked: boolean;
+  /** The album or one of its ancestors is hidden from listings. */
+  hidden: boolean;
+}
+
+/**
+ * Apply the same inheritance rule as `resolveChainAccess`, but for pages that
+ * render a listing rather than answering a request: tag pages, public search.
+ *
+ * Those pages know nothing about the visitor — a tag page is prerendered — so
+ * they can only ask what the tree says. Checking an album's own frontmatter is
+ * not enough: an album sitting inside a locked collection is protected content
+ * too, and printing its title and cover filename on a public page hands out
+ * what the lock on the collection exists to withhold.
+ *
+ * `lookup` resolves an album path to its frontmatter, or undefined when that
+ * path is not an album (an intermediate folder with no index.md).
+ */
+export function resolveChainVisibility(
+  albumPath: string,
+  lookup: (path: string) => ListingAlbum | undefined
+): ChainVisibility {
+  const parts = albumPath.split('/');
+  const result: ChainVisibility = { locked: false, hidden: false };
+
+  for (let i = parts.length; i > 0; i--) {
+    const entry = lookup(parts.slice(0, i).join('/'));
+    if (!entry) continue;
+    if (entry.password || entry.shareToken) result.locked = true;
+    if (entry.hidden) result.hidden = true;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

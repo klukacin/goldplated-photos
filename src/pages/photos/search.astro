@@ -7,6 +7,7 @@ export const prerender = false;
 
 import { getAllAlbums, getPhotosForAlbum, type Album, type Photo } from '../../lib/albums';
 import { albumMatchesQuery, photoMatchesQuery, normalizeQuery } from '../../lib/search-core';
+import { resolveChainVisibility } from '../../lib/access-core';
 import Layout from '../../layouts/Layout.astro';
 import SEO from '../../components/SEO.astro';
 import Footer from '../../components/Footer.astro';
@@ -33,17 +34,11 @@ if (query.length >= MIN_QUERY_LENGTH) {
   const albums = await getAllAlbums();
   const byPath = new Map(albums.map(a => [a.id.replace('/index.md', ''), a]));
 
-  const isLocked = (a: Album) => !!a.data.password || !!a.data.shareToken;
-
   // An album is publicly searchable when neither it nor any ancestor is
-  // hidden or locked.
+  // hidden or locked (same inheritance rule as access control).
   const isPublicChain = (albumPath: string): boolean => {
-    const parts = albumPath.split('/');
-    for (let i = parts.length; i > 0; i--) {
-      const ancestor = byPath.get(parts.slice(0, i).join('/'));
-      if (ancestor && (isLocked(ancestor) || ancestor.data.hidden)) return false;
-    }
-    return true;
+    const visibility = resolveChainVisibility(albumPath, p => byPath.get(p)?.data);
+    return !visibility.locked && !visibility.hidden;
   };
 
   const publicAlbums = albums

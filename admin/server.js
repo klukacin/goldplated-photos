@@ -23,10 +23,41 @@ try {
 } catch { /* no .env — fine */ }
 
 const app = express();
-const PORT = 4444;
+// 4444 unless told otherwise. Overridable so a test can take a free port
+// instead of fighting an admin panel the photographer already has running.
+const PORT = Number(process.env.ADMIN_PORT) || 4444;
 
 // Middleware
-app.use(cors({ origin: ['http://localhost:4444', 'http://127.0.0.1:4444'] }));
+const ALLOWED_ORIGINS = [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`];
+
+// SECURITY: reject anything a page on another origin sent us.
+//
+// `cors()` below does NOT do this. CORS decides who may *read* a response;
+// the request has already run by the time the browser applies it. Requests a
+// browser sends without a preflight — any GET, a multipart POST — therefore
+// reach the handlers with full authority, and the server is bound to loopback
+// but every page the photographer visits is too. An <img> tag pointing at
+// /api/tools/run/deploy is enough to push the site live from someone else's
+// website; a multipart POST is enough to write files into an album.
+//
+// Fetch metadata is the check that works here, because browsers send it on the
+// no-preflight requests where Origin is absent. `same-origin` is the admin's
+// own UI, `none` is the user typing the address; everything else is somebody
+// else's page. Clients that send neither header are not browsers and cannot be
+// driven by a hostile web page, so they pass — the panel stays scriptable.
+app.use((req, res, next) => {
+  const site = req.get('Sec-Fetch-Site');
+  if (site && site !== 'same-origin' && site !== 'none') {
+    return res.status(403).json({ error: 'Cross-site requests are not allowed' });
+  }
+  const origin = req.get('Origin');
+  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+    return res.status(403).json({ error: 'Cross-site requests are not allowed' });
+  }
+  next();
+});
+
+app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json({ limit: '5mb' }));
 app.use(express.static(join(__dirname)));
 

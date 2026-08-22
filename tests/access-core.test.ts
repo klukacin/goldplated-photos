@@ -6,9 +6,11 @@ import {
   isAlbumLocked,
   parseAccessCookie,
   resolveChainAccess,
+  resolveChainVisibility,
   safeCompare,
   serializeAccessCookie,
-  type AlbumLike
+  type AlbumLike,
+  type ListingAlbum
 } from '../src/lib/access-core';
 
 function album(id: string, data: Partial<AlbumLike['data']> = {}): AlbumLike {
@@ -169,10 +171,69 @@ describe('resolveChainAccess', () => {
     expect(resolveChainAccess([passwordChild, parent], parentCookie).hasAccess).toBe(false);
   });
 
+  it("a child with its own lock stays locked against the parent's share link too", () => {
+    // The cookie path stops at the nearest lock (test above). The share-token
+    // path must stop at the same place, or handing a client the collection's
+    // secret link also hands them every separately-locked album inside it.
+    const parentShareToken = generateShareToken();
+    const parent = album('2025', { shareToken: parentShareToken });
+    const passwordChild = album('2025/vip', { password: 'q' });
+    const linkOnlyChild = album('2025/secret', { shareToken: generateShareToken() });
+
+    expect(resolveChainAccess([passwordChild, parent], undefined, parentShareToken).hasAccess).toBe(false);
+    expect(resolveChainAccess([linkOnlyChild, parent], undefined, parentShareToken).hasAccess).toBe(false);
+  });
+
+  it("a child's own share token still opens it from under a locked parent", () => {
+    const childShareToken = generateShareToken();
+    const parent = album('2025', { password: 'p' });
+    const child = album('2025/secret', { shareToken: childShareToken });
+    const result = resolveChainAccess([child, parent], undefined, childShareToken);
+    expect(result.hasAccess).toBe(true);
+    expect(result.grantedTokens).toEqual([child.data.token]);
+  });
+
   it('ignores forged (unsigned) cookies', () => {
     const a = album('2025/priv', { password: 'p' });
     const forged = JSON.stringify([a.data.token]);
     expect(resolveChainAccess([a], forged).hasAccess).toBe(false);
+  });
+});
+
+describe('resolveChainVisibility', () => {
+  const tree: Record<string, ListingAlbum> = {
+    '2026': {},
+    '2026/clients': { shareToken: 'secret-link' },
+    '2026/clients/ana-ivan': {},
+    '2026/drafts': { hidden: true },
+    '2026/drafts/maybe': {},
+    '2026/public': {},
+    '2026/public/street': {},
+    '2026/public/vip': { password: 'p' }
+  };
+  const lookup = (p: string) => tree[p];
+
+  it('reports a fully public chain as neither locked nor hidden', () => {
+    expect(resolveChainVisibility('2026/public/street', lookup)).toEqual({ locked: false, hidden: false });
+  });
+
+  it("reports an album's own lock", () => {
+    expect(resolveChainVisibility('2026/public/vip', lookup).locked).toBe(true);
+  });
+
+  it('reports a lock inherited from an ancestor', () => {
+    // The pixels of this album are behind the access check either way, but its
+    // title and cover filename are not — a public listing must treat it as
+    // locked, exactly as it treats the collection above it.
+    expect(resolveChainVisibility('2026/clients/ana-ivan', lookup).locked).toBe(true);
+  });
+
+  it('reports hidden inherited from an ancestor', () => {
+    expect(resolveChainVisibility('2026/drafts/maybe', lookup).hidden).toBe(true);
+  });
+
+  it('ignores path segments that are not albums', () => {
+    expect(resolveChainVisibility('2026/nothing/here', lookup)).toEqual({ locked: false, hidden: false });
   });
 });
 

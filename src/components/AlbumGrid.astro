@@ -6,6 +6,13 @@ import { siteConfig } from '../config';
 interface AlbumWithCover {
   album: Album;
   coverPhotoUrl: string | null;
+  /**
+   * Set when the caller has already determined the album is locked — in
+   * practice by an ancestor. `isParentProtected` is one flag for the whole
+   * grid, so it cannot express this on a listing whose albums come from all
+   * over the tree (a tag page); the caller states it per album instead.
+   */
+  lockedByAncestor?: boolean;
 }
 
 interface Props {
@@ -41,12 +48,13 @@ function formatCroatianDate(date: Date): string {
 ---
 
 <div class="album-grid">
-  {albums.map(({ album, coverPhotoUrl }) => {
+  {albums.map(({ album, coverPhotoUrl, lockedByAncestor = false }) => {
     const albumPath = album.id.replace('/index.md', '');
     const displayTitle = album.data.title;
     const albumHasPassword = !!album.data.password;
-    // Locked = password OR link-share token (link-only albums are locked too)
-    const isProtected = albumHasPassword || !!album.data.shareToken || isParentProtected;
+    // Locked = password OR link-share token (link-only albums are locked too),
+    // on the album itself or anywhere above it
+    const isProtected = albumHasPassword || !!album.data.shareToken || lockedByAncestor || isParentProtected;
     const hasCoverPhoto = !!coverPhotoUrl;
     const isCollection = album.data.isCollection;
     // SECURITY: share links from a listing only ever carry the PARENT's token
