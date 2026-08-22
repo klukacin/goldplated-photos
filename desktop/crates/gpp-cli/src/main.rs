@@ -522,6 +522,16 @@ fn cmd_publish(args: &[String]) -> Result<()> {
         for m in &r.missing {
             println!("    missing: {m}");
         }
+
+        // Two frames wanting one published name. Naming both sides is the
+        // whole point: only the photographer can say which one the client
+        // should get, and the other is not on the site until they do.
+        for c in &r.collisions {
+            eprintln!("    name taken: {} — published {}", c.dest, c.sources[0]);
+            for skipped in &c.sources[1..] {
+                eprintln!("      not published: {skipped}");
+            }
+        }
     }
     println!("published {} album(s), {} file(s) copied", targets.len(), copied);
     Ok(())
