@@ -157,6 +157,14 @@ fn cmd_import(args: &[String]) -> Result<()> {
         None,
     )?;
 
+    // Pointing this at a camera card copies it into the library. Saying so
+    // matters more here than in the app: there is no sidebar to notice a new
+    // folder in, so the only way a CLI user learns their library grew by a
+    // gigabyte is if this line tells them.
+    if let Some(into) = &summary.copied_into {
+        println!("copied {} file(s) into {into}", summary.copied_in);
+    }
+
     println!(
         "imported {} · updated {} · unchanged {} · duplicates {} · failed {}",
         summary.imported,
@@ -167,6 +175,15 @@ fn cmd_import(args: &[String]) -> Result<()> {
     );
     for (path, err) in &summary.failed {
         eprintln!("  failed: {path}: {err}");
+    }
+
+    // Catalogued but with no readable pixels — a corrupt file, or a RAW format
+    // this build does not develop. They will not be published.
+    if !summary.undecodable.is_empty() {
+        eprintln!("  {} file(s) have no preview:", summary.undecodable.len());
+        for path in &summary.undecodable {
+            eprintln!("    {path}");
+        }
     }
     Ok(())
 }
