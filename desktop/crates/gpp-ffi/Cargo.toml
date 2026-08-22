@@ -1,0 +1,32 @@
+[package]
+name = "gpp-ffi"
+description = "C ABI door onto the Goldplated Photos core, for callers that are not Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "gpp_ffi"
+# cdylib for a `.dylib`/`.so`/`.dll` a language runtime can dlopen; staticlib
+# for the `.a` an iOS app links into its binary (the App Store does not take
+# loose dynamic libraries); rlib so Rust callers — and this crate's own tests —
+# can use it without going through the loader.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+# No new dependencies. serde_json is already in the workspace and already
+# drives the Tauri boundary, so the JSON door adds nothing that was not
+# shipping. Deliberately absent: UniFFI and cbindgen, both MPL-2.0 (see the
+# licence note in the workspace manifest and the README).
+[dependencies]
+gpp-core = { path = "../gpp-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The boundary tests need real files to import, and a JPEG is the cheapest
+# thing the core will actually decode.
+image.workspace = true

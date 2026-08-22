@@ -71,6 +71,11 @@ jobs:
       - name: Release build (CLI)
         run: cargo build --release -p gpp-cli
 
+      # `cargo test` only ever builds the rlib, so a broken cdylib or staticlib
+      # link would otherwise reach the first person trying to embed the core.
+      - name: Release build (C ABI)
+        run: cargo build --release -p gpp-ffi
+
   desktop-shell:
     name: Desktop shell (Tauri)
     runs-on: ubuntu-latest

@@ -60,7 +60,8 @@ desktop/
 │   │   ├── albums/          ← album tree, membership, ordering
 │   │   ├── publish/         ← materialize Astro content tree
 │   │   └── sync/            ← three-way state, transfer trait
-│   └── gpp-cli/             ← thin CLI over the core (testing + automation)
+│   ├── gpp-cli/             ← thin CLI over the core (testing + automation)
+│   └── gpp-ffi/             ← C ABI over the core, for callers that aren't Rust
 └── app/                     ← Tauri v2 shell (macOS first, iOS target ready)
     ├── src-tauri/           ← commands → gpp-core
     └── ui/                  ← web UI (reuses admin patterns)
@@ -69,6 +70,31 @@ desktop/
 **Rule: `gpp-core` never depends on Tauri, and the UI never touches SQLite.**
 Every capability is a core function first and a Tauri command second. That is
 what makes the iPad build a packaging exercise rather than a port.
+
+### 3.1 The C door
+
+Tauri v2 reaching iOS is what makes the iPad build cheap, but it only helps a
+client that is willing to be a webview. A *native* Swift or Kotlin app had
+nothing to hold on to, which quietly made "the core is portable" a claim only
+one shell could cash.
+
+`gpp-ffi` is the fix: four `extern "C"` functions, no new dependencies, built as
+`cdylib` + `staticlib` + `rlib`. Because every `Session` method already
+serialises, the whole surface goes through one JSON call rather than
+forty-five hand-written C signatures that would drift on the first added field:
+
+```c
+GppSession *gpp_session_new(void);
+char       *gpp_call(GppSession *, const char *method, const char *args_json);
+void        gpp_string_free(char *);
+void        gpp_session_free(GppSession *);
+```
+
+Replies are always `{"ok": …}` or `{"error": …, "kind": …}`, so no caller has to
+guess, and every entry point catches unwinding — a panic reaching C is undefined
+behaviour, not a bad day. The header is hand-written and checked in: cbindgen,
+like UniFFI, is MPL-2.0, and the licence line in `Cargo.toml` holds for
+build-time tools too. See `crates/gpp-ffi/README.md`.
 
 ---
 
