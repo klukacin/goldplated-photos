@@ -1,0 +1,5 @@
+/target
+
+# Tauri shell build output and generated ACL schemas.
+app/src-tauri/target/
+app/src-tauri/gen/

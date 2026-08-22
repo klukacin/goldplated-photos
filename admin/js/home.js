@@ -4,6 +4,7 @@ const home = {
   cardBodyEditor: null,
   cards: [],
   editingCardId: null,
+  dragIndex: null,
 
   async init() {
     this.initIntroEditor();
@@ -56,7 +57,8 @@ const home = {
       if (this.editingCardId) {
         const confirmed = await modal.confirm(
           'Delete Card',
-          'Are you sure you want to delete this card?'
+          'Are you sure you want to delete this card?',
+          'Delete'
         );
         if (confirmed) {
           await this.deleteCard(this.editingCardId);
@@ -115,10 +117,45 @@ const home = {
       return;
     }
 
-    this.cards.forEach(card => {
+    this.cards.forEach((card, index) => {
       const item = document.createElement('div');
       item.className = 'card-item';
+      item.draggable = true;
+      item.dataset.index = index;
       item.addEventListener('click', () => this.openCardModal(card));
+
+      // Drag & drop reordering
+      item.addEventListener('dragstart', (e) => {
+        this.dragIndex = index;
+        item.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+      });
+      item.addEventListener('dragend', () => {
+        item.classList.remove('dragging');
+        container.querySelectorAll('.drag-over-item').forEach(el => el.classList.remove('drag-over-item'));
+      });
+      item.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        item.classList.add('drag-over-item');
+      });
+      item.addEventListener('dragleave', () => item.classList.remove('drag-over-item'));
+      item.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        item.classList.remove('drag-over-item');
+        if (this.dragIndex === null || this.dragIndex === index) return;
+        const [moved] = this.cards.splice(this.dragIndex, 1);
+        this.cards.splice(index, 0, moved);
+        this.dragIndex = null;
+        try {
+          await api.post('/api/home/cards/reorder', { order: this.cards.map(c => c.id) });
+          notifications.success('Card order saved');
+          await this.loadCards();
+        } catch (error) {
+          notifications.error('Failed to save card order: ' + error.message);
+          await this.loadCards();
+        }
+      });
 
       if (card.image) {
         const thumb = document.createElement('img');
@@ -333,7 +370,7 @@ const home = {
         deleteBtn.textContent = '×';
         deleteBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
-          const confirmed = await modal.confirm('Delete Image', `Delete "${img.filename}"?`);
+          const confirmed = await modal.confirm('Delete Image', `Delete "${img.filename}"?`, 'Delete');
           if (confirmed) {
             await this.deleteHeroImage(img.filename);
           }

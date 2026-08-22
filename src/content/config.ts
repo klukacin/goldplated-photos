@@ -7,10 +7,18 @@ const albums = defineCollection({
     title: z.string(),
     description: z.string().optional(),
     date: z.coerce.date().optional(),
-    token: z.string(), // Unique token for direct access via query parameter
+    token: z.string(), // Internal album id used in the (signed) access cookie — grants nothing by itself
     password: z.string().optional(),
-    allowAnonymous: z.boolean().default(true), // Allow direct token access bypassing parent passwords
+    // Random secret for link-sharing (generate via admin or scripts/add-share-token.mjs).
+    // Presenting it via ?token= unlocks the album without a password. An album with a
+    // shareToken and no password is reachable ONLY via the secret link.
+    shareToken: z.string().optional(),
+    // DEPRECATED: no longer consulted. Access via token requires an explicit shareToken.
+    allowAnonymous: z.boolean().default(true),
     sort: z.enum(['date-asc', 'date-desc', 'exif-asc', 'exif-desc', 'name', 'custom']).default('date-desc'),
+    // Explicit photo order (filenames) used when sort is 'custom' — managed by
+    // drag & drop in the admin panel. Unlisted files sort after, by name.
+    photoOrder: z.array(z.string()).optional(),
     style: z.enum(['grid', 'masonry', 'slideshow', 'single-column']).default('single-column'),
     thumbnail: z.string().optional(),
     tags: z.array(z.string()).optional(),
@@ -18,6 +26,7 @@ const albums = defineCollection({
     order: z.number().optional(), // Lower numbers appear first in album listings
     hidden: z.boolean().default(false), // Hide from album listings (accessible via direct link)
     allowDownload: z.boolean().default(false), // Enable Download Album button
+    proofing: z.boolean().default(false), // Enable client proofing (select + comment + submit)
   }),
 });
 

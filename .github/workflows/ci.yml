@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    name: Web gallery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check (astro check)
+        run: npm run check
+
+      - name: Unit tests (vitest)
+        run: npm test
+
+      - name: Syntax-check admin server and scripts
+        run: |
+          for f in admin/server.js admin/js/*.js scripts/*.mjs; do
+            node --check "$f"
+          done
+          bash -n scripts/deploy.sh
+
+      - name: Build
+        run: npm run build
+
+  desktop-core:
+    name: Desktop core (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      # The Tauri shell is excluded from the workspace on purpose — it needs a
+      # platform webview toolkit. The core and CLI build anywhere.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      # The licence rule in Cargo.toml has been broken once by accident — a TLS
+      # backend change pulled in a vendored root bundle under a licence outside
+      # the policy, caught only by reading a dependency list by hand.
+      - name: Licence policy
+        working-directory: .
+        run: node scripts/check-licences.mjs
+
+      - name: Release build (CLI)
+        run: cargo build --release -p gpp-cli
+
+      # `cargo test` only ever builds the rlib, so a broken cdylib or staticlib
+      # link would otherwise reach the first person trying to embed the core.
+      - name: Release build (C ABI)
+        run: cargo build --release -p gpp-ffi
+
+  desktop-shell:
+    name: Desktop shell (Tauri)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop/app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Cheap, deterministic, and covers the failure mode the compiler cannot:
+      # a shell that builds and launches but is inert because a capability,
+      # a CSP directive or a CSS rule is missing.
+      - name: Shell contract checks
+        run: node check-shell.mjs
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/app/src-tauri
+
+      # The shell is outside the cargo workspace because it needs a platform
+      # webview. On Linux that is WebKitGTK.
+      - name: Install webview toolkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+
+      - name: Clippy
+        working-directory: desktop/app/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: desktop/app/src-tauri
+        run: cargo build

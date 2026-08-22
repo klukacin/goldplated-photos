@@ -30,6 +30,11 @@
     "dev:bg": "./scripts/start-dev.sh",
     "stop:dev": "./scripts/stop-dev.sh",
     "build": "astro build",
+    "check": "astro check",
+    "check:shell": "node desktop/app/check-shell.mjs",
+    "check:licences": "node scripts/check-licences.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "preview": "astro preview",
     "deploy": "./scripts/deploy.sh",
     "deploy:parallel": "./scripts/deploy.sh --parallel",
@@ -47,20 +52,25 @@
   "dependencies": {
     "@astrojs/node": "^9.5.1",
     "@ffprobe-installer/ffprobe": "^2.1.2",
+    "@noble/hashes": "^2.3.0",
+    "archiver": "^8.0.0",
     "astro": "^5.16.6",
     "cors": "^2.8.5",
     "exifr": "^7.1.3",
     "express": "^5.2.1",
     "fluent-ffmpeg": "^2.1.3",
     "gray-matter": "^4.0.3",
-    "jszip": "^3.10.1",
     "marked": "^12.0.2",
     "mrmime": "^2.0.1",
     "multer": "^2.0.2",
     "photoswipe": "^5.4.4",
-    "rollup": "^4.54.0"
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
-    "@types/fluent-ffmpeg": "^2.1.28"
+    "@astrojs/check": "^0.9.10",
+    "@types/archiver": "^8.0.0",
+    "@types/fluent-ffmpeg": "^2.1.28",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

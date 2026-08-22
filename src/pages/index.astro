@@ -45,7 +45,7 @@ import SEO from '../components/SEO.astro';
 
       // Try to play sound, but don't block navigation if it fails
       try {
-        shutterSound?.play();
+        (shutterSound as HTMLAudioElement | null)?.play();
       } catch (error) {
         console.log('Could not play shutter sound:', error);
       }

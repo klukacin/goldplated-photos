@@ -1,17 +1,10 @@
 import { getCollection, type CollectionEntry } from 'astro:content';
 import fs from 'fs/promises';
 import path from 'path';
-import { createHash } from 'crypto';
-import sharp from 'sharp';
-import * as exifr from 'exifr';
 import { marked } from 'marked';
+import { getAlbumMediaMeta } from './media-cache';
 
 export type Album = CollectionEntry<'albums'>;
-
-export interface AlbumWithPhotos extends Album {
-  photos: Photo[];
-  subAlbums: Album[];
-}
 
 export interface Photo {
   filename: string;
@@ -23,6 +16,10 @@ export interface Photo {
   width?: number;
   height?: number;
   isVideo?: boolean;
+  /** Tiny base64 JPEG data URI for blur-up placeholders */
+  blur?: string | null;
+  /** Camera make+model from EXIF */
+  camera?: string | null;
 }
 
 // Supported file extensions
@@ -102,7 +99,11 @@ export async function getSubAlbums(parentPath: string): Promise<Album[]> {
 }
 
 /**
- * Get media (photos and videos) from an album directory
+ * Get media (photos and videos) from an album directory.
+ *
+ * Dimensions, EXIF date, camera and blur previews come from the per-album
+ * metadata cache (.meta/index.json) — only new or changed files trigger
+ * actual image processing (see src/lib/media-cache.ts).
  */
 export async function getPhotosForAlbum(albumPath: string): Promise<Photo[]> {
   const albumDir = path.join(process.cwd(), 'src/content/albums', albumPath);
@@ -111,87 +112,51 @@ export async function getPhotosForAlbum(albumPath: string): Promise<Photo[]> {
     const files = await fs.readdir(albumDir);
     const allMediaExtensions = [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS];
 
-    const mediaPromises = files
-      .filter(file => {
-        // Skip hidden files (e.g., macOS resource forks like ._filename.jpg)
-        if (file.startsWith('.')) return false;
-        const ext = path.extname(file).toLowerCase();
-        return allMediaExtensions.includes(ext);
-      })
-      .map(async filename => {
-        const filePath = path.join(albumDir, filename);
+    const mediaFiles = files.filter(file => {
+      // Skip hidden files (e.g., macOS resource forks like ._filename.jpg)
+      if (file.startsWith('.')) return false;
+      const ext = path.extname(file).toLowerCase();
+      return allMediaExtensions.includes(ext);
+    });
+
+    // Cheap stat pass — the expensive metadata comes from the cache
+    const stats = await Promise.all(
+      mediaFiles.map(async filename => {
         const ext = path.extname(filename).toLowerCase();
         const isVideo = VIDEO_EXTENSIONS.includes(ext);
-
         try {
-          const stats = await fs.stat(filePath);
-          let width: number | undefined;
-          let height: number | undefined;
-
-          // Only read dimensions and EXIF for images (not videos)
-          let exifDate: Date | undefined;
-          if (!isVideo) {
-            try {
-              const metadata = await sharp(filePath).metadata();
-              width = metadata.width;
-              height = metadata.height;
-              // Swap dimensions for rotated images (EXIF orientation 5-8 involve 90° rotation)
-              if (metadata.orientation && metadata.orientation >= 5 && width && height) {
-                [width, height] = [height, width];
-              }
-            } catch (metaError) {
-              console.warn(`Could not read dimensions for ${filename}:`, metaError);
-            }
-
-            // Extract EXIF date
-            try {
-              const exifData = await exifr.parse(filePath, { pick: ['DateTimeOriginal'] });
-              if (exifData?.DateTimeOriginal) {
-                exifDate = new Date(exifData.DateTimeOriginal);
-              }
-            } catch (exifError) {
-              // Silently ignore EXIF errors
-            }
-          }
-
-          return {
-            filename,
-            path: filePath,
-            url: `/albums/${albumPath}/${filename}`,
-            size: stats.size,
-            mtime: stats.mtime,
-            exifDate,
-            width,
-            height,
-            isVideo
-          };
+          const stat = await fs.stat(path.join(albumDir, filename));
+          return { filename, size: stat.size, mtimeMs: stat.mtimeMs, isVideo };
         } catch (error) {
           console.error(`Error reading stats for ${filename}:`, error);
-          return {
-            filename,
-            path: filePath,
-            url: `/albums/${albumPath}/${filename}`,
-            isVideo
-          };
+          return null;
         }
-      });
+      })
+    );
+    const liveStats = stats.filter((s): s is NonNullable<typeof s> => s !== null);
 
-    return await Promise.all(mediaPromises);
+    const metaByName = await getAlbumMediaMeta(albumDir, liveStats);
+
+    return liveStats.map(stat => {
+      const meta = metaByName.get(stat.filename);
+      return {
+        filename: stat.filename,
+        path: path.join(albumDir, stat.filename),
+        url: `/albums/${albumPath}/${stat.filename}`,
+        size: stat.size,
+        mtime: new Date(stat.mtimeMs),
+        exifDate: meta?.exifDate ? new Date(meta.exifDate) : undefined,
+        width: meta?.width,
+        height: meta?.height,
+        isVideo: stat.isVideo,
+        blur: meta?.blur ?? null,
+        camera: meta?.camera ?? null
+      };
+    });
   } catch (error) {
     console.error(`Error reading album directory: ${albumDir}`, error);
     return [];
   }
-}
-
-/**
- * Get counts of photos and videos in an album
- */
-export async function getMediaCounts(albumPath: string): Promise<{ photos: number; videos: number }> {
-  const media = await getPhotosForAlbum(albumPath);
-  return {
-    photos: media.filter(m => !m.isVideo).length,
-    videos: media.filter(m => m.isVideo).length
-  };
 }
 
 /**
@@ -274,41 +239,6 @@ export function buildBreadcrumbs(albumPath: string): Array<{ label: string; path
 }
 
 /**
- * Check if password is correct for album
- */
-export function checkPassword(album: Album, password: string): boolean {
-  if (!album.data.password) return true;
-  return album.data.password === password;
-}
-
-/**
- * Sort photos based on album settings
- */
-export async function sortPhotos(photos: Photo[], sortOrder: string): Promise<Photo[]> {
-  switch (sortOrder) {
-    case 'name':
-      return photos.sort((a, b) => a.filename.localeCompare(b.filename));
-    case 'date-asc':
-    case 'date-desc':
-      // Will be implemented with EXIF data
-      return photos;
-    case 'custom':
-    default:
-      return photos;
-  }
-}
-
-/**
- * Generate stable token for album path
- */
-export function generateAlbumToken(albumPath: string): string {
-  return createHash('sha256')
-    .update(albumPath)
-    .digest('hex')
-    .substring(0, 12);
-}
-
-/**
  * Get all ancestor albums (bottom-up)
  */
 export async function getAncestors(albumPath: string): Promise<Album[]> {
@@ -335,41 +265,4 @@ export async function getAllDescendants(parentPath: string): Promise<Album[]> {
     const albumId = album.id.replace('/index.md', '');
     return albumId.startsWith(pathPrefix) && albumId !== parentPath;
   });
-}
-
-/**
- * Check if user has access to album
- */
-export function checkAccess(
-  album: Album,
-  ancestors: Album[],
-  unlockedTokens: Set<string>,
-  providedToken?: string
-): {
-  hasAccess: boolean;
-  requiresPassword: boolean;
-  blockingAncestor?: Album;
-} {
-  // 1. Valid token + allowAnonymous = bypass parent passwords
-  if (providedToken === album.data.token && album.data.allowAnonymous) {
-    return { hasAccess: true, requiresPassword: false };
-  }
-
-  // 2. Check album password
-  if (album.data.password && !unlockedTokens.has(album.data.token)) {
-    return { hasAccess: false, requiresPassword: true };
-  }
-
-  // 3. Check ancestor passwords (inheritance)
-  for (const ancestor of ancestors) {
-    if (ancestor.data.password && !unlockedTokens.has(ancestor.data.token)) {
-      return {
-        hasAccess: false,
-        requiresPassword: true,
-        blockingAncestor: ancestor
-      };
-    }
-  }
-
-  return { hasAccess: true, requiresPassword: false };
 }

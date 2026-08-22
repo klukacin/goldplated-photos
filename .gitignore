@@ -17,6 +17,7 @@ firebase-debug.log
 # environment variables
 .env
 .env.production
+.access-secret
 
 # macOS-specific files
 .DS_Store
@@ -49,6 +50,9 @@ src/content/home/
 *.jpg
 *.jpeg
 *.png
+# …but the desktop app's own icons are not photographs, and without them
+# `generate_context!` has nothing to embed and a clean clone cannot build.
+!desktop/app/src-tauri/icons/*.png
 *.gif
 *.webp
 *.tiff
@@ -63,3 +67,6 @@ src/content/home/
 *.m4v
 .private/
 docs/site/
+
+# Agent worktrees live here; they are full checkouts of other branches.
+.claude/worktrees/

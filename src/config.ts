@@ -36,6 +36,7 @@ export interface SiteConfig {
   features: {
     enablePhotoSharing: boolean;
     enableVideoThumbnails: boolean;
+    slideshowIntervalMs: number;
   };
 }
 
@@ -66,7 +67,8 @@ export const siteConfig: SiteConfig = {
   // Feature Flags
   features: {
     enablePhotoSharing: true,      // Enable ?photo= parameter for individual photo sharing
-    enableVideoThumbnails: false   // Requires ffmpeg on server (not implemented yet)
+    enableVideoThumbnails: false,  // Requires ffmpeg on server (not implemented yet)
+    slideshowIntervalMs: 5000      // Auto-advance interval for slideshow mode
   }
 };
 

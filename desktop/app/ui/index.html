@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Goldplated Photos</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Startup: no library open yet -->
+  <div id="welcome" class="welcome">
+    <div class="welcome-card">
+      <h1>Goldplated Photos</h1>
+      <p>Open a folder of photos to begin. A catalog is created inside it; your
+         files are never moved.</p>
+      <button id="open-library-btn" class="btn btn-primary">Choose folder…</button>
+      <p id="welcome-error" class="error" hidden></p>
+    </div>
+  </div>
+
+  <!-- Main application -->
+  <div id="app" class="app" hidden>
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="titlebar-title" id="library-name">Library</div>
+      <div class="titlebar-actions">
+        <button id="import-btn" class="btn">Import…</button>
+        <button id="sync-btn" class="btn">Sync…</button>
+        <button id="publish-btn" class="btn btn-primary">Publish</button>
+      </div>
+    </header>
+
+    <div class="body">
+      <aside class="sidebar">
+        <div class="sidebar-section">
+          <button class="nav-item active" data-album="">
+            <span>All Photos</span>
+            <span class="count" id="all-count">0</span>
+          </button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-header">
+            <h2>Albums</h2>
+            <button id="new-album-btn" class="btn btn-sm">+</button>
+          </div>
+          <div id="album-list" class="album-list"></div>
+        </div>
+
+        <div class="sidebar-footer">
+          <div id="library-stats" class="stats"></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="toolbar">
+          <input type="search" id="search" placeholder="Filter by name or camera…" autocomplete="off">
+          <div class="filter-group" role="group" aria-label="Minimum rating">
+            <button class="chip active" data-rating="">All</button>
+            <button class="chip" data-rating="1">★1+</button>
+            <button class="chip" data-rating="3">★3+</button>
+            <button class="chip" data-rating="5">★5</button>
+          </div>
+          <div class="filter-group" role="group" aria-label="Flag">
+            <button class="chip active" data-flag="">Any</button>
+            <button class="chip" data-flag="pick">Picks</button>
+            <button class="chip" data-flag="reject">Rejects</button>
+          </div>
+          <div class="spacer"></div>
+          <span id="selection-info" class="muted"></span>
+          <button id="add-to-album-btn" class="btn btn-sm" disabled>Add to album…</button>
+          <!-- Only means anything while looking at one album; it takes photos
+               out of that album and nowhere else. -->
+          <button id="remove-from-album-btn" class="btn btn-sm" disabled
+                  title="Take the selected photos out of this album. They stay in your library.">
+            Remove from album
+          </button>
+        </div>
+
+        <div id="grid" class="grid" tabindex="0"></div>
+        <div id="empty-state" class="empty" hidden>
+          <p>No photos match. Import a folder or clear the filters.</p>
+        </div>
+      </main>
+
+      <aside id="inspector" class="inspector" hidden>
+        <img id="inspector-img" class="inspector-img" alt="">
+        <div class="inspector-body">
+          <h3 id="inspector-name"></h3>
+          <div class="rating-row" id="inspector-rating"></div>
+
+          <!-- Develop. Adjustments are recorded, never written into the
+               original; the grid re-renders from the new render key. -->
+          <details class="develop" id="develop" open>
+            <summary>
+              Develop
+              <span id="develop-scope" class="muted"></span>
+            </summary>
+            <!-- Geometry first, as it is applied first: the tone sliders see
+                 the frame these leave behind. -->
+            <div class="geometry" role="group" aria-label="Rotate and flip">
+              <button id="dev-rotate-left" class="btn btn-sm" title="Rotate 90° left">↺</button>
+              <button id="dev-rotate-right" class="btn btn-sm" title="Rotate 90° right">↻</button>
+              <button id="dev-flip-h" class="btn btn-sm" title="Flip left to right">⇋</button>
+              <button id="dev-flip-v" class="btn btn-sm" title="Flip top to bottom">⇵</button>
+              <span id="dev-geometry-state" class="muted"></span>
+            </div>
+            <div id="develop-sliders" class="sliders"></div>
+            <div class="develop-actions">
+              <label class="check"><input type="checkbox" id="dev-bw"> Black &amp; white</label>
+              <button id="develop-reset" class="btn btn-sm">Reset</button>
+            </div>
+          </details>
+
+          <dl id="inspector-meta" class="meta"></dl>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="statusbar">
+      <span id="status-text">Ready</span>
+      <div class="progress" id="progress" hidden><div class="progress-fill" id="progress-fill"></div></div>
+      <button id="import-cancel" class="btn btn-sm" hidden>Cancel</button>
+      <span class="shortcut-hint">1–5 rate · 0 clear · P pick · X reject</span>
+    </footer>
+  </div>
+
+  <!-- New album -->
+  <div id="album-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>New album</h2>
+      <label>Path <small>e.g. 2026/weddings/ana-ivan</small>
+        <input type="text" id="album-path" placeholder="2026/weddings/ana-ivan">
+      </label>
+      <label>Title <input type="text" id="album-title" placeholder="Ana &amp; Ivan"></label>
+      <label class="check"><input type="checkbox" id="album-collection"> Collection (holds sub-albums)</label>
+      <p class="error" id="album-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn" data-close>Cancel</button>
+        <button id="album-create-btn" class="btn btn-primary">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Album settings -->
+  <div id="settings-album-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2 id="settings-album-title">Album settings</h2>
+      <label>Path <small>change it to rename or move the album — sub-albums come along</small>
+        <input type="text" id="set-path" placeholder="2026/weddings/ana-ivan">
+      </label>
+      <label>Title <input type="text" id="set-title"></label>
+      <label>Description <input type="text" id="set-description"></label>
+      <div class="row">
+        <label>Sort
+          <select id="set-sort">
+            <option value="date-desc">Date (newest)</option>
+            <option value="date-asc">Date (oldest)</option>
+            <option value="exif-desc">EXIF date (newest)</option>
+            <option value="exif-asc">EXIF date (oldest)</option>
+            <option value="name">Name</option>
+            <option value="custom">Custom order</option>
+          </select>
+        </label>
+        <label>Style
+          <select id="set-style">
+            <option value="single-column">Single column</option>
+            <option value="grid">Grid</option>
+            <option value="masonry">Masonry</option>
+            <option value="slideshow">Slideshow</option>
+          </select>
+        </label>
+      </div>
+      <label>Password <small>leave empty for no password</small>
+        <input type="text" id="set-password" placeholder="">
+      </label>
+      <label>Tags <small>comma separated</small>
+        <input type="text" id="set-tags" placeholder="wedding, summer">
+      </label>
+      <div class="checks">
+        <label class="check"><input type="checkbox" id="set-proofing"> Client proofing</label>
+        <label class="check"><input type="checkbox" id="set-download"> Allow download</label>
+        <label class="check"><input type="checkbox" id="set-hidden"> Hidden from listings</label>
+      </div>
+      <div class="share-row">
+        <button id="share-link-btn" class="btn btn-sm">Generate share link</button>
+        <input type="text" id="share-link" readonly placeholder="No share link">
+      </div>
+      <p class="error" id="settings-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn btn-danger" id="album-delete-btn">Delete album</button>
+        <div class="spacer"></div>
+        <button class="btn" data-close>Cancel</button>
+        <button id="album-save-btn" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Publish settings -->
+  <div id="publish-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Publish</h2>
+      <p class="muted">Writes the gallery content tree. Photos flagged as rejects
+         are always excluded.</p>
+      <label>Gallery content folder <small>…/src/content/albums</small>
+        <div class="row">
+          <input type="text" id="publish-dest" placeholder="/path/to/gallery/src/content/albums">
+          <button id="pick-dest-btn" class="btn btn-sm">Choose…</button>
+        </div>
+      </label>
+      <label>Minimum rating
+        <select id="publish-min-rating">
+          <option value="">Publish all</option>
+          <option value="1">★1 and up</option>
+          <option value="2">★2 and up</option>
+          <option value="3">★3 and up</option>
+          <option value="4">★4 and up</option>
+          <option value="5">★5 only</option>
+        </select>
+      </label>
+      <label>Album
+        <select id="publish-album"><option value="">All albums</option></select>
+      </label>
+      <p class="error" id="publish-error" hidden></p>
+      <pre id="publish-output" class="output" hidden></pre>
+      <div class="modal-actions">
+        <button class="btn" data-close>Close</button>
+        <button id="publish-run-btn" class="btn btn-primary">Publish now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sync / remote -->
+  <div id="sync-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Sync albums</h2>
+      <p class="muted">Each album syncs on its own, in its own direction. Albums
+         you don't track are never touched — on either side.</p>
+      <label>Remote <small>a folder — network share, external drive — or the gallery's sync URL</small>
+        <div class="row">
+          <input type="text" id="remote-dir" placeholder="/Volumes/gallery or https://gallery.example/api/sync">
+          <button id="pick-remote-btn" class="btn btn-sm">Choose folder…</button>
+        </div>
+      </label>
+      <!-- Only a URL remote needs one; a folder is reached through the file system. -->
+      <label id="remote-token-row" hidden>Access token <small>from the server's SYNC_TOKEN</small>
+        <input type="password" id="remote-token" placeholder="paste once — it is kept in the catalog"
+               autocomplete="off">
+      </label>
+      <div class="row" style="margin-bottom:0.75rem">
+        <button id="remote-refresh-btn" class="btn btn-sm">Refresh list</button>
+        <div class="spacer"></div>
+        <button id="sync-all-btn" class="btn btn-sm"
+                title="Sync every tracked album in its own direction. Never deletes anything on the server — use an album's own Push for that.">Sync all tracked</button>
+      </div>
+      <div id="remote-list" class="remote-list"></div>
+      <p class="error" id="sync-error" hidden></p>
+      <pre id="sync-output" class="output" hidden></pre>
+      <div class="modal-actions">
+        <button class="btn" data-close>Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add to album -->
+  <div id="add-modal" class="modal" hidden>
+    <div class="modal-card modal-sm">
+      <h2>Add to album</h2>
+      <p class="muted"><span id="add-count">0</span> photo(s) selected</p>
+      <select id="add-album-select"></select>
+      <p class="muted" id="add-empty" hidden>No album to add to yet — the ones you
+         have are folders that hold sub-albums. Create an album inside one.</p>
+      <p class="error" id="add-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn" data-close>Cancel</button>
+        <button id="add-confirm-btn" class="btn btn-primary">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Before app.js: it builds its queue as it loads. -->
+  <script src="develop-queue.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

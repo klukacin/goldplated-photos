@@ -6,12 +6,46 @@ const albums = {
   photosLoaded: false,
   videosLoaded: false,
   cacheLoaded: false,
+  proofingLoaded: false,
+  isNewAlbum: false,
+  currentPhotoOrder: null,
+  isDirty: false,
 
   async init() {
     await this.loadTree();
     this.initEventListeners();
     this.initEditorTabs();
     this.initBodyEditor();
+    this.initVideoUpload();
+    this.initDirtyTracking();
+  },
+
+  initDirtyTracking() {
+    const form = document.getElementById('album-form');
+    form.addEventListener('input', () => { this.isDirty = true; });
+    form.addEventListener('change', () => { this.isDirty = true; });
+
+    window.addEventListener('beforeunload', (e) => {
+      if (this.isDirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+  },
+
+  markClean() {
+    this.isDirty = false;
+  },
+
+  async confirmDiscardChanges() {
+    if (!this.isDirty) return true;
+    const confirmed = await modal.confirm(
+      'Unsaved Changes',
+      'You have unsaved changes in this album. Discard them?',
+      'Discard'
+    );
+    if (confirmed) this.markClean();
+    return confirmed;
   },
 
   initEditorTabs() {
@@ -47,7 +81,18 @@ const albums = {
           this.loadAlbumCacheStats();
           this.cacheLoaded = true;
         }
+
+        // Lazy load proofing submissions when Proofing tab is clicked
+        if (tabName === 'proofing' && !this.proofingLoaded && this.selectedPath) {
+          this.loadProofing(this.selectedPath);
+          this.proofingLoaded = true;
+        }
       });
+    });
+
+    // Proofing refresh button
+    document.getElementById('refresh-proofing-btn').addEventListener('click', () => {
+      if (this.selectedPath) this.loadProofing(this.selectedPath);
     });
 
     // Album cache buttons
@@ -59,7 +104,8 @@ const albums = {
       if (!this.selectedPath) return;
       const confirmed = await modal.confirm(
         'Clear Album Thumbnails',
-        'This will delete all cached thumbnails for this album. Continue?'
+        'This will delete all cached thumbnails for this album. Continue?',
+        'Clear'
       );
       if (confirmed) {
         const btn = document.getElementById('clear-album-cache-btn');
@@ -75,6 +121,137 @@ const albums = {
         }
       }
     });
+  },
+
+  async loadProofing(albumPath) {
+    const container = document.getElementById('proofing-submissions');
+    container.innerHTML = '<p class="loading">Loading submissions...</p>';
+
+    try {
+      const submissions = await api.get(`/api/proofing/${albumPath}`);
+
+      if (submissions.length === 0) {
+        container.innerHTML = '<p class="empty-message">No client selections yet. Enable "Client Proofing" in Settings and share the album — selections will appear here.</p>';
+        return;
+      }
+
+      container.innerHTML = '';
+      submissions.forEach(sub => {
+        const card = document.createElement('div');
+        card.className = 'proofing-card';
+
+        const header = document.createElement('div');
+        header.className = 'proofing-card-header';
+
+        const title = document.createElement('div');
+        title.className = 'proofing-card-title';
+        const when = new Date(sub.submittedAt).toLocaleString();
+        title.textContent = `${sub.name || 'Anonymous'} — ${sub.selections.length} photo(s) — ${when}`;
+        header.appendChild(title);
+
+        const actions = document.createElement('div');
+        actions.className = 'proofing-card-actions';
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'btn btn-sm';
+        copyBtn.textContent = 'Copy list';
+        copyBtn.addEventListener('click', async () => {
+          const list = sub.selections.map(s => s.filename).join('\n');
+          try {
+            await navigator.clipboard.writeText(list);
+            notifications.success('Filename list copied');
+          } catch {
+            notifications.error('Could not copy to clipboard');
+          }
+        });
+        actions.appendChild(copyBtn);
+
+        const csvBtn = document.createElement('button');
+        csvBtn.className = 'btn btn-sm';
+        csvBtn.textContent = 'CSV';
+        csvBtn.addEventListener('click', () => {
+          // Quoting is not enough on its own: a comment a client typed that
+          // starts with = + - or @ is a formula, and Excel runs it when the
+          // photographer opens the export. A leading apostrophe is the standard
+          // way to say "this is text" and spreadsheets do not display it.
+          const esc = (v) => {
+            const s = String(v ?? '');
+            const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+            return `"${safe.replace(/"/g, '""')}"`;
+          };
+          const rows = [
+            ['filename', 'comment', 'client', 'submittedAt'].join(','),
+            ...sub.selections.map(s => [esc(s.filename), esc(s.comment), esc(sub.name), esc(sub.submittedAt)].join(','))
+          ];
+          const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `proofing-${albumPath.replace(/\//g, '_')}-${sub.id.replace(/\.json$/, '')}.csv`;
+          a.click();
+          URL.revokeObjectURL(a.href);
+        });
+        actions.appendChild(csvBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'btn btn-sm btn-danger';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.addEventListener('click', async () => {
+          const confirmed = await modal.confirm(
+            'Delete Submission',
+            `Delete the selection from ${sub.name || 'Anonymous'} (${sub.selections.length} photos)?`,
+            'Delete'
+          );
+          if (confirmed) {
+            try {
+              await api.delete(`/api/proofing/${encodeURIComponent(albumPath)}/file/${encodeURIComponent(sub.id)}`);
+              notifications.success('Submission deleted');
+              await this.loadProofing(albumPath);
+              await this.loadTree();
+            } catch (error) {
+              notifications.error('Failed to delete submission: ' + error.message);
+            }
+          }
+        });
+        actions.appendChild(deleteBtn);
+
+        header.appendChild(actions);
+        card.appendChild(header);
+
+        const grid = document.createElement('div');
+        grid.className = 'proofing-thumbs';
+        sub.selections.forEach(sel => {
+          const cell = document.createElement('div');
+          cell.className = 'proofing-thumb';
+
+          const img = document.createElement('img');
+          img.src = `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(albumPath + '/' + sel.filename)}&size=small`;
+          img.alt = sel.filename;
+          img.loading = 'lazy';
+          img.onerror = () => { img.src = getAlbumImageUrl(albumPath, sel.filename); };
+          cell.appendChild(img);
+
+          const label = document.createElement('div');
+          label.className = 'proofing-thumb-label';
+          label.textContent = sel.filename;
+          cell.appendChild(label);
+
+          if (sel.comment) {
+            const comment = document.createElement('div');
+            comment.className = 'proofing-thumb-comment';
+            comment.textContent = sel.comment;
+            comment.title = sel.comment;
+            cell.appendChild(comment);
+          }
+
+          grid.appendChild(cell);
+        });
+        card.appendChild(grid);
+
+        container.appendChild(card);
+      });
+    } catch (error) {
+      container.innerHTML = `<p class="error-message">Failed to load submissions: ${error.message}</p>`;
+    }
   },
 
   async loadAlbumCacheStats() {
@@ -208,10 +385,10 @@ const albums = {
         // Delete button handler
         item.querySelector('.delete-video').addEventListener('click', async (e) => {
           e.stopPropagation(); // Don't trigger video play
-          const confirmed = await modal.confirm('Delete Video', `Delete "${video.filename}"?`);
+          const confirmed = await modal.confirm('Delete Video', `Delete "${video.filename}"?`, 'Delete');
           if (confirmed) {
             try {
-              await api.delete(`/api/photos/${albumPath}/${video.filename}`);
+              await api.delete(`/api/videos/${encodeURIComponent(albumPath)}/file/${encodeURIComponent(video.filename)}`);
               item.remove();
               notifications.success('Video deleted');
               // Reload tree to update counts
@@ -226,6 +403,66 @@ const albums = {
       });
     } catch (error) {
       grid.innerHTML = `<p class="error-message">Failed to load videos: ${error.message}</p>`;
+    }
+  },
+
+  initVideoUpload() {
+    const input = document.getElementById('video-upload');
+    const zone = document.getElementById('video-upload-zone');
+    if (!input || !zone) return;
+
+    input.addEventListener('change', async (e) => {
+      if (e.target.files.length > 0) {
+        await this.uploadVideos(e.target.files);
+        e.target.value = '';
+      }
+    });
+
+    zone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      zone.classList.add('drag-over');
+    });
+
+    zone.addEventListener('dragleave', () => {
+      zone.classList.remove('drag-over');
+    });
+
+    zone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      zone.classList.remove('drag-over');
+      const files = Array.from(e.dataTransfer.files).filter(f =>
+        f.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv|m4v)$/i.test(f.name)
+      );
+      if (files.length > 0) {
+        await this.uploadVideos(files);
+      }
+    });
+  },
+
+  async uploadVideos(files) {
+    if (!this.selectedPath) {
+      notifications.error('Please select an album first');
+      return;
+    }
+
+    const zone = document.getElementById('video-upload-zone');
+    const originalText = zone.innerHTML;
+    zone.innerHTML = `<p>Uploading ${files.length} video(s)... This can take a while.</p>`;
+
+    try {
+      const result = await api.upload(`/api/videos/${this.selectedPath}`, Array.from(files), 'videos');
+      notifications.success(`Uploaded ${result.uploaded.length} video(s)`);
+      if (result.renamed && result.renamed.length > 0) {
+        notifications.warning(
+          `${result.renamed.length} file(s) already existed and were saved under a new name (e.g. ${result.renamed[0].to})`
+        );
+      }
+      await this.loadVideos(this.selectedPath);
+      await this.loadTree();
+    } catch (error) {
+      notifications.error('Failed to upload videos: ' + error.message);
+    } finally {
+      zone.innerHTML = originalText;
     }
   },
 
@@ -248,6 +485,10 @@ const albums = {
         theme: 'monokai',
         lineWrapping: true,
         lineNumbers: true
+      });
+      this.bodyEditor.on('change', (_cm, change) => {
+        // setValue (programmatic populate) must not mark the form dirty
+        if (change.origin !== 'setValue') this.isDirty = true;
       });
       // Refresh after initialization to ensure proper rendering
       setTimeout(() => this.bodyEditor.refresh(), 100);
@@ -276,7 +517,8 @@ const albums = {
       if (this.selectedPath) {
         const confirmed = await modal.confirm(
           'Delete Album',
-          `Are you sure you want to delete "${this.selectedPath}"? This will also delete all photos in this album.`
+          `Are you sure you want to delete "${this.selectedPath}"? This will also delete all photos in this album.`,
+          'Delete'
         );
         if (confirmed) {
           await this.deleteAlbum(this.selectedPath);
@@ -284,11 +526,45 @@ const albums = {
       }
     });
 
-    // Generate token
+    // Rename / move album
+    document.getElementById('rename-album-btn').addEventListener('click', () => {
+      if (!this.selectedPath || this.isNewAlbum) return;
+      document.getElementById('rename-album-path').value = this.selectedPath;
+      modal.show('rename-album-modal');
+    });
+
+    document.getElementById('rename-album-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const newPath = document.getElementById('rename-album-path').value.trim();
+      if (!newPath || newPath === this.selectedPath) {
+        modal.hide('rename-album-modal');
+        return;
+      }
+      try {
+        const result = await api.post(`/api/album-rename/${this.selectedPath}`, { newPath });
+        notifications.success(`Album moved to "${result.path}"`);
+        modal.hide('rename-album-modal');
+        this.markClean();
+        await this.loadTree();
+        await this.selectAlbum(result.path);
+      } catch (error) {
+        notifications.error('Failed to rename album: ' + error.message);
+      }
+    });
+
+    // Generate share token (random secret for the shareable link)
     document.getElementById('generate-token-btn').addEventListener('click', async () => {
-      const token = await generateToken();
-      document.getElementById('album-token').value = token;
+      const result = await api.get('/api/share-token');
+      document.getElementById('album-share-token').value = result.shareToken;
       this.updateShareableLink();
+      notifications.success('Share token generated. Save the album to activate the link.');
+    });
+
+    // Remove share token
+    document.getElementById('remove-share-token-btn').addEventListener('click', () => {
+      document.getElementById('album-share-token').value = '';
+      this.updateShareableLink();
+      notifications.warning('Share token removed. Save the album to deactivate the old link.');
     });
 
     // Copy shareable link
@@ -311,10 +587,11 @@ const albums = {
 
   updateShareableLink() {
     const path = document.getElementById('album-path').value;
-    const token = document.getElementById('album-token').value;
-    if (path && token) {
-      const baseUrl = window.location.origin.replace(':4444', ':4321'); // Use dev server port
-      const shareLink = `${baseUrl}/photos/${path}?token=${token}`;
+    const shareToken = document.getElementById('album-share-token').value;
+    if (path && shareToken) {
+      // Prefer the configured production URL, fall back to the dev server
+      const baseUrl = adminConfig.siteUrl || adminConfig.previewUrl;
+      const shareLink = `${baseUrl}/photos/${path}?token=${shareToken}`;
       document.getElementById('album-share-link').value = shareLink;
     } else {
       document.getElementById('album-share-link').value = '';
@@ -330,6 +607,23 @@ const albums = {
     }
   },
 
+  async reorderSibling(items, index, dir) {
+    const target = index + dir;
+    if (target < 0 || target >= items.length) return;
+    const names = items.map(i => i.name);
+    [names[index], names[target]] = [names[target], names[index]];
+    const parent = items[index].path.split('/').slice(0, -1).join('/');
+    try {
+      const result = await api.post('/api/albums-reorder', { parent, order: names });
+      if (result.skipped && result.skipped.length > 0) {
+        notifications.warning(`Order not saved for folders without settings: ${result.skipped.join(', ')}`);
+      }
+      await this.loadTree();
+    } catch (error) {
+      notifications.error('Failed to reorder albums: ' + error.message);
+    }
+  },
+
   renderTree() {
     const container = document.getElementById('album-tree');
     container.innerHTML = '';
@@ -340,7 +634,7 @@ const albums = {
     }
 
     const renderItems = (items, parent) => {
-      items.forEach(item => {
+      items.forEach((item, itemIndex) => {
         const itemEl = document.createElement('div');
         itemEl.className = 'tree-item';
 
@@ -402,6 +696,38 @@ const albums = {
           rowEl.appendChild(videoCountEl);
         }
 
+        // Proofing submissions badge
+        if (item.proofingCount > 0) {
+          const proofingEl = document.createElement('span');
+          proofingEl.className = 'tree-count tree-proofing-count';
+          proofingEl.textContent = `♥${item.proofingCount}`;
+          proofingEl.title = `${item.proofingCount} client selection${item.proofingCount > 1 ? 's' : ''}`;
+          rowEl.appendChild(proofingEl);
+        }
+
+        // Reorder arrows (persist sibling order via `order` frontmatter)
+        const reorderEl = document.createElement('span');
+        reorderEl.className = 'tree-reorder';
+        const upBtn = document.createElement('button');
+        upBtn.textContent = '↑';
+        upBtn.title = 'Move up';
+        upBtn.disabled = itemIndex === 0;
+        upBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.reorderSibling(items, itemIndex, -1);
+        });
+        const downBtn = document.createElement('button');
+        downBtn.textContent = '↓';
+        downBtn.title = 'Move down';
+        downBtn.disabled = itemIndex === items.length - 1;
+        downBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.reorderSibling(items, itemIndex, 1);
+        });
+        reorderEl.appendChild(upBtn);
+        reorderEl.appendChild(downBtn);
+        rowEl.appendChild(reorderEl);
+
         // Click to select
         rowEl.addEventListener('click', () => {
           this.selectAlbum(item.path);
@@ -425,10 +751,14 @@ const albums = {
   },
 
   async selectAlbum(path) {
+    if (path !== this.selectedPath && !(await this.confirmDiscardChanges())) {
+      return;
+    }
     this.selectedPath = path;
     this.photosLoaded = false;
     this.videosLoaded = false;
     this.cacheLoaded = false;
+    this.proofingLoaded = false;
 
     // Update selection without re-rendering (preserves expand/collapse state)
     document.querySelectorAll('#album-tree .tree-row').forEach(row => {
@@ -452,7 +782,10 @@ const albums = {
     try {
       const albumData = await api.get(`/api/albums/${path}`);
       this.currentThumbnail = albumData.thumbnail;
+      this.currentPhotoOrder = albumData.photoOrder || null;
+      this.isNewAlbum = !!albumData.isNew;
       this.populateForm(albumData);
+      this.markClean();
 
       document.getElementById('album-editor').classList.remove('hidden');
       document.getElementById('album-placeholder').classList.add('hidden');
@@ -473,12 +806,13 @@ const albums = {
         saveBtn.textContent = 'Save';
       }
 
-      // Update photo and video count badges (from tree data)
+      // Update photo, video and proofing count badges (from tree data)
       const albumInTree = this.findAlbumInTree(path);
       const photoCount = albumInTree?.photoCount || 0;
       const videoCount = albumInTree?.videoCount || 0;
       document.getElementById('photo-count-badge').textContent = photoCount;
       document.getElementById('video-count-badge').textContent = videoCount;
+      document.getElementById('proofing-count-badge').textContent = albumInTree?.proofingCount || 0;
 
     } catch (error) {
       notifications.error('Failed to load album: ' + error.message);
@@ -503,14 +837,15 @@ const albums = {
     document.getElementById('album-date').value = formatDate(data.date);
     document.getElementById('album-password').value = data.password || '';
     document.getElementById('album-token').value = data.token || '';
+    document.getElementById('album-share-token').value = data.shareToken || '';
     document.getElementById('album-sort').value = data.sort || 'date-desc';
     document.getElementById('album-style').value = data.style || 'grid';
     document.getElementById('album-tags').value = (data.tags || []).join(', ');
     document.getElementById('album-isCollection').checked = data.isCollection || false;
-    document.getElementById('album-allowAnonymous').checked = data.allowAnonymous !== false;
     document.getElementById('album-order').value = data.order || '';
     document.getElementById('album-hidden').checked = data.hidden || false;
     document.getElementById('album-allowDownload').checked = data.allowDownload || false;
+    document.getElementById('album-proofing').checked = data.proofing || false;
 
     // Set body content
     if (this.bodyEditor) {
@@ -521,53 +856,49 @@ const albums = {
       document.getElementById('album-body').value = data.body || '';
     }
 
-    // Thumbnail will be populated by photos module
+    // Cover select: always reset and reflect the album's current thumbnail so
+    // saving without opening the Photos tab never loses (or leaks) the cover.
+    // The photos module later replaces this with the full file list.
+    const thumbnailSelect = document.getElementById('album-thumbnail');
+    thumbnailSelect.innerHTML = '<option value="">Auto (first photo)</option>';
+    if (data.thumbnail) {
+      const option = document.createElement('option');
+      option.value = data.thumbnail;
+      option.textContent = data.thumbnail;
+      option.selected = true;
+      thumbnailSelect.appendChild(option);
+    }
 
     // Update shareable link
     this.updateShareableLink();
   },
 
   getFormData() {
+    // null = clear the field on the server (merge removes null keys);
+    // absent keys keep their existing value.
     const form = document.getElementById('album-form');
-    const data = {
+    const orderValue = form.querySelector('#album-order').value;
+    const dateValue = form.querySelector('#album-date').value;
+    const tagsValue = form.querySelector('#album-tags').value;
+
+    return {
       title: form.querySelector('#album-title').value,
-      description: form.querySelector('#album-description').value || undefined,
-      password: form.querySelector('#album-password').value || undefined,
-      token: form.querySelector('#album-token').value,
+      description: form.querySelector('#album-description').value || null,
+      password: form.querySelector('#album-password').value || null,
+      token: form.querySelector('#album-token').value || undefined,
+      shareToken: form.querySelector('#album-share-token').value || null,
       sort: form.querySelector('#album-sort').value,
       style: form.querySelector('#album-style').value,
       isCollection: form.querySelector('#album-isCollection').checked,
-      allowAnonymous: form.querySelector('#album-allowAnonymous').checked,
       hidden: form.querySelector('#album-hidden').checked,
       allowDownload: form.querySelector('#album-allowDownload').checked,
+      proofing: form.querySelector('#album-proofing').checked,
+      order: orderValue !== '' ? parseInt(orderValue) : null,
+      date: dateValue ? parseDate(dateValue) : null,
+      tags: tagsValue ? tagsValue.split(',').map(t => t.trim()).filter(t => t) : null,
+      thumbnail: form.querySelector('#album-thumbnail').value || null,
       body: this.bodyEditor ? this.bodyEditor.getValue() : form.querySelector('#album-body').value
     };
-
-    // Order (numeric, optional)
-    const orderValue = form.querySelector('#album-order').value;
-    if (orderValue !== '') {
-      data.order = parseInt(orderValue);
-    }
-
-    // Date
-    const dateValue = form.querySelector('#album-date').value;
-    if (dateValue) {
-      data.date = parseDate(dateValue);
-    }
-
-    // Tags
-    const tagsValue = form.querySelector('#album-tags').value;
-    if (tagsValue) {
-      data.tags = tagsValue.split(',').map(t => t.trim()).filter(t => t);
-    }
-
-    // Thumbnail
-    const thumbnailValue = form.querySelector('#album-thumbnail').value;
-    if (thumbnailValue) {
-      data.thumbnail = thumbnailValue;
-    }
-
-    return data;
   },
 
   async saveAlbum() {
@@ -575,16 +906,24 @@ const albums = {
 
     try {
       const data = this.getFormData();
-      const isNew = document.getElementById('save-album-btn').textContent === 'Create Album';
 
-      if (isNew) {
+      if (this.isNewAlbum) {
         // Create new album (folder exists but no index.md)
-        await api.post('/api/albums', { path: this.selectedPath, ...data });
+        const result = await api.post('/api/albums', { path: this.selectedPath, ...data });
         notifications.success('Album created successfully');
+        this.isNewAlbum = false;
+        // Server may have sanitized the path (lowercase) — follow it
+        if (result.path && result.path !== this.selectedPath) {
+          await this.loadTree();
+          await this.selectAlbum(result.path);
+          return;
+        }
       } else {
         await api.put(`/api/albums/${this.selectedPath}`, data);
         notifications.success('Album saved successfully');
       }
+
+      this.markClean();
 
       // Reset button text
       document.getElementById('save-album-btn').textContent = 'Save';
@@ -617,7 +956,8 @@ const albums = {
       form.reset();
 
       await this.loadTree();
-      this.selectAlbum(path);
+      // Use the server's (sanitized) path, not the raw input
+      this.selectAlbum(result.path || path);
     } catch (error) {
       notifications.error('Failed to create album: ' + error.message);
     }

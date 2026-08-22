@@ -180,6 +180,10 @@ npm run deploy       # Full deployment to production server
 
 # Maintenance
 npm run update       # Normalize album structure (auto-create index.md)
+
+# Quality
+npm run check        # TypeScript check (astro check) - must pass
+npm test             # Unit tests (vitest) - access control, rate limiting
 ```
 
 ### Recommended Development Setup
@@ -216,8 +220,10 @@ The site has three main sections:
 |-------|------|-------------|
 | `/` | `src/pages/index.astro` | Landing page - full-screen background with shutter button |
 | `/home` | `src/pages/home.astro` | Digital home - hero slider, intro text, content cards |
-| `/photos` | `src/pages/photos/index.astro` | Gallery root - top-level album list |
+| `/photos` | `src/pages/photos/index.astro` | Gallery root - album list with Public/Locked toggle and live search box |
 | `/photos/*` | `src/pages/photos/[...path].astro` | Album/Collection view - dynamic route for all albums |
+| `/photos/tags/[tag]` | `src/pages/photos/tags/[tag].astro` | Prerendered tag page - albums with the tag (locked = no cover; hidden or locked *by an ancestor* counts as hidden or locked) |
+| `/photos/search` | `src/pages/photos/search.astro` | SSR search - albums (title/description/tags) + photos (filename/camera/EXIF date); PUBLIC content only |
 
 ### Components
 
@@ -227,20 +233,21 @@ The site has three main sections:
 | AlbumGrid | `src/components/AlbumGrid.astro` | Sub-album grid with cover photo thumbnails |
 | Breadcrumbs | `src/components/Breadcrumbs.astro` | Hierarchical navigation path |
 | SEO | `src/components/SEO.astro` | Open Graph and Twitter Card meta tags for social sharing |
-| PasswordProtection | `src/components/PasswordProtection.astro` | Password entry form (DEPRECATED - now inline in SSR) |
 | Footer | `src/components/Footer.astro` | Site footer with email contact and copyright |
 
 ### API Endpoints
 
 | Endpoint | File | Description |
 |----------|------|-------------|
-| `/api/thumbnail` | `src/pages/api/thumbnail.ts` | Generate/serve cached thumbnails (small/medium/large) |
-| `/api/exif` | `src/pages/api/exif.ts` | Extract EXIF metadata from photos |
-| `/api/video-info` | `src/pages/api/video-info.ts` | Extract video metadata via ffprobe |
-| `/api/check-password` | `src/pages/api/check-password.ts` | Validate album passwords (legacy) |
-| `/api/check-access` | `src/pages/api/check-access.ts` | Check if user has access to album (legacy) |
-| `/api/unlock` | `src/pages/api/unlock.ts` | SSR password verification, sets HttpOnly cookie |
-| `/api/download-album` | `src/pages/api/download-album.ts` | Create ZIP of album photos (requires X-Album-Token header) |
+| `/api/thumbnail` | `src/pages/api/thumbnail.ts` | Generate/serve cached thumbnails (small/medium/large), access-checked |
+| `/api/exif` | `src/pages/api/exif.ts` | Extract EXIF metadata from photos, access-checked |
+| `/api/video-info` | `src/pages/api/video-info.ts` | Extract video metadata via ffprobe, access-checked |
+| `/api/watermark` | `src/pages/api/watermark.ts` | Watermarked JPEG for social sharing, access-checked |
+| `/api/unlock` | `src/pages/api/unlock.ts` | SSR password verification, sets signed HttpOnly cookie |
+| `/api/download-album` | `src/pages/api/download-album.ts` | Streamed ZIP of album photos (cookie or X-Album-Token; checks ancestors; requires `allowDownload`) |
+| `/api/proofing` | `src/pages/api/proofing.ts` | Store a client proofing submission (requires `proofing: true` + album access; rate-limited; validated against the album's photo list; saved to `.meta/proofing/`) |
+
+**All media routes enforce album access** via `src/lib/access.ts` — originals (`/albums/*`), thumbnails, EXIF, video info, watermark and ZIP download all deny protected content without a valid signed cookie or share token.
 
 ### PhotoGrid Views & States
 
@@ -348,36 +355,59 @@ Albums display cover photos in the grid using this priority:
 
 ### Photo Sorting
 
-Albums support 6 sort options via dropdown (persisted to localStorage):
+Albums support sort options via dropdown (persisted to localStorage):
+- Album Order (custom — the admin's drag-drop `photoOrder`, applied server-side when `sort: custom`)
 - Name (A-Z / Z-A)
-- Date taken (Oldest / Newest) - **default: oldest first**
+- Date taken / EXIF date (Oldest / Newest)
 - File size (Smallest / Largest)
 
-### Password Protection Flow (SSR)
+### Tags & Search
 
-**SECURITY:** Protected albums use Server-Side Rendering (SSR) - image URLs are NOT exposed in page source until access is verified.
+- Tag pills on album pages link to prerendered `/photos/tags/<tag>` pages (non-hidden albums; locked ones render title + lock placeholder only).
+- The `/photos` search box filters album cards live (via `data-search` on cards); submitting goes to `/photos/search?q=`.
+- `/photos/search` matches albums by title/description/tags and photos by filename, camera and EXIF date (ISO `2025-06-14` or `14.06.2025`) using the per-album metadata cache. Only fully public chains are searchable — hidden/locked albums and their content never appear. Pure matching logic: `src/lib/search-core.ts` (unit-tested).
 
-**How it works:**
-1. Album page uses `prerender = false` (SSR, not static)
-2. Server checks `album-access` cookie for unlocked tokens
-3. If NOT authorized: Only password form is rendered (no image URLs in source)
-4. If authorized: Full album content is rendered with image URLs
+### Slideshow
+
+`style: slideshow` renders the grid as `grid` and auto-opens an auto-advancing lightbox (interval: `siteConfig.features.slideshowIntervalMs`, default 5 s; disabled under `prefers-reduced-motion`; `?photo=` deep links take priority). Every lightbox has a play/pause toolbar button (`P` key); manual navigation or tapping pauses.
+
+### Client Proofing
+
+Enable per album with `proofing: true` (checkbox in admin Settings). Visitors get a heart on every photo (grid + lightbox, `L` key), selections persist in localStorage per album, and a bottom bar opens a review panel (per-photo comments + optional name) that POSTs to `/api/proofing`. Submissions are JSON files in `<album>/.meta/proofing/`, browsable in the admin's Proofing tab (thumbnails, comments, copy-list, CSV export, delete) with a ♥ badge in the album tree.
+
+### Access Control (src/lib/access.ts + access-core.ts)
+
+**SECURITY:** Protected albums use Server-Side Rendering (SSR) — image URLs are NOT exposed in page source until access is verified, and every media route re-checks access server-side.
+
+**Album access types:**
+| Type | Frontmatter | Behavior |
+|------|-------------|----------|
+| Public | (none) | Freely accessible |
+| Password-protected | `password: "..."` | Password form; unlock sets signed cookie |
+| Link-share | `shareToken: "<random>"` | Reachable ONLY via secret link `?token=<shareToken>` |
+
+An album can have both — the share link then skips the password form.
+
+**Tokens:**
+- `token` (required) — internal album id stored in the access cookie. Grants nothing by itself.
+- `shareToken` (optional) — random secret, generated in the admin panel or via `node scripts/add-share-token.mjs <album-path>`. The ONLY value accepted from `?token=`/`X-Album-Token`.
+- `allowAnonymous` — DEPRECATED, ignored.
+
+**Signed cookie:**
+- `album-access` cookie value is `base64url(json).hmac` signed with `ACCESS_SECRET` from `.env` (min 16 chars). Without it an ephemeral secret is used (sessions reset on restart).
+- Cookie flags: `httpOnly`, `secure` (prod), `sameSite: strict`, 24h expiry. Forged/unsigned cookies are rejected.
 
 **Unlock flow:**
 1. User submits password via form POST to `/api/unlock`
-2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min)
-3. On success: Sets HttpOnly cookie with album token, redirects to album
-4. Cookie flags: `httpOnly`, `secure` (prod), `sameSite: strict`, 24h expiry
+2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min per real client IP — X-Forwarded-For aware behind the proxy)
+3. On success: unlocks the album + cascades to password-less descendants, sets signed cookie, redirects
 
 **Access inheritance:**
-- Parent album access grants access to child albums without passwords
-- Tokens can be passed via `?token=` query parameter (share links)
+- A locked ancestor blocks descendants until unlocked; an unlocked album grants its descendants
+- Share tokens of ancestors also grant descendants
+- **A grant stops at the nearest lock.** A descendant with its own `password` or `shareToken` stays locked whether the ancestor was opened by cookie or by share link — so handing a client the collection's secret link does not hand them the separately locked albums inside it
 
-**Security features:**
-- Path traversal protection on all API endpoints
-- Rate limiting prevents brute force attacks
-- Timing-safe password comparison prevents timing attacks
-- HttpOnly cookies prevent XSS token theft
+**Single implementation:** `resolveAlbumAccess()` / `resolveFileAccess()` are used by the album page AND all media routes (`/albums/*`, thumbnail, exif, video-info, watermark, download-album). Never add a media route without calling them. Pure logic lives in `access-core.ts` (unit-tested in `tests/`).
 
 Passwords are plaintext strings in frontmatter (simple protection, not cryptographically secure).
 
@@ -528,6 +558,8 @@ Environment variables (`.env`) can override site URL for different environments.
 
 A local-only web-based CMS for content management. **Never deployed to production.**
 
+**SECURITY:** the server binds to loopback, but every page the photographer visits can reach loopback too, and `cors()` does not stop that — it decides who may *read* a response, long after the handler has run. A fetch-metadata guard (`Sec-Fetch-Site` / `Origin`, in `admin/server.js` before every route) rejects anything sent from another origin, which is what keeps a stray `<img src="http://localhost:4444/api/tools/run/deploy">` on someone else's website from pushing the site live. Non-browser clients (curl) send neither header and still work. `ADMIN_PORT` overrides the 4444 default.
+
 **Location:** `admin/` directory
 **Server:** Express.js on port 4444
 **Frontend:** Vanilla JS + CodeMirror markdown editor
@@ -536,21 +568,29 @@ A local-only web-based CMS for content management. **Never deployed to productio
 
 | Tab | Purpose |
 |-----|---------|
-| **Albums** | Create/edit albums, upload photos/videos, manage settings |
-| **Home** | Edit landing background, hero slider, intro text, content cards |
-| **Tools** | Thumbnail cache management, quick links |
+| **Albums** | Create/edit/rename/move albums, reorder siblings (↑↓ in tree), upload photos/videos with progress, drag-drop photo reordering (persists `photoOrder` + sets `sort: custom`), multi-select bulk delete/move/set-cover, click-to-preview with EXIF, share-token management |
+| **Home** | Edit landing background, hero slider, intro text, content cards (drag to reorder) |
+| **Tools** | Thumbnail cache management, script runner (build/deploy/maintenance with live output), quick links |
+
+Unsaved album changes prompt before switching albums or closing the tab. CodeMirror is vendored locally (`admin/vendor/`), so the admin works offline.
 
 ### Admin API Endpoints
 
 | Endpoint | Purpose |
 |----------|---------|
-| `/api/albums`, `/api/albums/*path` | Album CRUD |
+| `/api/albums`, `/api/albums/*path` | Album CRUD (PUT merges frontmatter; `null` clears a field) |
+| `/api/album-rename/*path` | Rename/move an album folder |
+| `/api/albums-reorder` | Persist sibling album order (`order` fields) |
 | `/api/photos/*path` | Photo upload/delete |
+| `/api/photo-order/*path` | Save drag-drop photo order (`photoOrder`) |
+| `/api/photo-bulk/delete\|move/*path` | Bulk photo operations |
+| `/api/photo-exif/*path` | EXIF for the admin preview |
 | `/api/videos/*path` | Video upload/delete |
 | `/api/home/intro` | Intro text |
-| `/api/home/cards` | Content cards CRUD |
+| `/api/home/cards` | Content cards CRUD + reorder |
 | `/api/assets/hero`, `/api/assets/cards` | Asset management |
 | `/api/cache/stats`, `/api/cache/thumbnails` | Cache management |
+| `/api/tools/scripts`, `/api/tools/run/:id` | Whitelisted script runner (SSE output, one at a time) |
 
 ### Data Flow
 
@@ -559,6 +599,95 @@ Admin Panel (browser) → Admin API (:4444) → File System → Dev Server (:432
 ```
 
 Changes made in admin are saved directly to `src/content/` and `public/`, then auto-reloaded by dev server.
+
+## Desktop App (`desktop/`)
+
+A native photo workflow — import, cull, develop, publish, sync — sitting in front of the same gallery the admin panel edits. Written in Rust so it can run where a browser cannot: macOS today, iPadOS and Windows on the same code.
+
+`desktop/ARCHITECTURE.md` is the long form. This is what you need before touching it.
+
+### The shape
+
+```
+gpp-core  ──  all the logic: catalog, import, albums, develop, publish, sync
+   │              no GUI, no async runtime, no shelling out
+   ├── gpp-cli       a command-line driver — the way to test without a GUI
+   ├── gpp-ffi       a C ABI: one JSON call, for clients that are not Rust
+   └── gpp-desktop   a Tauri v2 shell: one #[tauri::command] per UI action
+```
+
+`Session` is the application-level API — roughly one method per thing the UI can do. The shell, the CLI and the C ABI are all thin wrappers over it; if logic is creeping into any of them, it belongs in the core instead.
+
+`gpp-ffi` is what makes a *native* iPad or Android client possible rather than only a webview one: four `extern "C"` functions, `gpp_call(session, method, args_json)` covering the whole of `Session`, replies always `{"ok": …}` or `{"error": …, "kind": …}`, and no panic ever allowed to unwind into C. Its header is hand-written and checked in — cbindgen and UniFFI are both MPL-2.0, which the licence policy does not allow even at build time. See `desktop/crates/gpp-ffi/README.md`.
+
+**The portability contract** (stated in `gpp-core/src/lib.rs`, and it is load-bearing): no GUI dependencies, no spawning external processes, anything platform-specific behind a trait the shell implements — `sync::RemoteTransport`, `media::RawDecoder`. Breaking it is how the iPad target quietly dies.
+
+### The library on disk
+
+A library is a folder of photos the user already has. The app never moves them; it writes a catalog beside them:
+
+```
+<library>/
+  2026/weddings/ana-ivan/*.jpg     the photographer's own folders, untouched
+  .gpp/catalog.db                  SQLite: photos, albums, edits, sync state
+  .gpp/thumbs/<shard>/<key>_*.jpg  content-addressed derived images
+```
+
+Importing a folder from **outside** the library copies it in, because the catalog addresses photos by their path under the root and cannot point anywhere else.
+
+### Develop is non-destructive
+
+An adjustment is a row in `edits`, never a write to the original. What identifies a rendered image is a **render key**: the photo's content hash when there are no edits, otherwise `blake3(content_hash + stack_json)`. Change an adjustment and the key changes, so the grid asks for a thumbnail that does not exist yet and gets a freshly rendered one; reset it and the key returns to the original's, which is still cached. Publishing ships the developed pixels.
+
+Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
+
+**Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), and copying a photo *into* the library on import. `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
+
+### Publish and sync are different things
+
+- **Publish** writes the gallery's content tree — `index.md` frontmatter plus the photo files — into `src/content/albums`. It only removes files this library published before, so nothing the admin panel or another tool put there is ever touched.
+- **Sync** moves that tree to a server. Per album, in a direction that album chose (`push`, `pull`, `both`, or untracked). **An album nobody tracks is never touched on either side** — not pushed, not pulled, not deleted.
+
+Three manifests decide every file: what is local, what was last synced, what the remote holds. Both sides changed since the baseline is a conflict, and a conflict is reported, never resolved by guessing. Deleting on the server needs `allow_deletes` — the UI asks first and names the files.
+
+Two transports, same trait: a folder (network share, external drive) or the gallery's own HTTP endpoints. `.meta/` is server-owned — the proofing submissions live there — and is excluded from every manifest in both directions.
+
+**A subscription follows its album.** Renaming or moving an album carries its subscription and its sub-albums' subscriptions; deleting an album drops its subscription. Nothing on the remote moves, though — a tracked album that was already pushed stays on the server under the old path too, and the next sync publishes it under the new one, so the server holds both until someone deletes the old copy with `allow_deletes`.
+
+**One album's failure never stops the batch.** "Sync all tracked" reports each album's outcome separately, a failed album included, and carries on with the rest — the same way `apply` already treats a single failing file.
+
+### Sync over HTTP
+
+`/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `desktop/UPLOAD-TRANSPORT.md` for the measurements and why the transport is what it is.
+
+### Commands
+
+```bash
+cd desktop
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings   # must be clean
+cargo run -p gpp-cli -- --help                          # drive the core headless
+
+cd desktop/app/src-tauri && cargo build                 # the shell
+node desktop/app/check-shell.mjs                        # contract checks, see below
+```
+
+`npm run check:licences` holds every Rust dependency to MIT / Apache-2.0 / BSD / CC0, per target.
+
+**Do not share one `CARGO_TARGET_DIR` between git worktrees.** It looks like a way to save disk and it costs correctness: a build of one worktree's sources can be served artifacts built from another's, so a test passes or fails for reasons that are not in the tree you are reading. It has already produced both a phantom failure and a phantom extra dozen tests. Give each worktree its own target directory, or build them one at a time.
+
+### The shell cannot be unit-tested, so it has contract checks
+
+`desktop/app/check-shell.mjs` encodes defects that shipped and were only found by launching the app: an `invoke()` with no registered command, an element id that is not in the markup, a missing Tauri capability, a CSP without `ipc:`, a `[hidden]` rule a class can override, a `build.rs` that does not watch the UI files. **The UI is embedded into the binary at compile time — rebuild after every UI edit or you are testing the previous JavaScript.**
+
+Two traps worth knowing before you write UI code:
+
+- `window.confirm()` inside a Tauri webview on Linux returns `true` without asking. Use `askConfirm` from the dialog plugin; the contract check enforces it.
+- Types crossing the IPC boundary are built in JavaScript and read by serde. A name serde does not recognise is dropped in silence — which is how the star filter and the album sidebar once filtered nothing. Multi-word fields need `rename_all = "camelCase"`, and `deny_unknown_fields` turns the next typo into an error.
+
+### Running it without a screen
+
+`desktop/app/run-headless.sh <library>` starts Xvfb, a window manager (without one, synthetic clicks land nowhere), a session bus and the XDG portal (without it the folder picker opens nothing and reports no error). Pass a library path to skip the picker. `GPP_DISPLAY` and `GPP_BUS` let several run at once.
 
 ## Deployment Workflow
 
@@ -686,26 +815,33 @@ sshpass -p 'PASSWORD' rsync -avz --progress \
 - `src/components/PhotoGrid.astro` - Photo display, lightbox, EXIF, keyboard nav, sorting
 - `src/components/AlbumGrid.astro` - Sub-album grid with cover photos
 - `src/components/SEO.astro` - Open Graph and Twitter Card meta tags for social sharing
-- `src/components/PasswordProtection.astro` - Password entry form
 - `src/components/Breadcrumbs.astro` - Hierarchical navigation
 - `src/components/Footer.astro` - Site footer with email contact and copyright
 - `src/layouts/Layout.astro` - Base layout wrapper
 
 **API Routes:**
-- `src/pages/albums/[...path].ts` - Serve original images
-- `src/pages/api/thumbnail.ts` - Generate/serve cached thumbnails
-- `src/pages/api/exif.ts` - Extract EXIF metadata
-- `src/pages/api/unlock.ts` - SSR password verification (sets HttpOnly cookie)
-- `src/pages/api/check-password.ts` - Validate album passwords (legacy)
-- `src/pages/api/download-album.ts` - Create ZIP of album photos
+- `src/pages/albums/[...path].ts` - Serve original images (access-checked)
+- `src/pages/api/thumbnail.ts` - Generate/serve cached thumbnails (access-checked)
+- `src/pages/api/exif.ts` - Extract EXIF metadata (access-checked)
+- `src/pages/api/video-info.ts` - Video metadata via ffprobe (access-checked)
+- `src/pages/api/watermark.ts` - Watermarked share image (access-checked)
+- `src/pages/api/unlock.ts` - SSR password verification (sets signed HttpOnly cookie)
+- `src/pages/api/download-album.ts` - Create ZIP of album photos (access-checked incl. ancestors)
 
 **Configuration:**
 - `src/config.ts` - Centralized site configuration (URL, name, social defaults)
-- `.env.example` - Environment variables template for deployment
+- `.env.example` - Environment variables template (SITE_URL, ACCESS_SECRET, deploy settings)
 
 **Utilities:**
-- `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos, password checking
+- `src/lib/access-core.ts` - Pure access-control logic (signed cookie, share tokens, chain resolution) — unit-tested
+- `src/lib/access.ts` - Astro glue: resolveAlbumAccess/resolveFileAccess/setAccessCookie
+- `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos
 - `src/lib/rate-limit.ts` - In-memory rate limiting (10 attempts / 15 minutes per IP)
+- `src/lib/media-info.ts` - Builds the lightbox EXIF/video-info overlay markup. Every interpolated value is HTML-escaped: EXIF strings (Make, Model, LensModel) ride inside the image file, so a photo from a client or second shooter can carry markup in them — unit-tested
+
+**Tests & CI:**
+- `tests/*.test.ts` - Vitest unit tests (access control, rate limiting)
+- `.github/workflows/ci.yml` - CI: astro check → vitest → syntax checks → build
 
 **Static Assets:**
 - `public/images/landing-bg.jpg` - Landing page background
@@ -722,8 +858,9 @@ sshpass -p 'PASSWORD' rsync -avz --progress \
 - `scripts/deploy.sh` - Production deployment script
 - `scripts/start-dev.sh` / `stop-dev.sh` - Dev server background control
 - `scripts/start-admin.sh` / `stop-admin.sh` - Admin server background control
-- `scripts/update-albums.mjs` - Album structure normalization
-- `scripts/fix-server-paths.mjs` - Production path fixer
+- `scripts/update-albums.mjs` - Album structure normalization (keeps admin-authored body.md)
+- `scripts/fix-server-paths.mjs` - Production path fixer (reads DEPLOY_REMOTE_ROOT from env)
+- `scripts/add-share-token.mjs` - Generate/remove/list album share tokens (secret links)
 
 ## Important Patterns
 

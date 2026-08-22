@@ -1,15 +1,25 @@
 #!/bin/bash
 # scripts/deploy.sh
 # Deployment script for Astro Photo Gallery
-# Syncs build artifacts, content, and admin interface to production.
+# Syncs build artifacts, content and server files to production.
+# (The admin panel is local-only and is never deployed.)
 #
 # Usage:
 #   npm run deploy              # Full deployment
 #   npm run deploy -- --checksum   # Force checksum for albums (slower but thorough)
+#   npm run deploy -- --parallel   # Parallel album sync (5 workers)
 #
 # Configuration:
 #   - Copy .env.example to .env and fill in your deployment settings
 #   - Supports SSH key (recommended) or password authentication
+
+set -uo pipefail
+
+# Fail helper: print message and abort with non-zero status
+fail() {
+    echo -e "${RED:-}✗ $1${NC:-}" >&2
+    exit 1
+}
 
 # --- Parse Arguments ---
 FORCE_CHECKSUM=""
@@ -26,6 +36,14 @@ for arg in "$@"; do
     esac
 done
 
+# Colors (defined before first use)
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+DIM='\033[2m'
+NC='\033[0m'
+
 # --- Load Environment Variables ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -33,9 +51,10 @@ ENV_FILE="$PROJECT_ROOT/.env"
 
 if [[ -f "$ENV_FILE" ]]; then
     set -a
-    source <(grep -v '^#' "$ENV_FILE" | grep -v '^$' | sed 's/^/export /')
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
     set +a
-    echo -e "${DIM:-}Loaded configuration from .env${NC:-}"
+    echo -e "${DIM}Loaded configuration from .env${NC}"
 fi
 
 # --- Configuration ---
@@ -56,6 +75,10 @@ CHOWN="${DEPLOY_CHOWN:-}"
 CONTROL_PATH="/tmp/deploy-ssh-$$"
 SSH_BASE_OPTS="-o ControlMaster=auto -o ControlPath=$CONTROL_PATH -o ControlPersist=60"
 
+# Password auth wrapper: `sshpass -e` reads the password from $SSHPASS, so it
+# never appears in the process list. Applied to both ssh and rsync.
+SSH_WRAP=()
+
 # Build SSH options
 if [[ -n "$SSH_KEY" ]] && [[ -f "${SSH_KEY/#\~/$HOME}" ]]; then
     SSH_KEY_EXPANDED="${SSH_KEY/#\~/$HOME}"
@@ -63,11 +86,12 @@ if [[ -n "$SSH_KEY" ]] && [[ -f "${SSH_KEY/#\~/$HOME}" ]]; then
     AUTH_METHOD="SSH key ($SSH_KEY)"
 elif [[ -n "$SSH_PASSWORD" ]]; then
     if command -v sshpass &> /dev/null; then
-        SSH_CMD_PREFIX="sshpass -p '$SSH_PASSWORD'"
+        export SSHPASS="$SSH_PASSWORD"
+        SSH_WRAP=(sshpass -e)
         SSH_OPTS="$SSH_BASE_OPTS"
         AUTH_METHOD="SSH password (via sshpass)"
     else
-        echo -e "\033[1;33mWarning: sshpass not installed.\033[0m"
+        echo -e "${YELLOW}Warning: sshpass not installed — you will be prompted for the password on every connection.${NC}"
         SSH_OPTS="$SSH_BASE_OPTS"
         AUTH_METHOD="SSH password (interactive)"
     fi
@@ -76,17 +100,17 @@ else
     AUTH_METHOD="default SSH agent"
 fi
 
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-RED='\033[0;31m'
-DIM='\033[2m'
-NC='\033[0m'
+# Wrappers so sshpass (when configured) applies everywhere consistently
+run_ssh() {
+    "${SSH_WRAP[@]}" ssh $SSH_OPTS -p "$SSH_PORT" "$@"
+}
+run_rsync() {
+    "${SSH_WRAP[@]}" rsync -e "ssh $SSH_OPTS -p $SSH_PORT" "$@"
+}
 
 # Cleanup on exit
 cleanup() {
-    ssh -O exit -o ControlPath=$CONTROL_PATH ${REMOTE_USER}@${REMOTE_HOST} 2>/dev/null
+    ssh -O exit -o ControlPath="$CONTROL_PATH" -p "$SSH_PORT" "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -105,34 +129,35 @@ echo ""
 
 # 1. Sanitize Folder Names
 echo -e "${YELLOW}[1/7] Sanitizing folder names to lowercase...${NC}"
-node scripts/sanitize-folders.mjs || { echo "Folder sanitization failed."; exit 1; }
+node scripts/sanitize-folders.mjs || fail "Folder sanitization failed."
 
 # 2. Build Project
 echo -e "${YELLOW}[2/7] Building project...${NC}"
-npm run build || { echo "Build failed."; exit 1; }
+npm run build || fail "Build failed."
 
 # 3. Fix Paths
 echo -e "${YELLOW}[3/7] Fixing server paths for production...${NC}"
-node scripts/fix-server-paths.mjs || { echo "Path fix failed."; exit 1; }
+DEPLOY_REMOTE_ROOT="$REMOTE_ROOT" node scripts/fix-server-paths.mjs || fail "Path fix failed."
 
 # 4. Create Remote Directories
 echo -e "${YELLOW}[4/7] Preparing remote directories...${NC}"
-ssh $SSH_OPTS -p $SSH_PORT ${REMOTE_USER}@${REMOTE_HOST} \
-    "mkdir -p ${REMOTE_ROOT}/client ${REMOTE_ROOT}/server ${REMOTE_ROOT}/src/content/albums ${REMOTE_ROOT}/public"
+run_ssh "${REMOTE_USER}@${REMOTE_HOST}" \
+    "mkdir -p ${REMOTE_ROOT}/client ${REMOTE_ROOT}/server ${REMOTE_ROOT}/src/content/albums ${REMOTE_ROOT}/public" \
+    || fail "Could not prepare remote directories (check SSH connection)."
 
 # 5. Sync Files
 echo -e "${YELLOW}[5/7] Syncing files...${NC}"
 
 # Sync static directories
 echo -e "  ${DIM}→ Syncing client assets...${NC}"
-rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
-    -e "ssh $SSH_OPTS -p $SSH_PORT" \
-    dist/client/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/client/"
+run_rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
+    dist/client/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/client/" \
+    || fail "Client assets sync failed."
 
 echo -e "  ${DIM}→ Syncing public assets...${NC}"
-rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
-    -e "ssh $SSH_OPTS -p $SSH_PORT" \
-    public/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/public/"
+run_rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
+    public/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/public/" \
+    || fail "Public assets sync failed."
 
 # Sync albums
 ALBUMS_LOCAL="src/content/albums"
@@ -150,12 +175,12 @@ if [[ -n "$PARALLEL_MODE" ]]; then
 
         if [[ -d "$src" ]]; then
             # Directory: sync contents with --delete
-            rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
+            "${SSH_WRAP[@]}" rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
                 -e "ssh $SSH_OPTS -p $SSH_PORT" \
                 "$src/" "$dest/"
         elif [[ -f "$src" ]]; then
             # File: sync to remote directory (no --delete for single files)
-            rsync -av --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
+            "${SSH_WRAP[@]}" rsync -av --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
                 -e "ssh $SSH_OPTS -p $SSH_PORT" \
                 "$src" "${REMOTE_USER}@${REMOTE_HOST}:$ALBUMS_REMOTE/"
         fi
@@ -164,65 +189,73 @@ if [[ -n "$PARALLEL_MODE" ]]; then
     # Export for background subshells
     export -f sync_album
     export ALBUMS_LOCAL ALBUMS_REMOTE REMOTE_USER REMOTE_HOST SSH_OPTS SSH_PORT
-    export CHMOD_DIRS CHMOD_FILES FORCE_CHECKSUM
+    export CHMOD_DIRS CHMOD_FILES FORCE_CHECKSUM SSHPASS
 
     # Gather top-level items (files and directories)
     mapfile -t ITEMS < <(find "$ALBUMS_LOCAL" -mindepth 1 -maxdepth 1 -printf "%f\n")
     echo -e "  ${DIM}  Found ${#ITEMS[@]} top-level items to sync${NC}"
 
-    # Sync in parallel with worker limit
+    # Sync in parallel with worker limit; track failures
+    SYNC_FAILED=0
     active=0
     for item in "${ITEMS[@]}"; do
         echo -e "  ${DIM}  Starting: $item${NC}"
         sync_album "$item" &
         ((active++))
         if (( active >= MAX_CONCURRENT )); then
-            wait -n  # Wait for any one background job to finish (Bash 5+)
+            if ! wait -n; then SYNC_FAILED=1; fi  # Bash 5+
             ((active--))
         fi
     done
-    wait
+    # Wait for the rest, collecting failures
+    while (( active > 0 )); do
+        if ! wait -n; then SYNC_FAILED=1; fi
+        ((active--))
+    done
+    [[ "$SYNC_FAILED" == "1" ]] && fail "One or more album syncs failed — aborting before cleanup."
 
     # Final cleanup: remove stale remote items
     echo -e "  ${DIM}→ Cleaning up stale remote items...${NC}"
-    REMOTE_ITEMS=$(ssh $SSH_OPTS -p $SSH_PORT "${REMOTE_USER}@${REMOTE_HOST}" \
+    REMOTE_ITEMS=$(run_ssh "${REMOTE_USER}@${REMOTE_HOST}" \
         "find '$ALBUMS_REMOTE' -mindepth 1 -maxdepth 1 -printf '%f\n'" 2>/dev/null)
 
     while IFS= read -r rem_item; do
         [[ -z "$rem_item" ]] && continue
         if [ ! -e "$ALBUMS_LOCAL/$rem_item" ]; then
             echo -e "    ${DIM}Removing stale: $rem_item${NC}"
-            ssh $SSH_OPTS -p $SSH_PORT "${REMOTE_USER}@${REMOTE_HOST}" \
-                "rm -rf '$ALBUMS_REMOTE/$rem_item'"
+            # printf %q quotes the path safely for the remote shell
+            run_ssh "${REMOTE_USER}@${REMOTE_HOST}" \
+                "rm -rf -- $(printf '%q' "$ALBUMS_REMOTE/$rem_item")"
         fi
     done <<< "$REMOTE_ITEMS"
 else
     # Sequential mode (default)
     echo -e "  ${DIM}→ Syncing albums...${NC}"
-    rsync -av --progress --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
-        -e "ssh $SSH_OPTS -p $SSH_PORT" \
-        src/content/albums/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/src/content/albums/"
+    run_rsync -av --progress --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
+        src/content/albums/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/src/content/albums/" \
+        || fail "Album sync failed."
 fi
 
 # Sync server and config files
 echo -e "  ${DIM}→ Syncing server files...${NC}"
-rsync -av --delete --checksum --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
-    -e "ssh $SSH_OPTS -p $SSH_PORT" \
-    dist/server/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/server/"
+run_rsync -av --delete --checksum --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
+    dist/server/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/server/" \
+    || fail "Server files sync failed."
 
-rsync -av --checksum --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
-    -e "ssh $SSH_OPTS -p $SSH_PORT" \
-    package.json ecosystem.config.cjs "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/"
+run_rsync -av --checksum --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
+    package.json ecosystem.config.cjs "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/" \
+    || fail "Config files sync failed."
 
-rsync -av --checksum --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
-    -e "ssh $SSH_OPTS -p $SSH_PORT" \
-    scripts/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/scripts/"
+run_rsync -av --checksum --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} \
+    scripts/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/scripts/" \
+    || fail "Scripts sync failed."
 
 echo -e "  ${GREEN}✓ Sync complete${NC}"
 
 # 6. Post-Deployment Setup
 echo -e "${YELLOW}[6/7] Configuring remote environment...${NC}"
-ssh $SSH_OPTS -p $SSH_PORT ${REMOTE_USER}@${REMOTE_HOST} "bash -s" <<EOF
+run_ssh "${REMOTE_USER}@${REMOTE_HOST}" "bash -s" <<EOF || fail "Remote configuration failed."
+    set -uo pipefail
     cd ${REMOTE_ROOT}
 
     # Sanitize remote folder names to lowercase
@@ -267,7 +300,8 @@ EOF
 
 # 7. Restart Server
 echo -e "${YELLOW}[7/7] Restarting gallery server...${NC}"
-ssh $SSH_OPTS -p $SSH_PORT ${REMOTE_USER}@${REMOTE_HOST} "cd ${REMOTE_ROOT} && pm2 restart ecosystem.config.cjs"
+run_ssh "${REMOTE_USER}@${REMOTE_HOST}" "cd ${REMOTE_ROOT} && pm2 restart ecosystem.config.cjs" \
+    || fail "PM2 restart failed — the site may be running the old version."
 
 # Done
 ELAPSED=$SECONDS
