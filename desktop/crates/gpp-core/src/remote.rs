@@ -291,7 +291,7 @@ fn pull_one(
     }
 
     // --- 3. Catalog the pulled media -------------------------------------
-    let summary = import_dir(lib, &album_dir, &ImportOptions { recursive: false, ..Default::default() }, None)?;
+    let summary = import_dir(lib, &album_dir, &ImportOptions { recursive: false, ..Default::default() }, None, None)?;
     outcome.photos_imported = summary.imported + summary.updated;
 
     // --- 4. Membership and order -----------------------------------------

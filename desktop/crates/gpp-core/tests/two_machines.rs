@@ -50,7 +50,7 @@ fn author_album(m: &Machine, album: &str, files: &[&str]) {
     for (i, name) in files.iter().enumerate() {
         write_jpeg(&dir.join(name), 120 + i as u32 * 10, 90);
     }
-    import_dir(&m.lib, &dir, &ImportOptions::default(), None).unwrap();
+    import_dir(&m.lib, &dir, &ImportOptions::default(), None, None).unwrap();
 
     m.lib
         .create_album(&NewAlbum {

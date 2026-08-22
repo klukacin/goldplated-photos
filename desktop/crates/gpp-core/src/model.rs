@@ -227,6 +227,10 @@ pub struct ImportSummary {
     /// dropped, because a file on disk that the catalog forgets is worse than
     /// one it cannot preview, but the caller should say so.
     pub undecodable: Vec<String>,
+    /// The run stopped on request before reaching the end of the folder. Every
+    /// other count is then a partial tally, so a caller that ignores this flag
+    /// would announce a finished import that never finished.
+    pub cancelled: bool,
 }
 
 #[cfg(test)]

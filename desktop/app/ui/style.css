@@ -310,6 +310,14 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   overflow: hidden;
 }
 .progress-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
+/* Sits in a 30px status bar, so it gets its own tighter metrics rather than
+   stretching the bar every time an import starts. */
+#import-cancel {
+  padding: 0.1rem 0.5rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
 
 /* ----------------------------------------------------------------- modals */
 

@@ -228,6 +228,16 @@ not orphan its thumbnails.
 is the single biggest speed win over the Node admin: real threads, no event loop,
 no GC pause.
 
+**Stopping.** `import_dir` takes a `should_stop` predicate alongside its progress
+callback and polls it before each file, in the copy-in step as well as the
+processing pass — a 2000-frame card is tens of minutes of work, and killing the
+app cannot be the only way out. A stopped run **commits what it finished**: the
+photographer who stops at 600 keeps those 600, and the frames never reached are
+simply absent rather than half-written. `ImportSummary::cancelled` says which
+kind of run it was, so no caller can report a partial import as a complete one.
+`Session::cancel_import()` is the GUI-facing handle; each `import` clears the
+flag first, or the second import would stop before opening a file.
+
 ### 5.1 Develop
 
 Adjustments are a list of ops stored as JSON against a photo. Nothing on disk

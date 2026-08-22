@@ -87,6 +87,13 @@ async fn import_photos(
     .map_err(|e| e.to_string())?
 }
 
+/// Stop the running import. Synchronous on purpose: it only raises a flag, and
+/// it must not queue behind the blocking task it is trying to interrupt.
+#[tauri::command]
+fn cancel_import(state: State<'_, Session>) {
+    state.cancel_import();
+}
+
 #[tauri::command]
 fn prune_missing(state: State<'_, Session>) -> CmdResult<usize> {
     state.prune().map_err(to_msg)
@@ -400,6 +407,7 @@ pub fn run() {
             library_status,
             is_library_open,
             import_photos,
+            cancel_import,
             prune_missing,
             list_photos,
             photo_path,
