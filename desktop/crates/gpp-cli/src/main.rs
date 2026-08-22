@@ -573,6 +573,12 @@ fn cmd_sync(args: &[String]) -> Result<()> {
                 for c in &outcome.conflicts {
                     println!("  conflict: {c}");
                 }
+                // A whole album can land here — a subscription naming an album
+                // that was renamed or deleted, say. The batch carries on, so
+                // this is the only place it is said out loud.
+                for (path, why) in &outcome.failed {
+                    println!("  failed: {path} — {why}");
+                }
             }
         }
     }

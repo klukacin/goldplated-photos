@@ -390,3 +390,85 @@ fn pushing_an_album_never_rewrites_a_shared_parent_folder() {
     assert!(now.contains("title: \"Vjenčanja\""));
     assert!(now.contains("tajna"), "A's password survived B's rename");
 }
+
+/// One stranded subscription must not stop the others.
+///
+/// A subscription names an album by path, and nothing today keeps that name in
+/// step with the catalog: rename the album, or delete it, and the row is left
+/// pointing at nothing. `sync_tracked_albums` then failed the whole batch on
+/// that one row, so a photographer whose Friday shoot syncs fine discovers on
+/// Sunday that none of it went up — because an album they renamed on Wednesday
+/// is checked first and takes everything down with it.
+#[test]
+fn a_stranded_subscription_does_not_stop_the_other_albums() {
+    let a = machine();
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    author_album(&a, "2026/healthy", &["one.jpg"]);
+    a.lib.track_album("2026/healthy", SyncDirection::Push).unwrap();
+    // A subscription to an album the catalog does not have — exactly what a
+    // rename or a delete leaves behind. It sorts first, so it is reached first.
+    a.lib.track_album("2025/gone", SyncDirection::Push).unwrap();
+
+    let results = remote::sync_tracked_albums(
+        &a.lib, &server, a.published_root(), &opts, false,
+    )
+    .expect("one bad subscription must not fail the batch");
+
+    let healthy = results
+        .iter()
+        .find(|(path, _)| path == "2026/healthy")
+        .expect("the healthy album should still have been synced");
+    assert!(healthy.1.pushed > 0, "the healthy album pushed nothing");
+
+    let stranded = results
+        .iter()
+        .find(|(path, _)| path == "2025/gone")
+        .expect("the stranded subscription should be reported, not swallowed");
+    assert_eq!(stranded.1.failed.len(), 1, "it should say what went wrong");
+}
+
+/// Deleting an album must take its subscription with it. Left behind, the row
+/// names an album that no longer exists and every later sync has to work around
+/// it.
+#[test]
+fn deleting_an_album_stops_syncing_it() {
+    let a = machine();
+    author_album(&a, "2026/gone-soon", &["one.jpg"]);
+    a.lib.track_album("2026/gone-soon", SyncDirection::Push).unwrap();
+
+    a.lib.delete_album("2026/gone-soon").unwrap();
+
+    assert!(
+        a.lib.album_subscription("2026/gone-soon").unwrap().is_none(),
+        "the subscription outlived the album it names"
+    );
+}
+
+/// Renaming an album must carry its subscription, and its descendants'.
+/// Dropping them would quietly stop syncing an album the photographer only
+/// renamed — no error, no warning, just a client's gallery that stops updating.
+#[test]
+fn renaming_an_album_carries_its_subscription() {
+    let a = machine();
+    author_album(&a, "2026/weddings/ana", &["one.jpg"]);
+    a.lib.track_album("2026/weddings", SyncDirection::Both).unwrap();
+    a.lib.track_album("2026/weddings/ana", SyncDirection::Push).unwrap();
+
+    a.lib.move_album("2026/weddings", "2026/vjencanja").unwrap();
+
+    let moved = a.lib.album_subscription("2026/vjencanja").unwrap();
+    assert!(moved.is_some(), "the folder's own subscription was dropped");
+    assert_eq!(moved.unwrap().direction, SyncDirection::Both);
+
+    let child = a.lib.album_subscription("2026/vjencanja/ana").unwrap();
+    assert!(child.is_some(), "the sub-album's subscription was dropped");
+    assert_eq!(child.unwrap().direction, SyncDirection::Push);
+
+    assert!(
+        a.lib.album_subscription("2026/weddings").unwrap().is_none(),
+        "the old path is still subscribed"
+    );
+}

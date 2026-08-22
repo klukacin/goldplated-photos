@@ -650,6 +650,10 @@ Three manifests decide every file: what is local, what was last synced, what the
 
 Two transports, same trait: a folder (network share, external drive) or the gallery's own HTTP endpoints. `.meta/` is server-owned — the proofing submissions live there — and is excluded from every manifest in both directions.
 
+**A subscription follows its album.** Renaming or moving an album carries its subscription and its sub-albums' subscriptions; deleting an album drops its subscription. Nothing on the remote moves, though — a tracked album that was already pushed stays on the server under the old path too, and the next sync publishes it under the new one, so the server holds both until someone deletes the old copy with `allow_deletes`.
+
+**One album's failure never stops the batch.** "Sync all tracked" reports each album's outcome separately, a failed album included, and carries on with the rest — the same way `apply` already treats a single failing file.
+
 ### Sync over HTTP
 
 `/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `desktop/UPLOAD-TRANSPORT.md` for the measurements and why the transport is what it is.

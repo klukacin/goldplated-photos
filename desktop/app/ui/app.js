@@ -1323,10 +1323,23 @@ $('sync-all-btn').addEventListener('click', async () => {
       return;
     }
     $('sync-output').hidden = false;
+    // One album failing no longer stops the others, so the reason has to be
+    // shown per album — a count alone would leave the photographer knowing
+    // something went wrong and not which album or why.
     $('sync-output').textContent = results
-      .map(([path, o]) => `${path}: ${describeOutcome(o)}`)
+      .map(([path, o]) =>
+        [
+          `${path}: ${describeOutcome(o)}`,
+          ...(o.failed || []).map(([file, why]) => `    ${file} — ${why}`),
+        ].join('\n')
+      )
       .join('\n');
-    status(`Synced ${results.length} album(s)`);
+    const failedAlbums = results.filter(([, o]) => o.failed?.length).length;
+    status(
+      failedAlbums
+        ? `Synced ${results.length - failedAlbums} of ${results.length} album(s)`
+        : `Synced ${results.length} album(s)`
+    );
     await refreshAll();
     await refreshRemote();
   } catch (err) {

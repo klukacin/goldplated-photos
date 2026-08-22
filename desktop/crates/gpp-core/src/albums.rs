@@ -396,7 +396,14 @@ impl Library {
             .ok_or_else(|| Error::AlbumNotFound(path.to_string()))
     }
 
-    /// Rename or move an album, carrying its descendants with it.
+    /// Rename or move an album, carrying its descendants — and their sync
+    /// subscriptions — with it.
+    ///
+    /// This moves nothing on a remote. A tracked album that has already been
+    /// pushed stays on the server under its old path as well, and the next
+    /// sync publishes it under the new one, so the server ends up holding both.
+    /// Removing the old copy is a deletion, and deletions are never implicit
+    /// here: the photographer does it deliberately, with `allow_deletes`.
     pub fn move_album(&self, from: &str, to: &str) -> Result<Album> {
         let to = normalize_path(to)?;
         if self.album_by_path(from)?.is_none() {
@@ -445,6 +452,35 @@ impl Library {
             for (id, new_path) in moves {
                 upd.execute(params![new_path, parent_of(&new_path), id])?;
             }
+
+            // Carry the sync subscriptions along. A subscription names an album
+            // by path, so leaving them behind means a rename quietly stops
+            // syncing the album — no error, just a client's gallery that never
+            // updates again — and leaves a row pointing at nothing for every
+            // later sync to trip over. Same literal-prefix comparison as above,
+            // for the same reason.
+            tx.execute(
+                "UPDATE album_sync SET album_path = ?1 WHERE album_path = ?2",
+                params![to, from],
+            )?;
+            let mut stmt = tx.prepare(
+                "SELECT album_path FROM album_sync WHERE substr(album_path, 1, ?2) = ?1",
+            )?;
+            let rows = stmt.query_map(
+                params![descendant_prefix, descendant_prefix.chars().count() as i64],
+                |r| r.get::<_, String>(0),
+            )?;
+            let mut sub_moves = Vec::new();
+            for row in rows {
+                let old = row?;
+                let suffix = old[descendant_prefix.len()..].to_string();
+                sub_moves.push((old, format!("{to}/{suffix}")));
+            }
+            let mut upd_sub =
+                tx.prepare("UPDATE album_sync SET album_path = ?1 WHERE album_path = ?2")?;
+            for (old, new_path) in sub_moves {
+                upd_sub.execute(params![new_path, old])?;
+            }
             Ok(())
         })?;
 
@@ -455,8 +491,15 @@ impl Library {
     /// Delete an album. Photos are untouched — an album is a view over them,
     /// not a container of them.
     pub fn delete_album(&self, path: &str) -> Result<()> {
-        let n = self.with_conn(|c| {
-            Ok(c.execute("DELETE FROM albums WHERE path = ?1", params![path])?)
+        let n = self.with_tx(|tx| {
+            let n = tx.execute("DELETE FROM albums WHERE path = ?1", params![path])?;
+            // The subscription goes with it. Left behind it names an album the
+            // catalog no longer has, and every later sync has to work around a
+            // row describing nothing.
+            if n > 0 {
+                tx.execute("DELETE FROM album_sync WHERE album_path = ?1", params![path])?;
+            }
+            Ok(n)
         })?;
         if n == 0 {
             return Err(Error::AlbumNotFound(path.to_string()));

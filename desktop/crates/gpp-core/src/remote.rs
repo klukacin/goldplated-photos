@@ -726,7 +726,13 @@ pub fn sync_tracked_albums(
             continue;
         }
 
-        let outcome = sync_path(
+        // One album's failure is reported against that album and the batch goes
+        // on. Aborting here meant a single stale subscription — an album
+        // renamed on Wednesday, say — stopped every other album from syncing,
+        // and the photographer had no way to tell which one was at fault or
+        // that the rest had never gone up at all. `apply` already treats a
+        // single failing file this way; a failing album is the same shape.
+        let outcome = match sync_path(
             lib,
             transport,
             &sub.album_path,
@@ -734,7 +740,13 @@ pub fn sync_tracked_albums(
             published_root,
             publish_opts,
             allow_deletes,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => sync::SyncOutcome {
+                failed: vec![(sub.album_path.clone(), e.to_string())],
+                ..Default::default()
+            },
+        };
         out.push((sub.album_path.clone(), outcome));
     }
     Ok(out)
