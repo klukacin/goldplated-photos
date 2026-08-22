@@ -242,6 +242,17 @@ pub fn apply_orientation(img: DynamicImage, orientation: Option<u16>) -> Dynamic
     }
 }
 
+/// What [`apply_orientation`] would do to a size, without decoding anything.
+///
+/// EXIF orientations 5–8 turn the image a quarter turn, so the stored width
+/// and height are the other way round from how the photo is displayed.
+pub fn swap_for_orientation(w: u32, h: u32, orientation: Option<u16>) -> (u32, u32) {
+    match orientation.unwrap_or(1) {
+        5..=8 => (h, w),
+        _ => (w, h),
+    }
+}
+
 /// Resize preserving aspect ratio so the long edge is at most `max_edge`.
 /// Never enlarges.
 pub fn resize_to_fit(img: &DynamicImage, max_edge: u32) -> DynamicImage {

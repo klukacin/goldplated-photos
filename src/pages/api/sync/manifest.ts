@@ -11,7 +11,8 @@ import type { APIRoute } from 'astro';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { checkSyncAuth, safeScope } from '../../../lib/sync-auth';
-import { blake3Hex, CONTENT_ROOT, jsonError } from './_shared';
+import { cachedHash, flushHashCache } from './_hash-cache';
+import { CONTENT_ROOT, jsonError } from './_shared';
 
 export const prerender = false;
 
@@ -32,6 +33,7 @@ export const GET: APIRoute = async ({ request, url }) => {
     // exactly what a first push looks like.
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
   }
+  await flushHashCache();
 
   return new Response(JSON.stringify({ files }), {
     status: 200,
@@ -49,10 +51,8 @@ async function walk(dir: string, out: Array<{ path: string; hash: string }>) {
     if (entry.isDirectory()) {
       await walk(full, out);
     } else if (entry.isFile()) {
-      out.push({
-        path: path.relative(CONTENT_ROOT, full).split(path.sep).join('/'),
-        hash: await blake3Hex(full),
-      });
+      const rel = path.relative(CONTENT_ROOT, full).split(path.sep).join('/');
+      out.push({ path: rel, hash: await cachedHash(full, rel) });
     }
   }
 }

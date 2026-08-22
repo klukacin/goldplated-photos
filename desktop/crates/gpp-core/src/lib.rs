@@ -34,3 +34,19 @@ pub use catalog::Library;
 /// Application session — one method per UI command. The desktop and mobile
 /// shells are thin wrappers over this.
 pub use session::Session;
+
+#[cfg(test)]
+mod contract {
+    /// Anything holding a library from more than one thread — a server, a
+    /// background import, a scheduled publish — needs these. They hold today
+    /// because of what `Session` and `Library` are made of; this makes the
+    /// next change that would take them away a compile error instead of a
+    /// discovery in someone else's project.
+    #[test]
+    fn the_public_handles_cross_threads() {
+        fn require<T: Send + Sync + 'static>() {}
+        require::<crate::Session>();
+        require::<crate::Library>();
+        require::<crate::Error>();
+    }
+}

@@ -56,6 +56,13 @@ impl Library {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // A library is meant to be reachable from more than one program at a
+        // time — the desktop app open while the CLI publishes. WAL lets
+        // readers through; two writers still meet, and the second must wait
+        // rather than fail with "database is locked". rusqlite already
+        // defaults to waiting 5s; this states the intent and pins it, since
+        // bare SQLite's own default is to fail instantly.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         Ok(())
     }
 
@@ -625,6 +632,48 @@ mod tests {
     fn opens_and_migrates() {
         let lib = Library::open_in_memory("/tmp/lib").unwrap();
         assert_eq!(lib.photo_count().unwrap(), 0);
+    }
+
+    /// Two programs may hold the same library — the app open while the CLI
+    /// publishes. WAL lets readers through; a second writer has to wait rather
+    /// than fail instantly with "database is locked". This locks that in: it
+    /// is currently true because of a default, and a default is not a promise.
+    #[test]
+    fn a_second_writer_waits_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Library::open(dir.path()).unwrap();
+        let second = Library::open(dir.path()).unwrap();
+
+        let holding = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let done = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let writer = {
+            let (holding, done) = (holding.clone(), done.clone());
+            std::thread::spawn(move || {
+                first
+                    .with_tx(|tx| {
+                        // Take the write lock, then hold it while the other
+                        // side tries.
+                        tx.execute("INSERT INTO settings(key, value) VALUES('a','1')", [])?;
+                        holding.wait();
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        Ok(())
+                    })
+                    .unwrap();
+                done.wait();
+            })
+        };
+
+        holding.wait();
+        // Without a busy timeout this returns SQLITE_BUSY immediately.
+        second
+            .with_tx(|tx| {
+                tx.execute("INSERT INTO settings(key, value) VALUES('b','2')", [])?;
+                Ok(())
+            })
+            .expect("second writer should wait for the lock, not fail");
+        done.wait();
+        writer.join().unwrap();
     }
 
     #[test]

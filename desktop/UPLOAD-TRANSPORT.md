@@ -305,3 +305,49 @@ A search summary claimed rclone does rsync-style delta transfers. **It does
 not** — zero occurrences of "delta" in its docs tree. That is settled, not open;
 it is recorded here only as a reminder that a confident-sounding source was
 flatly wrong, which is the failure mode this section exists to prevent.
+
+---
+
+## Measured, once the transport was built
+
+The design above was argued from vendor docs and arithmetic. Here is what a
+real 1.1 GB shoot — 60 photos, ~18 MB each — actually costs, measured on a
+4-core Linux box pushing to the gallery over loopback, so the network is out of
+the picture and only our own code is being timed.
+
+| Step | Before | After |
+|---|---|---|
+| Server manifest of the tree | 41.7 s | **0.01 s** (first call after a change still pays for that file) |
+| Push with nothing to send | 76.5 s | **0.4 s** |
+| First push of the whole 1.1 GB | 46.4 s | 43.9 s — 25 MB/s, **200 Mbit/s** |
+| Push of 5 changed photos | — | **3.6 s** |
+
+### Where the time was going
+
+Not the network, and not the client. The gallery server hashes with BLAKE3 in
+JavaScript, and on this machine that runs at **32 MB/s** while the disk reads
+at 2.3 GB/s. Every sync asked the server for a manifest, and the server
+re-hashed all 1.1 GB to answer — 40 seconds, on every push, even a push with
+nothing to send. The client's own hashing of the same bytes takes 0.36 s
+serial, 0.17 s across four cores; it was never the problem.
+
+The fix is a cache keyed by `(size, mtime)` in `.sync-hashes.json` beside the
+content, filled as a side effect of the verification an upload already
+performs. The cache is only ever an optimisation: a wrong answer makes the
+client send a file it did not need to, never skip one it did. `tests/sync-hash-cache.test.ts`
+holds it to that.
+
+### What is left, and whether it matters
+
+Uploads are still bounded by the same JavaScript hash — the server verifies
+`X-Content-Blake3` before committing a file — which caps a push at about
+**25 MB/s (200 Mbit/s)** no matter how fast the link is. That is above any
+consumer uplink, so for pushing to a hosted server it is not the constraint;
+the uplink is. It would start to matter on a LAN or a gigabit link.
+
+If that day comes, the fix is to stop asking JavaScript to hash: switch the
+wire hash to SHA-256, which Node computes in OpenSSL at 1–2 GB/s, and have the
+Rust side match. The reason it is BLAKE3 today — matching what the core
+computes for the catalog — turns out to be weak, since the published tree is
+hashed separately from the originals anyway. Not worth the wire change until
+the throughput is worth it.

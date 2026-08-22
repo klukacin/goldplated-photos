@@ -10,6 +10,7 @@ import type { APIRoute } from 'astro';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { checkSyncAuth, safeRelPath } from '../../../lib/sync-auth';
+import { flushHashCache, forgetHash, rememberHash } from './_hash-cache';
 import { blake3HexOf, CONTENT_ROOT, jsonError } from './_shared';
 
 export const prerender = false;
@@ -17,21 +18,22 @@ export const prerender = false;
 /** 512 MB: far above any photo, far below anything that could exhaust the box. */
 const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 
-function resolve(url: URL): string | null {
+function resolve(url: URL): { full: string; rel: string } | null {
   const rel = safeRelPath(url.searchParams.get('path'));
   if (!rel) return null;
   const full = path.join(CONTENT_ROOT, rel);
   // Belt and braces: even with the path rules above, never act outside the root.
   if (!full.startsWith(CONTENT_ROOT + path.sep)) return null;
-  return full;
+  return { full, rel };
 }
 
 export const GET: APIRoute = async ({ request, url }) => {
   const auth = checkSyncAuth(request);
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
-  const full = resolve(url);
-  if (!full) return jsonError('Invalid path', 400);
+  const target = resolve(url);
+  if (!target) return jsonError('Invalid path', 400);
+  const { full } = target;
 
   try {
     const bytes = await fs.readFile(full);
@@ -48,8 +50,9 @@ export const PUT: APIRoute = async ({ request, url }) => {
   const auth = checkSyncAuth(request);
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
-  const full = resolve(url);
-  if (!full) return jsonError('Invalid path', 400);
+  const target = resolve(url);
+  if (!target) return jsonError('Invalid path', 400);
+  const { full, rel } = target;
 
   const body = new Uint8Array(await request.arrayBuffer());
   if (body.byteLength > MAX_UPLOAD_BYTES) {
@@ -58,11 +61,13 @@ export const PUT: APIRoute = async ({ request, url }) => {
 
   // Reject rather than publish a file that did not survive the wire intact.
   const declared = request.headers.get('x-content-blake3');
+  let verified: string | null = null;
   if (declared) {
     const actual = blake3HexOf(body);
     if (actual !== declared) {
       return jsonError(`Hash mismatch: declared ${declared}, received ${actual}`, 422);
     }
+    verified = actual;
   }
 
   await fs.mkdir(path.dirname(full), { recursive: true });
@@ -77,6 +82,13 @@ export const PUT: APIRoute = async ({ request, url }) => {
     throw err;
   }
 
+  // The hash was computed to verify the upload; keeping it means the next
+  // manifest does not read this file again.
+  if (verified) {
+    await rememberHash(full, rel, verified);
+    await flushHashCache();
+  }
+
   return new Response(null, { status: 204 });
 };
 
@@ -84,10 +96,13 @@ export const DELETE: APIRoute = async ({ request, url }) => {
   const auth = checkSyncAuth(request);
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
-  const full = resolve(url);
-  if (!full) return jsonError('Invalid path', 400);
+  const target = resolve(url);
+  if (!target) return jsonError('Invalid path', 400);
+  const { full, rel } = target;
 
   await fs.rm(full, { force: true });
+  await forgetHash(rel);
+  await flushHashCache();
   // Tidy up a directory the deletion emptied, but never complain if it is not
   // empty — another album's files may share the parent.
   await fs.rmdir(path.dirname(full)).catch(() => {});

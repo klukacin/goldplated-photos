@@ -7,7 +7,6 @@
  */
 import { blake3 } from '@noble/hashes/blake3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import fs from 'node:fs/promises';
 import path from 'node:path';
 
 /** The tree the gallery reads, and the only tree sync may touch. */
@@ -15,10 +14,6 @@ export const CONTENT_ROOT = path.resolve(process.cwd(), 'src/content/albums');
 
 export function blake3HexOf(bytes: Uint8Array): string {
   return bytesToHex(blake3(bytes));
-}
-
-export async function blake3Hex(file: string): Promise<string> {
-  return blake3HexOf(new Uint8Array(await fs.readFile(file)));
 }
 
 export function jsonError(message: string, status: number): Response {
