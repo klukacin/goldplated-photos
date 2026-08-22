@@ -307,7 +307,11 @@ fn pull_one(
         .filter(|p| is_direct_child(album_path, &p.rel_path))
         .collect();
 
-    lib.add_photos_to_album(album_path, &own.iter().map(|p| p.id).collect::<Vec<_>>())?;
+    // A folder in the chain has no photos of its own, and asking to add none
+    // of them to a collection is a question the catalog is right to refuse.
+    if !own.is_empty() {
+        lib.add_photos_to_album(album_path, &own.iter().map(|p| p.id).collect::<Vec<_>>())?;
+    }
 
     if !parsed.photo_order.is_empty() {
         let ordered: Vec<i64> = parsed

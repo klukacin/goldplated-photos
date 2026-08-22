@@ -60,9 +60,17 @@ struct Processed {
     /// Dimensions after orientation is applied.
     width: Option<u32>,
     height: Option<u32>,
+    /// No decoder could read this file's pixels.
+    undecodable: bool,
 }
 
-/// Import every supported file under `dir` (which must be inside the library).
+/// Import every supported file under `dir`.
+///
+/// A folder inside the library is catalogued where it lies. A folder outside
+/// it — a camera card, a downloads folder — is copied in first, because the
+/// catalog addresses photos by their path under the library root and cannot
+/// point at files that live somewhere else. Nothing at the source is altered
+/// or removed.
 ///
 /// `on_progress` is called from the worker threads; keep it cheap and
 /// thread-safe.
@@ -72,9 +80,19 @@ pub fn import_dir(
     opts: &ImportOptions,
     on_progress: Option<&(dyn Fn(ImportProgress) + Sync)>,
 ) -> Result<ImportSummary> {
+    let brought_in = bring_inside(lib, dir, opts.recursive, on_progress)?;
+    let (dir, copied) = match &brought_in {
+        Some(c) => (c.dest.as_path(), Some(c)),
+        None => (dir, None),
+    };
+
     let candidates = scan(lib, dir, opts.recursive)?;
     if candidates.is_empty() {
-        return Ok(ImportSummary::default());
+        return Ok(ImportSummary {
+            copied_in: copied.map(|c| c.files).unwrap_or(0),
+            copied_into: copied.map(|c| c.rel.clone()),
+            ..Default::default()
+        });
     }
 
     // What the catalog already knows, so unchanged files can be skipped
@@ -113,11 +131,20 @@ pub fn import_dir(
         })
         .collect();
 
-    let mut summary = ImportSummary::default();
+    let mut summary = ImportSummary {
+        copied_in: copied.map(|c| c.files).unwrap_or(0),
+        copied_into: copied.map(|c| c.rel.clone()),
+        ..Default::default()
+    };
     let mut to_insert = Vec::new();
     for r in results {
         match r {
-            Ok(Some(p)) => to_insert.push(p),
+            Ok(Some(p)) => {
+                if p.undecodable {
+                    summary.undecodable.push(p.candidate.rel_path.clone());
+                }
+                to_insert.push(p);
+            }
             Ok(None) => summary.skipped += 1,
             Err((path, msg)) => summary.failed.push((path, msg)),
         }
@@ -202,6 +229,135 @@ pub fn import_dir(
     })?;
 
     Ok(summary)
+}
+
+/// Where an outside folder was copied to, and how much of it arrived.
+struct BroughtIn {
+    dest: PathBuf,
+    /// The destination relative to the library root, for the report.
+    rel: String,
+    files: usize,
+}
+
+/// Copy an outside folder into the library so it can be catalogued.
+///
+/// Returns `None` when `dir` is already inside the library, which is the
+/// in-place case and needs no copying.
+///
+/// The destination keeps the source folder's name, and a name already taken
+/// gains a numeric suffix rather than merging into it — two cards both called
+/// `DCIM` are two shoots, not one. Subfolder structure is preserved. A file
+/// that somehow already exists at the destination with identical bytes is left
+/// alone, so a re-run after an interruption resumes instead of duplicating.
+fn bring_inside(
+    lib: &Library,
+    dir: &Path,
+    recursive: bool,
+    on_progress: Option<&(dyn Fn(ImportProgress) + Sync)>,
+) -> Result<Option<BroughtIn>> {
+    let root = lib.root();
+    let source = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        root.join(dir)
+    };
+    // canonicalize so that symlinks and `..` cannot disguise an inside path as
+    // an outside one, or the reverse.
+    let source = source.canonicalize().unwrap_or(source);
+    let root_real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if source.starts_with(&root_real) {
+        return Ok(None);
+    }
+    if !source.is_dir() {
+        return Err(Error::InvalidPath(source.display().to_string()));
+    }
+
+    let base = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("imported");
+    let (dest, rel) = free_destination(&root_real, base);
+
+    // Collect first so progress can report a total.
+    let mut walker = WalkDir::new(&source).follow_links(false);
+    if !recursive {
+        walker = walker.max_depth(1);
+    }
+    let files: Vec<PathBuf> = walker
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_hidden(e.path()))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && media::classify(e.path()).is_some())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let total = files.len();
+    let mut copied = 0;
+    for (i, file) in files.iter().enumerate() {
+        let Ok(sub) = file.strip_prefix(&source) else {
+            continue;
+        };
+        let target = dest.join(sub);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        if let Some(cb) = on_progress {
+            cb(ImportProgress {
+                processed: i + 1,
+                total,
+                current: format!("copying {}", sub.display()),
+            });
+        }
+        if same_file(file, &target) {
+            copied += 1;
+            continue;
+        }
+        std::fs::copy(file, &target).map_err(|e| Error::io(file, e))?;
+        copied += 1;
+    }
+
+    Ok(Some(BroughtIn {
+        dest,
+        rel,
+        files: copied,
+    }))
+}
+
+/// `<root>/<name>`, or `<root>/<name>-2` and so on when that is taken.
+fn free_destination(root: &Path, name: &str) -> (PathBuf, String) {
+    let first = root.join(name);
+    if !first.exists() {
+        return (first, name.to_string());
+    }
+    for n in 2..1000 {
+        let rel = format!("{name}-{n}");
+        let candidate = root.join(&rel);
+        if !candidate.exists() {
+            return (candidate, rel);
+        }
+    }
+    // Vanishingly unlikely; better than looping forever.
+    let rel = format!("{name}-{}", std::process::id());
+    (root.join(&rel), rel)
+}
+
+/// Same length and same bytes — cheap enough for the resume check, and the
+/// length test rejects almost everything before any reading happens.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (a.metadata(), b.metadata()) else {
+        return false;
+    };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// Walk the tree and collect supported files.
@@ -291,6 +447,7 @@ fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<
     let mut width = metadata.width;
     let mut height = metadata.height;
     let mut lqip = None;
+    let mut undecodable = false;
 
     // Videos and RAW get catalogued on metadata alone in this phase.
     if cand.kind == PhotoKind::Photo && thumbnails {
@@ -306,15 +463,21 @@ fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<
                 lqip = d.lqip;
             }
             Err(e) => {
-                // A file we can't decode is still worth cataloguing.
+                // Still catalogued — a file on disk the catalog has forgotten
+                // is worse than one it cannot preview — but flagged, so the
+                // import can say so and the grid can show why.
                 tracing::warn!(path = %cand.rel_path, error = %e, "thumbnail generation failed");
+                undecodable = true;
             }
         }
     } else if cand.kind == PhotoKind::Photo {
-        if let Ok(img) = image::open(&cand.abs_path) {
-            let img = media::apply_orientation(img, metadata.orientation);
-            width = Some(img.width());
-            height = Some(img.height());
+        match image::open(&cand.abs_path) {
+            Ok(img) => {
+                let img = media::apply_orientation(img, metadata.orientation);
+                width = Some(img.width());
+                height = Some(img.height());
+            }
+            Err(_) => undecodable = true,
         }
     }
 
@@ -325,6 +488,7 @@ fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<
         lqip,
         width,
         height,
+        undecodable,
     })
 }
 
@@ -370,6 +534,72 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let img = image::DynamicImage::new_rgb8(w, h);
         img.save_with_format(path, image::ImageFormat::Jpeg).unwrap();
+    }
+
+    /// The obvious gesture — point Import at a camera card — used to fail
+    /// with "invalid path", because the catalog can only address files under
+    /// the library root. The folder is copied in instead.
+    #[test]
+    fn a_folder_from_outside_the_library_is_copied_in() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let card = tempfile::tempdir().unwrap();
+        let lib = Library::open(lib_dir.path()).unwrap();
+
+        write_jpeg(&card.path().join("DCIM/a.jpg"), 40, 30);
+        write_jpeg(&card.path().join("DCIM/sub/b.jpg"), 40, 30);
+
+        let summary = import_dir(&lib, &card.path().join("DCIM"), &ImportOptions::default(), None)
+            .unwrap();
+
+        assert_eq!(summary.copied_in, 2);
+        assert_eq!(summary.copied_into.as_deref(), Some("DCIM"));
+        assert_eq!(summary.imported, 2);
+
+        // The copies live under the library, keeping their subfolder.
+        assert!(lib_dir.path().join("DCIM/a.jpg").exists());
+        assert!(lib_dir.path().join("DCIM/sub/b.jpg").exists());
+        // And the card is untouched.
+        assert!(card.path().join("DCIM/a.jpg").exists());
+
+        let photos = lib.photos(&PhotoFilter::default()).unwrap();
+        let mut paths: Vec<_> = photos.iter().map(|p| p.rel_path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["DCIM/a.jpg", "DCIM/sub/b.jpg"]);
+    }
+
+    /// A second card of the same name is a second shoot, not an overwrite.
+    #[test]
+    fn a_second_card_with_the_same_name_lands_beside_the_first() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(lib_dir.path()).unwrap();
+
+        for (card, w) in [(tempfile::tempdir().unwrap(), 40), (tempfile::tempdir().unwrap(), 60)] {
+            write_jpeg(&card.path().join("DCIM/only.jpg"), w, 30);
+            let summary =
+                import_dir(&lib, &card.path().join("DCIM"), &ImportOptions::default(), None)
+                    .unwrap();
+            assert_eq!(summary.copied_in, 1);
+        }
+
+        assert!(lib_dir.path().join("DCIM/only.jpg").exists());
+        assert!(lib_dir.path().join("DCIM-2/only.jpg").exists());
+    }
+
+    /// Re-running an interrupted copy must not duplicate what already arrived.
+    #[test]
+    fn re_importing_the_same_card_does_not_duplicate_it() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let card = tempfile::tempdir().unwrap();
+        let lib = Library::open(lib_dir.path()).unwrap();
+        write_jpeg(&card.path().join("DCIM/a.jpg"), 40, 30);
+
+        import_dir(&lib, &card.path().join("DCIM"), &ImportOptions::default(), None).unwrap();
+        // Same source, second run: it lands in DCIM-2 as a distinct folder, but
+        // the catalog must not grow a phantom copy of a file that is byte for
+        // byte what it already holds.
+        let second =
+            import_dir(&lib, &card.path().join("DCIM"), &ImportOptions::default(), None).unwrap();
+        assert_eq!(second.duplicates, 1, "same bytes should register as a duplicate");
     }
 
     #[test]

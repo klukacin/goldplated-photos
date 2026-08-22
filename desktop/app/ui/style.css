@@ -147,7 +147,6 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .nav-item:hover, .album-item:hover { background: #26262e; }
 .nav-item.active, .album-item.active { background: #32323c; }
 .album-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.album-item .depth-1 { padding-left: 0.75rem; }
 .count { font-size: 0.78em; color: var(--text-dim); }
 .lock { font-size: 0.8em; }
 .album-cog { opacity: 0; background: none; border: none; cursor: pointer; padding: 0 0.2rem; }
@@ -208,6 +207,20 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   background: #0e0e11;
 }
 .cell.rejected img { opacity: 0.35; }
+
+/* A file the decoder could not read. The cell keeps its place in the grid —
+   the file is real and still in the catalog — but says so plainly. */
+.cell.undecodable { border-color: var(--border); }
+.cell-note {
+  width: 100%;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  background: repeating-linear-gradient(
+    45deg, #17171c, #17171c 8px, #1c1c22 8px, #1c1c22 16px);
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
 
 .cell-bar {
   position: absolute;

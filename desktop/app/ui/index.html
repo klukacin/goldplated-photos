@@ -26,7 +26,6 @@
         <button id="import-btn" class="btn">Import…</button>
         <button id="sync-btn" class="btn">Sync…</button>
         <button id="publish-btn" class="btn btn-primary">Publish</button>
-        <button id="settings-btn" class="btn btn-icon" title="Settings">⚙</button>
       </div>
     </header>
 
@@ -249,6 +248,9 @@
       <h2>Add to album</h2>
       <p class="muted"><span id="add-count">0</span> photo(s) selected</p>
       <select id="add-album-select"></select>
+      <p class="muted" id="add-empty" hidden>No album to add to yet — the ones you
+         have are folders that hold sub-albums. Create an album inside one.</p>
+      <p class="error" id="add-error" hidden></p>
       <div class="modal-actions">
         <button class="btn" data-close>Cancel</button>
         <button id="add-confirm-btn" class="btn btn-primary">Add</button>

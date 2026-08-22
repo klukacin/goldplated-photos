@@ -116,6 +116,59 @@ fn title_from_path(path: &str) -> String {
     }
 }
 
+/// Order albums so that every parent comes immediately before its children.
+///
+/// The key for one album is the sibling key of each ancestor followed by its
+/// own. Because a parent's key is a prefix of its children's, and a shorter
+/// vector sorts before a longer one that starts the same way, the result is a
+/// depth-first walk of the tree with siblings in gallery order.
+fn sort_as_tree(albums: &mut [Album]) {
+    use std::collections::HashMap;
+
+    // Sibling key: ordered albums first, in their order; the rest by title.
+    let keys: HashMap<&str, (i64, String)> = albums
+        .iter()
+        .map(|a| {
+            (
+                a.path.as_str(),
+                (a.sort_order.unwrap_or(i64::MAX), a.title.to_lowercase()),
+            )
+        })
+        .collect();
+
+    let key_of = |path: &str| -> Vec<(i64, String, String)> {
+        let mut prefix = String::new();
+        let mut out = Vec::new();
+        for segment in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            // A gap in the chain — an album whose parent folder is not itself
+            // catalogued — still sorts sensibly under its own slug.
+            let (order, title) = keys
+                .get(prefix.as_str())
+                .cloned()
+                .unwrap_or((i64::MAX, segment.to_lowercase()));
+            out.push((order, title, segment.to_lowercase()));
+        }
+        out
+    };
+
+    let mut decorated: Vec<_> = albums
+        .iter()
+        .map(|a| (key_of(&a.path), a.path.clone()))
+        .collect();
+    decorated.sort();
+
+    let position: HashMap<&str, usize> = decorated
+        .iter()
+        .enumerate()
+        .map(|(i, (_, path))| (path.as_str(), i))
+        .collect();
+    albums.sort_by_key(|a| position[a.path.as_str()]);
+}
+
 /// Internal album id used by the site's access cookie. Grants nothing alone.
 fn generate_token() -> String {
     let bytes: [u8; 6] = rand::thread_rng().gen();
@@ -223,14 +276,18 @@ impl Library {
         }
     }
 
-    /// All albums, ordered the way the gallery orders them: explicit
-    /// `sort_order` first, then title.
+    /// All albums, in tree order.
+    ///
+    /// Siblings are ordered the way the gallery orders them — explicit
+    /// `sort_order` first, then title — but a plain `ORDER BY title` is not
+    /// enough on its own: it interleaves the levels, so an album can be listed
+    /// above the folder that contains it and the indentation a sidebar draws
+    /// stops meaning anything. Every album is therefore keyed by the sibling
+    /// key of each of its ancestors as well as its own, which puts a parent
+    /// immediately before its children and keeps whole branches together.
     pub fn albums(&self) -> Result<Vec<Album>> {
         let rows = self.with_conn(|c| {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {ALBUM_COLS} FROM albums \
-                 ORDER BY (sort_order IS NULL), sort_order, title"
-            ))?;
+            let mut stmt = c.prepare(&format!("SELECT {ALBUM_COLS} FROM albums"))?;
             let mapped = stmt.query_map([], album_from_row)?;
             let mut out = Vec::new();
             for r in mapped {
@@ -244,6 +301,7 @@ impl Library {
             self.hydrate(&mut album, cover_id)?;
             albums.push(album);
         }
+        sort_as_tree(&mut albums);
         Ok(albums)
     }
 
@@ -401,10 +459,19 @@ impl Library {
     // ---------------------------------------------------------- membership
 
     /// Add photos to an album, appending in the given order.
+    ///
+    /// A collection is refused: the gallery renders one as a grid of its
+    /// sub-albums and never draws loose photos, so accepting them here would
+    /// mean photos that are in the catalog, published, and invisible.
     pub fn add_photos_to_album(&self, album_path: &str, photo_ids: &[i64]) -> Result<usize> {
         let album = self
             .album_by_path(album_path)?
             .ok_or_else(|| Error::AlbumNotFound(album_path.to_string()))?;
+        if album.is_collection {
+            return Err(Error::Other(format!(
+                "{album_path} is a folder of albums — put the photos in an album inside it"
+            )));
+        }
 
         self.with_tx(|tx| {
             let next: i64 = tx.query_row(
@@ -530,6 +597,60 @@ mod tests {
             path: path.to_string(),
             ..Default::default()
         }
+    }
+
+    /// The sidebar draws this list as a tree, so a parent must never appear
+    /// below its own child. Ordering by title alone did exactly that.
+    #[test]
+    fn albums_come_back_in_tree_order() {
+        let lib = lib();
+        // Created out of order, and named so that a title sort would scatter
+        // them: "Ana" sorts before "Weddings", though it lives inside it.
+        // Creating a deep path also creates the folders above it.
+        for path in ["2026/weddings/ana-ivan", "2025/zeta"] {
+            lib.create_album(&new_album(path)).unwrap();
+        }
+
+        let paths: Vec<_> = lib.albums().unwrap().into_iter().map(|a| a.path).collect();
+        assert_eq!(
+            paths,
+            vec!["2025", "2025/zeta", "2026", "2026/weddings", "2026/weddings/ana-ivan"],
+            "every parent must come immediately before its children"
+        );
+    }
+
+    /// Explicit order still decides between siblings, and only between them.
+    #[test]
+    fn sort_order_ranks_siblings_without_breaking_the_tree() {
+        let lib = lib();
+        for path in ["b", "b/child", "a"] {
+            lib.create_album(&new_album(path)).unwrap();
+        }
+        // Push "b" ahead of "a" by hand.
+        lib.update_album(
+            "b",
+            &AlbumUpdate {
+                sort_order: Some(Some(1)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let paths: Vec<_> = lib.albums().unwrap().into_iter().map(|a| a.path).collect();
+        assert_eq!(paths, vec!["b", "b/child", "a"]);
+    }
+
+    /// Photos in a collection would be published and then never drawn, since
+    /// the gallery renders a collection as a grid of its sub-albums.
+    #[test]
+    fn photos_cannot_be_added_to_a_folder_of_albums() {
+        let lib = lib();
+        lib.create_album(&new_album("2026/weddings/ana-ivan")).unwrap();
+        let err = lib.add_photos_to_album("2026/weddings", &[1]).unwrap_err();
+        assert!(
+            err.to_string().contains("folder of albums"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]

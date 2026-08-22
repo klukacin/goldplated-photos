@@ -110,7 +110,15 @@ impl Photo {
 
 /// Query filter for the photo grid. All conditions are ANDed; `None` means
 /// "don't constrain on this".
+///
+/// The field names cross an IPC boundary from JavaScript, so they are named
+/// the way JavaScript names things. Without that, serde quietly dropped
+/// `minRating` and `albumPath` as unknown fields and both the star filter and
+/// the album sidebar looked like they worked while filtering nothing.
+/// `deny_unknown_fields` is what makes the next such typo an error rather than
+/// a feature that silently does nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PhotoFilter {
     /// Minimum star rating (inclusive).
     pub min_rating: Option<u8>,
@@ -203,4 +211,47 @@ pub struct ImportSummary {
     pub updated: usize,
     pub skipped: usize,
     pub failed: Vec<(String, String)>,
+    /// Files copied into the library because they came from outside it — a
+    /// camera card, a download folder. Zero when importing in place.
+    pub copied_in: usize,
+    /// Where those copies landed, relative to the library root.
+    pub copied_into: Option<String>,
+    /// Catalogued, but no decoder could read the pixels — a corrupt file, or a
+    /// RAW format this build does not develop. They are kept rather than
+    /// dropped, because a file on disk that the catalog forgets is worse than
+    /// one it cannot preview, but the caller should say so.
+    pub undecodable: Vec<String>,
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    /// The desktop UI builds this object in JavaScript. Every field it sends
+    /// has to land: an unrecognised key used to be dropped in silence, which
+    /// is how the star filter and the album sidebar came to filter nothing.
+    #[test]
+    fn photo_filter_accepts_what_the_ui_sends() {
+        let json = r#"{
+            "minRating": 3,
+            "flag": "pick",
+            "text": "nikon",
+            "albumPath": "2026/weddings/ana-ivan",
+            "sort": "album-order",
+            "limit": 2000
+        }"#;
+        let filter: PhotoFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(filter.min_rating, Some(3));
+        assert_eq!(filter.flag, Some(Flag::Pick));
+        assert_eq!(filter.album_path.as_deref(), Some("2026/weddings/ana-ivan"));
+        assert_eq!(filter.text.as_deref(), Some("nikon"));
+        assert_eq!(filter.limit, Some(2000));
+    }
+
+    /// And a name that is not a field is a loud error, not a no-op.
+    #[test]
+    fn photo_filter_rejects_an_unknown_field() {
+        let err = serde_json::from_str::<PhotoFilter>(r#"{"min_rating": 3}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
 }

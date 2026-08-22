@@ -109,6 +109,9 @@ pub struct PublishResult {
     /// the published tree is left alone — `prune_missing` is the deliberate way
     /// to drop photos that are really gone.
     pub missing: Vec<String>,
+    /// Catalogued photos no decoder could read, so they were not shipped: on
+    /// the site they would be broken images.
+    pub unrenderable: Vec<String>,
     /// Files removed from the published folder because this album no longer
     /// publishes them. Only ever files this library put there itself.
     pub removed: Vec<String>,
@@ -157,6 +160,17 @@ pub fn publish_album(
     // Photos
     if opts.copy_photos {
         for photo in &photos {
+            // A file nothing could decode at import time would reach the site
+            // as a broken image. It stays in the catalog — it is the
+            // photographer's file — but the published gallery is meant to work.
+            if photo.kind == crate::model::PhotoKind::Photo
+                && photo.width.is_none()
+                && photo.height.is_none()
+            {
+                result.unrenderable.push(photo.rel_path.clone());
+                continue;
+            }
+
             // What ships is the developed photo. With no adjustments this is the
             // original file itself — no copy, no render, nothing cached.
             let original = lib.resolve(&photo.rel_path)?;
@@ -518,6 +532,29 @@ mod tests {
         assert_eq!(r.photos_copied, 1);
         assert_eq!(r.missing, vec!["a/gone.jpg".to_string()]);
         assert!(dest.path().join("a/here.jpg").exists());
+    }
+
+    /// A file no decoder could read is kept in the catalog but must not be
+    /// shipped: on the site it is a broken image, and the photographer would
+    /// only find out from a visitor.
+    #[test]
+    fn a_photo_without_a_preview_is_not_published() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/good.jpg"), 40, 40);
+        std::fs::write(src.path().join("a/corrupt.jpg"), b"\xff\xd8\xff\xe0 not a jpeg").unwrap();
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let ids: Vec<i64> = lib.photos(&Default::default()).unwrap().iter().map(|p| p.id).collect();
+        lib.add_photos_to_album("a", &ids).unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 1);
+        assert_eq!(r.unrenderable, vec!["a/corrupt.jpg".to_string()]);
+        assert!(dest.path().join("a/good.jpg").exists());
+        assert!(!dest.path().join("a/corrupt.jpg").exists());
     }
 
     #[test]

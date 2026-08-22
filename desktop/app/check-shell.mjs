@@ -96,6 +96,7 @@ if (!existsSync(capDir) || readdirSync(capDir).filter((f) => f.endsWith('.json')
   const needs = [
     { used: /window\.__TAURI__\.event|listen\(/, perm: /^core:(default|event)/, what: 'event.listen' },
     { used: /openDialog\(|\.dialog\b/, perm: /^dialog:/, what: 'dialog.open' },
+    { used: /askConfirm\(/, perm: /^dialog:(default|allow-confirm|allow-ask)/, what: 'dialog.confirm' },
   ];
   for (const { used, perm, what } of needs) {
     if (used.test(appJs) && !perms.some((p) => perm.test(p))) {
@@ -103,6 +104,24 @@ if (!existsSync(capDir) || readdirSync(capDir).filter((f) => f.endsWith('.json')
     }
   }
   ok('capabilities grant what the UI uses', perms.join(', '));
+}
+
+// ----------------------------------------------------- confirmation dialogs
+
+// window.confirm() inside a Tauri webview is not a prompt on every platform:
+// WebKitGTK has no script-dialog handler, so it returns true and the guarded
+// action happens unasked. Deleting an album and deleting files off the server
+// both hang off one of these.
+const bareConfirm = /(^|[^.\w])confirm\s*\(/m.test(
+  appJs.replace(/askConfirm\s*\(/g, 'askConfirmCall('),
+);
+if (bareConfirm) {
+  fail(
+    'UI calls the webview\'s own confirm()',
+    'it returns true without asking on Linux — use the dialog plugin instead',
+  );
+} else {
+  ok('no reliance on the webview\'s confirm()');
 }
 
 // -------------------------------------------------------------------- CSP

@@ -6,7 +6,12 @@
  */
 
 const { invoke, convertFileSrc } = window.__TAURI__.core;
-const { open: openDialog } = window.__TAURI__.dialog;
+// The webview's own window.confirm() is not usable here: WebKitGTK has no
+// script-dialog handler inside a Tauri window, so it returns true without ever
+// asking. Everything guarded by it — deleting an album, deleting files off the
+// server — would then go ahead unasked. Tauri's dialog plugin is a real native
+// prompt on every platform.
+const { open: openDialog, confirm: askConfirm } = window.__TAURI__.dialog;
 const { listen } = window.__TAURI__.event;
 
 const LIBRARY_KEY = 'gpp.lastLibrary';
@@ -36,8 +41,19 @@ function showError(el, message) {
   node.hidden = !message;
 }
 
-function openModal(id) { $(id).hidden = false; }
+function openModal(id) {
+  $(id).hidden = false;
+  // Put the caret where the user is about to type. Without this the keystrokes
+  // go to the document, where digits are rating shortcuts — start typing an
+  // album path beginning "2026/" and four photos silently change rating.
+  $(id).querySelector('input:not([type=checkbox]), select, textarea')?.focus();
+}
 function closeModal(id) { $(id).hidden = true; }
+
+/// True while any dialog is up. Triage shortcuts must not fire behind one.
+function modalIsOpen() {
+  return document.querySelector('.modal:not([hidden])') !== null;
+}
 
 document.addEventListener('click', (e) => {
   if (e.target.matches('[data-close]')) {
@@ -109,9 +125,11 @@ function renderStatus(info) {
   const name = info.root.split('/').filter(Boolean).pop() || info.root;
   $('library-name').textContent = name;
   $('all-count').textContent = info.photo_count;
+  // Camera names come out of EXIF, which is to say out of the files — escape
+  // them. A photo whose Model field is "<b>bold</b>" must not restyle the app.
   $('library-stats').innerHTML =
     `${info.photo_count} photos · ${info.album_count} albums` +
-    (info.cameras.length ? `<br>${info.cameras.join(', ')}` : '');
+    (info.cameras.length ? `<br>${escapeHtml(info.cameras.join(', '))}` : '');
 }
 
 // ------------------------------------------------------------------ import
@@ -125,8 +143,12 @@ $('import-btn').addEventListener('click', async () => {
   try {
     const summary = await invoke('import_photos', { dir });
     status(
-      `Imported ${summary.imported} · updated ${summary.updated} · ` +
+      // A folder from outside the library is copied in; say where it landed,
+      // because that folder is now part of the library's own tree.
+      (summary.copied_into ? `Copied ${summary.copied_in} file(s) into ${summary.copied_into} · ` : '') +
+      `imported ${summary.imported} · updated ${summary.updated} · ` +
       `unchanged ${summary.skipped}` +
+      (summary.undecodable.length ? ` · ${summary.undecodable.length} without a preview` : '') +
       (summary.failed.length ? ` · ${summary.failed.length} failed` : '')
     );
     await refreshAll();
@@ -188,9 +210,21 @@ function renderGrid() {
     if (photo.blur_lqip) {
       img.style.background = `url(${photo.blur_lqip}) center/cover`;
     }
+    // A file no decoder can read — a corrupt JPEG, a RAW format this build
+    // does not develop — gets a named tile. A broken-image icon tells the
+    // photographer nothing about which file is the problem.
+    const undecodable = () => {
+      cell.classList.add('undecodable');
+      img.remove();
+      const note = document.createElement('div');
+      note.className = 'cell-note';
+      note.textContent = 'No preview';
+      cell.prepend(note);
+    };
+    img.addEventListener('error', undecodable, { once: true });
     invoke('thumbnail_path', { id: photo.id, size: 'small' })
       .then((p) => { img.src = convertFileSrc(p); })
-      .catch(() => {});
+      .catch(undecodable);
     cell.appendChild(img);
 
     const name = document.createElement('div');
@@ -283,6 +317,7 @@ async function applyFlag(flag) {
 document.addEventListener('keydown', (e) => {
   if (e.target.matches('input, select, textarea')) return;
   if ($('app').hidden) return;
+  if (modalIsOpen()) return;
 
   if (e.key >= '0' && e.key <= '5') {
     e.preventDefault();
@@ -592,9 +627,12 @@ async function refreshAlbums() {
     const item = document.createElement('button');
     item.className = 'album-item' + (state.currentAlbum === entry.path ? ' active' : '');
 
+    // Indent by real depth. A single "is nested" class drew a three-level
+    // tree as two, so an album and its own parent sat at the same margin.
     const depth = entry.path.split('/').length - 1;
     const name = document.createElement('span');
-    name.className = 'name' + (depth ? ' depth-1' : '');
+    name.className = 'name';
+    name.style.paddingLeft = `${depth * 0.85}rem`;
     name.textContent = entry.title;
     item.appendChild(name);
 
@@ -733,7 +771,12 @@ $('album-save-btn').addEventListener('click', async () => {
 $('album-delete-btn').addEventListener('click', async () => {
   if (!state.editingAlbum) return;
   const path = state.editingAlbum.path;
-  if (!confirm(`Delete album "${path}"?\n\nPhotos stay in your library.`)) return;
+  const sure = await askConfirm(`Photos stay in your library.`, {
+    title: `Delete album "${path}"?`,
+    kind: 'warning',
+    okLabel: 'Delete',
+  });
+  if (!sure) return;
   try {
     await invoke('delete_album', { path });
     closeModal('settings-album-modal');
@@ -749,23 +792,32 @@ $('album-delete-btn').addEventListener('click', async () => {
 $('add-to-album-btn').addEventListener('click', () => {
   const select = $('add-album-select');
   select.innerHTML = '';
-  state.albums.forEach((a) => {
+  // Collections hold sub-albums, not photos — the gallery would never draw a
+  // photo put in one, so it is not offered as a destination.
+  const targets = state.albums.filter((a) => !a.is_collection);
+  targets.forEach((a) => {
     const opt = document.createElement('option');
     opt.value = a.path;
     opt.textContent = a.path;
     select.appendChild(opt);
   });
   $('add-count').textContent = state.selected.size;
+  $('add-empty').hidden = targets.length > 0;
+  $('add-confirm-btn').disabled = targets.length === 0;
   openModal('add-modal');
 });
 
 $('add-confirm-btn').addEventListener('click', async () => {
   const path = $('add-album-select').value;
   if (!path) return;
-  const n = await invoke('add_to_album', { path, ids: [...state.selected] });
-  closeModal('add-modal');
-  await refreshAlbums();
-  status(`Added ${n} photo(s) to ${path}`);
+  try {
+    const n = await invoke('add_to_album', { path, ids: [...state.selected] });
+    closeModal('add-modal');
+    await refreshAlbums();
+    status(`Added ${n} photo(s) to ${path}`);
+  } catch (err) {
+    showError('add-error', String(err));
+  }
 });
 
 // ----------------------------------------------------------------- filters
@@ -810,8 +862,6 @@ $('publish-btn').addEventListener('click', async () => {
   openModal('publish-modal');
 });
 
-$('settings-btn').addEventListener('click', () => $('publish-btn').click());
-
 async function loadPublishTarget() {
   try {
     const target = await invoke('get_publish_target');
@@ -847,7 +897,15 @@ $('publish-run-btn').addEventListener('click', async () => {
     const total = results.reduce((n, r) => n + r.photos_copied, 0);
     $('publish-output').hidden = false;
     $('publish-output').textContent = results
-      .map((r) => `${r.album_path}: ${r.photos_copied} copied, ${r.photos_skipped} unchanged`)
+      .map((r) => {
+        // Anything not shipped is named here. Silence would read as success.
+        const notes = [];
+        if (r.missing.length) notes.push(`${r.missing.length} missing from disk`);
+        if (r.unrenderable.length) notes.push(`${r.unrenderable.length} without a preview, not published`);
+        if (r.removed.length) notes.push(`${r.removed.length} removed`);
+        return `${r.album_path}: ${r.photos_copied} copied, ${r.photos_skipped} unchanged` +
+          (notes.length ? ` · ${notes.join(' · ')}` : '');
+      })
       .join('\n');
     status(`Published ${results.length} album(s), ${total} file(s) copied`);
   } catch (err) {
@@ -1077,11 +1135,15 @@ async function pushWithDeleteCheck(command, path, extra = {}) {
   const gone = first.withheld_deletes || [];
   if (!gone.length) return first;
 
-  const ok = confirm(
-    `${gone.length} file(s) are on the server but no longer in this album:\n\n` +
+  const ok = await askConfirm(
     `${gone.slice(0, 12).join('\n')}` +
     `${gone.length > 12 ? `\n…and ${gone.length - 12} more` : ''}\n\n` +
-    'Remove them from the server? Cancel leaves them online.'
+    'Remove them from the server? Cancel leaves them online.',
+    {
+      title: `${gone.length} file(s) are on the server but no longer in this album`,
+      kind: 'warning',
+      okLabel: 'Remove from server',
+    }
   );
   if (!ok) return first;
 
