@@ -227,8 +227,14 @@ fn prune_published(
 
     for stale in lib.published_files(album_path)?.difference(&current) {
         // A photo whose original vanished keeps its published copy: that is a
-        // broken drive, not a decision to unpublish.
-        if result.missing.iter().any(|m| m.ends_with(stale)) {
+        // broken drive, not a decision to unpublish. Matched on the filename
+        // itself — as a suffix, `my-gone.jpg` going missing also spared an
+        // unrelated `gone.jpg` that the album really had dropped.
+        if result
+            .missing
+            .iter()
+            .any(|m| m.rsplit('/').next() == Some(stale.as_str()))
+        {
             continue;
         }
         let path = album_dir.join(stale);
@@ -511,6 +517,36 @@ mod tests {
         assert!(dest.path().join("a/sub/index.md").exists(), "sub-albums untouched");
     }
 
+    /// The guard that spares a photo whose original vanished matched the stale
+    /// name as a *suffix*, so any missing photo whose name ended the same way
+    /// kept an unpublished file alive on the site.
+    #[test]
+    fn a_missing_photo_only_spares_itself_from_the_prune() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/gone.jpg"), 40, 40);
+        write_jpeg(&src.path().join("a/my-gone.jpg"), 40, 40);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let gone = lib.photo_by_rel_path("a/gone.jpg").unwrap().unwrap();
+        let mine = lib.photo_by_rel_path("a/my-gone.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[gone.id, mine.id]).unwrap();
+        publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+
+        // One photo is unpublished on purpose; an unrelated one loses its
+        // original to an unplugged drive.
+        lib.remove_photos_from_album("a", &[gone.id]).unwrap();
+        std::fs::remove_file(src.path().join("a/my-gone.jpg")).unwrap();
+
+        let second = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(second.missing, vec!["a/my-gone.jpg".to_string()]);
+        assert_eq!(second.removed, vec!["a/gone.jpg".to_string()]);
+        assert!(!dest.path().join("a/gone.jpg").exists(), "unpublished, so gone from the site");
+        assert!(dest.path().join("a/my-gone.jpg").exists(), "a broken drive is not a decision");
+    }
+
     /// One original gone from disk (deleted by hand, drive unplugged) must not
     /// take the whole album down with it.
     #[test]
@@ -788,13 +824,31 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
 /// Strip surrounding double quotes and undo the escaping `yaml_scalar` applies.
 fn unquote(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        return trimmed[1..trimmed.len() - 1]
-            .replace("\\n", "\n")
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\");
+    let Some(inner) = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return trimmed.to_string();
+    };
+
+    // One pass, not three `replace` calls. Escaping runs backslash-first, so
+    // undoing it a pass at a time reads the second backslash of `\\n` as the
+    // start of a newline escape: a description holding `C:\new` came back
+    // with a real line break in it, and a pull wrote that into the catalog.
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some(escaped) => out.push(escaped),
+            None => out.push('\\'),
+        }
     }
-    trimmed.to_string()
+    out
 }
 
 #[cfg(test)]
@@ -867,6 +921,22 @@ mod parse_tests {
 
         assert_eq!(parse_frontmatter(""), ParsedFrontmatter::default());
         assert_eq!(parse_frontmatter("no fences here"), ParsedFrontmatter::default());
+    }
+
+    /// Escaping runs backslash-first, so undoing it one `replace` at a time
+    /// reads the backslash of an escaped backslash as the start of the *next*
+    /// escape: a Windows path in a description came back with a real newline
+    /// in it, and a pull wrote that into the catalog.
+    #[test]
+    fn a_backslash_in_a_field_survives_the_round_trip() {
+        for value in [r"C:\new\photos", r"a\nb", r"a\b", "say \"hi\"", "plain"] {
+            let rendered = format!("---\n{}---\n", yaml_kv("title", value));
+            assert_eq!(
+                parse_frontmatter(&rendered).title.as_deref(),
+                Some(value),
+                "round trip of {value:?}"
+            );
+        }
     }
 
     #[test]

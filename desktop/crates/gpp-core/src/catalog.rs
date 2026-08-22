@@ -158,6 +158,7 @@ impl Library {
         let mut wheres: Vec<String> = Vec::new();
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+        let joined_an_album = filter.album_path.is_some();
         if let Some(album) = &filter.album_path {
             sql.push_str(
                 " JOIN album_photos ap ON ap.photo_id = p.id \
@@ -217,7 +218,13 @@ impl Library {
             PhotoSort::NameAsc => " ORDER BY p.filename ASC",
             PhotoSort::NameDesc => " ORDER BY p.filename DESC",
             PhotoSort::RatingDesc => " ORDER BY p.rating DESC, p.filename ASC",
-            PhotoSort::AlbumOrder => " ORDER BY ap.position ASC, p.filename ASC",
+            PhotoSort::AlbumOrder if joined_an_album => {
+                " ORDER BY ap.position ASC, p.filename ASC"
+            }
+            // `ap.position` is only in the query when an album was joined in.
+            // With no album to hold a position, name order is the answer;
+            // naming a column that is not there was not.
+            PhotoSort::AlbumOrder => " ORDER BY p.filename ASC",
         });
 
         if let Some(limit) = filter.limit {
@@ -684,6 +691,20 @@ mod tests {
         assert!(lib.resolve("a/../../etc").is_err());
         assert!(lib.resolve("/etc/passwd").is_err());
         assert!(lib.resolve("a\0b").is_err());
+    }
+
+    /// `ap.position` only exists in the query when an album was joined in.
+    /// Asking for album order without an album handed SQLite a column that was
+    /// not there — and the first caller to write the filter JSON by hand, a
+    /// CLI or a client over the C door, reaches that before the UI ever does.
+    #[test]
+    fn album_order_without_an_album_still_answers() {
+        let lib = Library::open_in_memory("/tmp/lib").unwrap();
+        let listed = lib.photos(&PhotoFilter {
+            sort: PhotoSort::AlbumOrder,
+            ..Default::default()
+        });
+        assert!(listed.is_ok(), "{:?}", listed.err());
     }
 
     #[test]

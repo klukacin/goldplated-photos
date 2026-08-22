@@ -362,9 +362,13 @@ impl Session {
             if let Some(dest) = &target.dest {
                 lib.set_setting(SETTING_PUBLISH_DEST, dest)?;
             }
-            if let Some(min) = target.min_rating {
-                lib.set_setting(SETTING_PUBLISH_MIN_RATING, &min.to_string())?;
-            }
+            // Written whichever way it came, unlike the destination: "no
+            // minimum" is one of the choices the panel offers, and reading a
+            // cleared field as "leave it alone" kept publishing only the
+            // four-star frames after the photographer had turned the filter
+            // off. An empty value reads back as no minimum.
+            let min = target.min_rating.map(|m| m.to_string()).unwrap_or_default();
+            lib.set_setting(SETTING_PUBLISH_MIN_RATING, &min)?;
             Ok(())
         })
     }
@@ -677,6 +681,31 @@ mod tests {
         let t = s2.publish_target().unwrap();
         assert_eq!(t.dest.as_deref(), Some("/tmp/gallery"));
         assert_eq!(t.min_rating, Some(3));
+    }
+
+    /// "No minimum" is one of the choices the publish panel offers, so it has
+    /// to take. Read as "leave it alone", a cleared field kept the old filter
+    /// in place and the frames the photographer had just asked for silently
+    /// did not publish.
+    #[test]
+    fn clearing_the_minimum_rating_really_clears_it() {
+        let src = tempfile::tempdir().unwrap();
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+
+        s.set_publish_target(PublishTarget {
+            dest: Some("/tmp/gallery".into()),
+            min_rating: Some(4),
+        })
+        .unwrap();
+        assert_eq!(s.publish_target().unwrap().min_rating, Some(4));
+
+        s.set_publish_target(PublishTarget {
+            dest: Some("/tmp/gallery".into()),
+            min_rating: None,
+        })
+        .unwrap();
+        assert_eq!(s.publish_target().unwrap().min_rating, None);
     }
 
     #[test]

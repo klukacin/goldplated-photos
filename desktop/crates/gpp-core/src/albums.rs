@@ -423,10 +423,18 @@ impl Library {
             )?;
 
             // Re-path descendants: '<from>/x/y' → '<to>/x/y'
-            let mut stmt = tx.prepare("SELECT id, path FROM albums WHERE path LIKE ?1")?;
-            let rows = stmt.query_map(params![format!("{descendant_prefix}%")], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?;
+            //
+            // Compared as a literal prefix, not with LIKE: `_` and `%` are legal
+            // in a folder name and are SQL wildcards, so `LIKE 'a_b/%'` also
+            // matched `axb/…` and moved an album that had nothing to do with
+            // this one. `substr` counts characters, so a match here means the
+            // byte prefix is identical too, which is what the slice below needs.
+            let mut stmt =
+                tx.prepare("SELECT id, path FROM albums WHERE substr(path, 1, ?2) = ?1")?;
+            let rows = stmt.query_map(
+                params![descendant_prefix, descendant_prefix.chars().count() as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )?;
             let mut moves = Vec::new();
             for row in rows {
                 let (id, old) = row?;
@@ -780,6 +788,26 @@ mod tests {
         assert!(l.album_by_path("2027/ana-ivan").unwrap().is_some());
         let moved_child = l.album_by_path("2027/ana-ivan/day2").unwrap().unwrap();
         assert_eq!(moved_child.parent_path.as_deref(), Some("2027/ana-ivan"));
+    }
+
+    /// `_` is a legal separator in an album folder, and it is also SQL's
+    /// single-character wildcard. Matching descendants with `LIKE` therefore
+    /// let a move reach into an album it has nothing to do with.
+    #[test]
+    fn moving_an_album_with_an_underscore_leaves_its_neighbours_where_they_are() {
+        let l = lib();
+        l.create_album(&new_album("a_b")).unwrap();
+        l.create_album(&new_album("a_b/mine")).unwrap();
+        l.create_album(&new_album("axb")).unwrap();
+        l.create_album(&new_album("axb/theirs")).unwrap();
+
+        l.move_album("a_b", "moved").unwrap();
+
+        assert!(l.album_by_path("moved/mine").unwrap().is_some(), "its own child came along");
+        assert!(
+            l.album_by_path("axb/theirs").unwrap().is_some(),
+            "an unrelated album must not be dragged along by a wildcard match"
+        );
     }
 
     #[test]

@@ -286,6 +286,20 @@ fn pull_one(
                 outcome.files_pulled += 1;
             }
             Action::Conflict => outcome.conflicts.push(change.path.clone()),
+            // Nothing to fetch, but the baseline may still be out of date.
+            // Settled by the same rule `sync::apply` uses on the push side —
+            // a pull-only machine has no other pass to put its books right.
+            Action::ForgetState => {
+                let published = published_root.join(&change.path);
+                match std::fs::read(&published) {
+                    Ok(bytes) => {
+                        let hash = blake3::hash(&bytes).to_hex().to_string();
+                        lib.record_synced(&change.path, &hash)?;
+                    }
+                    Err(_) => lib.forget_synced(&change.path)?,
+                }
+                outcome.skipped_unchanged += 1;
+            }
             _ => outcome.skipped_unchanged += 1,
         }
     }

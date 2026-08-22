@@ -102,6 +102,9 @@ pub fn import_dir(
         Some(c) => (c.dest.as_path(), Some(c)),
         None => (dir, None),
     };
+    // Named only when something actually arrived: an outside folder with
+    // nothing importable reserves a destination that is never created.
+    let copied_into = copied.filter(|c| c.files > 0).map(|c| c.rel.clone());
 
     // A copy stopped part-way ends the run here rather than cataloguing what
     // arrived: that pass is the expensive half, and the user just asked for it
@@ -110,7 +113,7 @@ pub fn import_dir(
     if copied.map(|c| c.cancelled).unwrap_or(false) {
         return Ok(ImportSummary {
             copied_in: copied.map(|c| c.files).unwrap_or(0),
-            copied_into: copied.map(|c| c.rel.clone()),
+            copied_into: copied_into.clone(),
             cancelled: true,
             ..Default::default()
         });
@@ -120,7 +123,7 @@ pub fn import_dir(
     if candidates.is_empty() {
         return Ok(ImportSummary {
             copied_in: copied.map(|c| c.files).unwrap_or(0),
-            copied_into: copied.map(|c| c.rel.clone()),
+            copied_into: copied_into.clone(),
             cancelled: stop(),
             ..Default::default()
         });
@@ -170,7 +173,7 @@ pub fn import_dir(
 
     let mut summary = ImportSummary {
         copied_in: copied.map(|c| c.files).unwrap_or(0),
-        copied_into: copied.map(|c| c.rel.clone()),
+        copied_into: copied_into.clone(),
         ..Default::default()
     };
     let mut to_insert = Vec::new();
@@ -344,8 +347,17 @@ fn bring_inside(
         .filter(|e| e.file_type().is_file() && media::classify(e.path()).is_some())
         .map(|e| e.path().to_path_buf())
         .collect();
+    // Nothing this app can read. `None` means "already inside the library", and
+    // saying that here sent the caller on to scan the *outside* folder, which
+    // the catalog cannot address: picking a folder of documents answered
+    // "invalid path" rather than "nothing to import".
     if files.is_empty() {
-        return Ok(None);
+        return Ok(Some(BroughtIn {
+            dest,
+            rel,
+            files: 0,
+            cancelled: false,
+        }));
     }
 
     let total = files.len();
@@ -627,6 +639,26 @@ mod tests {
         let mut paths: Vec<_> = photos.iter().map(|p| p.rel_path.clone()).collect();
         paths.sort();
         assert_eq!(paths, vec!["DCIM/a.jpg", "DCIM/sub/b.jpg"]);
+    }
+
+    /// Pointing Import at an outside folder holding nothing it can read must
+    /// say "nothing to import", not "invalid path". The catalog genuinely
+    /// cannot address a folder outside the library — but the person who picked
+    /// it never asked it to, and the copy-in step is what spares them that.
+    #[test]
+    fn an_outside_folder_with_nothing_importable_is_not_an_error() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("notes.txt"), "hello").unwrap();
+
+        let lib = Library::open(lib_dir.path()).unwrap();
+        let summary =
+            import_dir(&lib, elsewhere.path(), &ImportOptions::default(), None, None).unwrap();
+
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.copied_in, 0);
+        assert_eq!(summary.copied_into, None, "nothing was copied anywhere");
+        assert!(!summary.cancelled);
     }
 
     /// A second card of the same name is a second shoot, not an overwrite.
