@@ -170,7 +170,15 @@ const albums = {
         csvBtn.className = 'btn btn-sm';
         csvBtn.textContent = 'CSV';
         csvBtn.addEventListener('click', () => {
-          const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+          // Quoting is not enough on its own: a comment a client typed that
+          // starts with = + - or @ is a formula, and Excel runs it when the
+          // photographer opens the export. A leading apostrophe is the standard
+          // way to say "this is text" and spreadsheets do not display it.
+          const esc = (v) => {
+            const s = String(v ?? '');
+            const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+            return `"${safe.replace(/"/g, '""')}"`;
+          };
           const rows = [
             ['filename', 'comment', 'client', 'submittedAt'].join(','),
             ...sub.selections.map(s => [esc(s.filename), esc(s.comment), esc(sub.name), esc(sub.submittedAt)].join(','))

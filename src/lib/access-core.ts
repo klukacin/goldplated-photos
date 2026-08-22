@@ -285,6 +285,37 @@ export function resolveChainVisibility(
 }
 
 // ---------------------------------------------------------------------------
+// Redirect targets
+// ---------------------------------------------------------------------------
+
+/**
+ * Reduce a caller-supplied redirect target to somewhere on this site, falling
+ * back to `fallback` when it is anything else.
+ *
+ * The unlock form carries where to go back to, and a form can be posted from
+ * any page on the internet — so left alone this hands an attacker a redirect
+ * that departs from the photographer's own domain. That is what makes the
+ * phishing link convincing: the visitor sees the gallery they know in the
+ * address bar before they are sent somewhere else.
+ *
+ * A path is kept only if it starts with a single `/`. `//evil.example` is
+ * protocol-relative and leaves the site despite looking local, and a backslash
+ * takes its place in enough browsers to be worth refusing too.
+ */
+export function safeReturnUrl(raw: unknown, fallback: string): string {
+  if (typeof raw !== 'string' || raw === '') return fallback;
+  if (!raw.startsWith('/')) return fallback;
+  if (raw.startsWith('//') || raw.startsWith('/\\')) return fallback;
+  // A control character can truncate or split the header a redirect is
+  // written into.
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return fallback;
+  }
+  return raw;
+}
+
+// ---------------------------------------------------------------------------
 // Client IP (rate limiting behind a reverse proxy)
 // ---------------------------------------------------------------------------
 

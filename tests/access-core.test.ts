@@ -8,6 +8,7 @@ import {
   resolveChainAccess,
   resolveChainVisibility,
   safeCompare,
+  safeReturnUrl,
   serializeAccessCookie,
   type AlbumLike,
   type ListingAlbum
@@ -254,5 +255,41 @@ describe('getClientIp', () => {
   it('falls back to "unknown" when nothing is available', () => {
     expect(getClientIp(undefined, null)).toBe('unknown');
     expect(getClientIp('', '')).toBe('unknown');
+  });
+});
+
+describe('safeReturnUrl', () => {
+  // The unlock form carries where to go back to, and a form can be posted from
+  // any page on the internet. Left alone, that is a redirect off the
+  // photographer's own domain — which is exactly what makes a phishing link
+  // convincing: the visitor sees the gallery they know before they are sent
+  // somewhere else.
+  const FALLBACK = '/photos/2026/weddings';
+
+  it('keeps an ordinary path on this site', () => {
+    expect(safeReturnUrl('/photos/2026/weddings/ana', FALLBACK))
+      .toBe('/photos/2026/weddings/ana');
+  });
+
+  it('refuses an absolute URL somewhere else', () => {
+    expect(safeReturnUrl('https://evil.example/login', FALLBACK)).toBe(FALLBACK);
+  });
+
+  it('refuses a protocol-relative URL that only looks local', () => {
+    // `//evil.example` starts with a slash and leaves the site anyway.
+    expect(safeReturnUrl('//evil.example/login', FALLBACK)).toBe(FALLBACK);
+  });
+
+  it('refuses a backslash-escaped host', () => {
+    expect(safeReturnUrl('/\\evil.example', FALLBACK)).toBe(FALLBACK);
+  });
+
+  it('refuses a control character that could split the header', () => {
+    expect(safeReturnUrl('/photos\r\nSet-Cookie: a=b', FALLBACK)).toBe(FALLBACK);
+  });
+
+  it('falls back when nothing was supplied', () => {
+    expect(safeReturnUrl(undefined, FALLBACK)).toBe(FALLBACK);
+    expect(safeReturnUrl('', FALLBACK)).toBe(FALLBACK);
   });
 });

@@ -5,6 +5,7 @@ import {
   getClientIp,
   parseAccessCookie,
   safeCompare,
+  safeReturnUrl,
   setAccessCookie
 } from '../../lib/access';
 import { isRateLimited, recordFailedAttempt, clearRateLimit, getRemainingAttempts } from '../../lib/rate-limit';
@@ -16,7 +17,10 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
     const formData = await request.formData();
     const albumPath = formData.get('albumPath') as string;
     const password = formData.get('password') as string;
-    const returnUrl = formData.get('returnUrl') as string || `/photos/${albumPath}`;
+    // Where to go back to comes from the form, and a form can be posted from
+    // any page on the internet — so this is reduced to somewhere on this site
+    // before it reaches a Location header.
+    const returnUrl = safeReturnUrl(formData.get('returnUrl'), `/photos/${albumPath}`);
 
     if (!albumPath || !password) {
       return redirect(`${returnUrl}?error=missing-fields`);
