@@ -446,7 +446,7 @@ mod tests {
         write_jpeg(&src.path().join("b.jpg"), 80, 60);
 
         let lib = Library::open(src.path()).unwrap();
-        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
         lib.create_album(&NewAlbum {
             path: "2026/ana".into(),
             title: Some("Ana & Ivan".into()),
@@ -485,7 +485,7 @@ mod tests {
         write_jpeg(&src.path().join("a/drop.jpg"), 40, 40);
 
         let lib = Library::open(src.path()).unwrap();
-        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
         lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
         let keep = lib.photo_by_rel_path("a/keep.jpg").unwrap().unwrap();
         let drop = lib.photo_by_rel_path("a/drop.jpg").unwrap().unwrap();
@@ -521,7 +521,7 @@ mod tests {
         write_jpeg(&src.path().join("a/gone.jpg"), 40, 40);
 
         let lib = Library::open(src.path()).unwrap();
-        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
         lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
         let ids: Vec<i64> = lib.photos(&Default::default()).unwrap().iter().map(|p| p.id).collect();
         lib.add_photos_to_album("a", &ids).unwrap();
@@ -545,7 +545,7 @@ mod tests {
         std::fs::write(src.path().join("a/corrupt.jpg"), b"\xff\xd8\xff\xe0 not a jpeg").unwrap();
 
         let lib = Library::open(src.path()).unwrap();
-        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
         lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
         let ids: Vec<i64> = lib.photos(&Default::default()).unwrap().iter().map(|p| p.id).collect();
         lib.add_photos_to_album("a", &ids).unwrap();
@@ -566,7 +566,7 @@ mod tests {
         write_jpeg(&src.path().join("rejected.jpg"), 40, 40);
 
         let lib = Library::open(src.path()).unwrap();
-        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
         lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
 
         let keep = lib.photo_by_rel_path("keep.jpg").unwrap().unwrap();
@@ -629,7 +629,7 @@ mod tests {
         write_jpeg(&src.path().join("2.jpg"), 40, 40);
 
         let lib = Library::open(src.path()).unwrap();
-        import_dir(&lib, src.path(), &ImportOptions::default(), None).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
         lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
 
         let one = lib.photo_by_rel_path("1.jpg").unwrap().unwrap();

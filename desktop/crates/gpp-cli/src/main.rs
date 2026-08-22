@@ -151,6 +151,10 @@ fn cmd_import(args: &[String]) -> Result<()> {
                 eprintln!("  [{}/{}] {}", p.processed, p.total, p.current);
             }
         }),
+        // No stop signal: Ctrl-C already ends a one-shot command, and the
+        // graceful variant would cost a signal-handling dependency to save a
+        // partial import nobody asked this tool for.
+        None,
     )?;
 
     println!(

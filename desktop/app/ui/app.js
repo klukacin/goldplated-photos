@@ -134,18 +134,32 @@ function renderStatus(info) {
 
 // ------------------------------------------------------------------ import
 
+/// How far the running import got. Kept because the summary counts what was
+/// imported, not what was on the card — and a stopped import has to be able to
+/// say "612 of 2000" rather than implying 612 was the whole job.
+let importReach = { processed: 0, total: 0 };
+
 $('import-btn').addEventListener('click', async () => {
   const dir = await openDialog({ directory: true, title: 'Import from folder' });
   if (!dir) return;
 
+  importReach = { processed: 0, total: 0 };
   $('progress').hidden = false;
+  $('import-cancel').hidden = false;
+  $('import-cancel').disabled = false;
   status('Importing…');
   try {
     const summary = await invoke('import_photos', { dir });
+    const done = summary.imported + summary.updated + summary.skipped;
     status(
       // A folder from outside the library is copied in; say where it landed,
       // because that folder is now part of the library's own tree.
       (summary.copied_into ? `Copied ${summary.copied_in} file(s) into ${summary.copied_into} · ` : '') +
+      // Never let a stopped import read as a finished one: lead with the fact
+      // that it stopped, and with how much of the folder it never reached.
+      (summary.cancelled
+        ? `Stopped: imported ${done} of ${importReach.total || done} · `
+        : '') +
       `imported ${summary.imported} · updated ${summary.updated} · ` +
       `unchanged ${summary.skipped}` +
       (summary.undecodable.length ? ` · ${summary.undecodable.length} without a preview` : '') +
@@ -156,14 +170,28 @@ $('import-btn').addEventListener('click', async () => {
     status(`Import failed: ${err}`);
   } finally {
     $('progress').hidden = true;
+    $('import-cancel').hidden = true;
     $('progress-fill').style.width = '0';
   }
 });
 
+$('import-cancel').addEventListener('click', async () => {
+  // The button only raises a flag in the core; the import ends at its next
+  // file. Disable it so a second click cannot read as "it did not work", and
+  // leave it visible until the import actually returns.
+  $('import-cancel').disabled = true;
+  status('Stopping after the current file…');
+  await invoke('cancel_import');
+});
+
 listen('import-progress', ({ payload }) => {
+  importReach = payload;
   const pct = payload.total ? (payload.processed / payload.total) * 100 : 0;
   $('progress-fill').style.width = `${pct}%`;
-  status(`Importing ${payload.processed}/${payload.total} — ${payload.current}`);
+  // A cancel already announced is not overwritten by the files still finishing.
+  if (!$('import-cancel').disabled) {
+    status(`Importing ${payload.processed}/${payload.total} — ${payload.current}`);
+  }
 });
 
 // ------------------------------------------------------------------ photos

@@ -6,6 +6,7 @@
 //! test on any platform.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,12 @@ use crate::publish::{publish_album, PublishOptions, PublishResult};
 #[derive(Default)]
 pub struct Session {
     library: RwLock<Option<Library>>,
+    /// Raised by [`Session::cancel_import`], polled by the running import.
+    ///
+    /// An atomic and not a channel: the import reads it from every rayon
+    /// worker, and it sits outside the library lock so the UI thread can raise
+    /// it while the import it is trying to stop holds that lock.
+    import_cancel: AtomicBool,
 }
 
 /// What the UI shows in the sidebar for one album.
@@ -95,18 +102,39 @@ impl Session {
 
     // ------------------------------------------------------------- import
 
+    /// Import a folder, or the whole library when `dir` is `None`.
+    ///
+    /// Stoppable: [`Session::cancel_import`] ends the run at the next file and
+    /// sets `cancelled` on the summary.
     pub fn import(
         &self,
         dir: Option<String>,
         on_progress: Option<&(dyn Fn(crate::model::ImportProgress) + Sync)>,
     ) -> Result<ImportSummary> {
+        // Clear a cancel left over from the last run — including one raised
+        // after that run had already finished, which would otherwise stop this
+        // import before it read a single file.
+        self.import_cancel.store(false, Ordering::SeqCst);
+
         self.with(|lib| {
             let target = match &dir {
                 Some(d) => PathBuf::from(d),
                 None => lib.root().to_path_buf(),
             };
-            import_dir(lib, &target, &ImportOptions::default(), on_progress)
+            import_dir(
+                lib,
+                &target,
+                &ImportOptions::default(),
+                on_progress,
+                Some(&|| self.import_cancel.load(Ordering::SeqCst)),
+            )
         })
+    }
+
+    /// Ask the running import to stop. Harmless when none is running: the next
+    /// [`Session::import`] clears the flag before it starts.
+    pub fn cancel_import(&self) {
+        self.import_cancel.store(true, Ordering::SeqCst);
     }
 
     /// Drop catalog rows whose files are gone.
@@ -590,6 +618,23 @@ mod tests {
 
         let index = std::fs::read_to_string(dest.path().join("2026/test/index.md")).unwrap();
         assert!(index.contains(&format!("shareToken: \"{token}\"")));
+    }
+
+    /// The GUI's cancel is a latch, and a latch left closed would make every
+    /// import after the first one stop before it read a file.
+    #[test]
+    fn a_cancel_does_not_carry_over_into_the_next_import() {
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a.jpg"), 100, 80);
+        write_jpeg(&src.path().join("b.jpg"), 100, 80);
+
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.cancel_import();
+
+        let summary = s.import(None, None).unwrap();
+        assert!(!summary.cancelled);
+        assert_eq!(summary.imported, 2);
     }
 
     #[test]
