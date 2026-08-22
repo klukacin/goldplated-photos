@@ -53,6 +53,12 @@ pub struct PullOutcome {
     pub photos_imported: usize,
     pub skipped_unchanged: usize,
     pub conflicts: Vec<String>,
+    /// Photos the server had a different version of, where this library already
+    /// holds an original. The published copy was updated; the original was left
+    /// exactly as it was. Named so the photographer can look, not resolved by
+    /// guessing — the file under the library root is the negative, and there is
+    /// no second copy of it anywhere.
+    pub kept_originals: Vec<String>,
     /// Every album this operation touched, shallowest first: the folders above
     /// the path, the path itself, and everything under it.
     pub albums: Vec<String>,
@@ -273,7 +279,23 @@ fn pull_one(
 
                 if !is_metadata {
                     let dest = album_dir.join(filename);
-                    std::fs::write(&dest, &bytes).map_err(|e| Error::io(&dest, e))?;
+                    // Only ever *add* a photo to the library. Bringing an album
+                    // this machine has never seen is the point of a pull, and
+                    // for that the file is simply not there yet.
+                    //
+                    // When it is there, it is the photographer's original, and
+                    // the plan that said "pull" never looked at it: the local
+                    // side of that comparison is the published tree, which
+                    // holds developed pixels. So a second machine developing
+                    // one frame and republishing it was enough to write its
+                    // JPEG over the negative here — with the whole develop
+                    // model resting on that negative being the thing Reset
+                    // returns to, and no other copy of it in existence.
+                    if dest.exists() {
+                        outcome.kept_originals.push(change.path.clone());
+                    } else {
+                        std::fs::write(&dest, &bytes).map_err(|e| Error::io(&dest, e))?;
+                    }
                 }
 
                 let published = published_root.join(&change.path);

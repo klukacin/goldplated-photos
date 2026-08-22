@@ -472,3 +472,41 @@ fn renaming_an_album_carries_its_subscription() {
         "the old path is still subscribed"
     );
 }
+
+/// A pull must never overwrite the library's own original.
+///
+/// The whole develop model rests on the original being untouchable: an
+/// adjustment is a row in `edits`, the developed pixels live in the cache, and
+/// Reset gets the photograph back. A pull that writes the server's bytes over
+/// the file in the library breaks that for good — there is no copy left to
+/// reset to, and the frame the photographer actually shot is gone.
+///
+/// The reachable case is ordinary: A shoots and publishes; B pulls the album,
+/// develops a photo and republishes it; A pulls. The remote bytes now differ
+/// from A's published copy, so the plan says Pull — but A's *original* was
+/// never part of that comparison.
+#[test]
+fn a_pull_never_overwrites_the_library_original() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/ana-ivan", &["a1.jpg"]);
+    remote::push_album(&a.lib, &server, "2026/ana-ivan", a.published_root(), &opts, false).unwrap();
+
+    let original_path = a.lib.resolve("2026/ana-ivan").unwrap().join("a1.jpg");
+    let original_bytes = std::fs::read(&original_path).unwrap();
+
+    // Somebody else republishes that photo — a develop on another machine is
+    // exactly this: same filename, different pixels.
+    server.put("2026/ana-ivan/a1.jpg", b"developed on another machine").unwrap();
+
+    remote::pull_album(&a.lib, &server, "2026/ana-ivan", a.published_root()).unwrap();
+
+    assert_eq!(
+        std::fs::read(&original_path).unwrap(),
+        original_bytes,
+        "the pull wrote over the photographer's original — it is not recoverable"
+    );
+}

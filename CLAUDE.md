@@ -641,6 +641,8 @@ An adjustment is a row in `edits`, never a write to the original. What identifie
 
 Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
 
+**Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), and copying a photo *into* the library on import. `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
+
 ### Publish and sync are different things
 
 - **Publish** writes the gallery's content tree — `index.md` frontmatter plus the photo files — into `src/content/albums`. It only removes files this library published before, so nothing the admin panel or another tool put there is ever touched.

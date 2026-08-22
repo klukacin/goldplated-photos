@@ -728,6 +728,14 @@ fn cmd_pull(args: &[String]) -> Result<()> {
             println!("  {c}");
         }
     }
+    // The gallery copy took the server's version; the negative in the library
+    // did not, and there is no other copy of it.
+    if !outcome.kept_originals.is_empty() {
+        println!("originals kept (the server has a different version):");
+        for c in &outcome.kept_originals {
+            println!("  {c}");
+        }
+    }
     Ok(())
 }
 

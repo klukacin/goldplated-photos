@@ -1388,6 +1388,12 @@ function reportOutcome(path, o) {
     (o.conflicts?.length
       ? `\n\nChanged on both sides, nothing overwritten:\n  ${o.conflicts.join('\n  ')}`
       : '') +
+    // The library original is the negative. A pull updates the gallery copy
+    // but never writes over it, so say which frames the server disagrees on.
+    (o.kept_originals?.length
+      ? `\n\nThe server has a different version of these — your originals were kept:\n  ` +
+        `${o.kept_originals.join('\n  ')}`
+      : '') +
     // A parent folder someone else configured is not this push's to rewrite.
     (o.folders_left_alone?.length
       ? `\n\nAlready on the server and configured elsewhere — left as they are:\n  ` +
