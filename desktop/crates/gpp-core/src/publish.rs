@@ -99,8 +99,11 @@ impl Default for PublishOptions {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PublishResult {
     pub album_path: String,
-    /// Relative paths written, under the destination root.
+    /// Relative paths written, under the destination root. One entry per file
+    /// that exists on disk afterwards — never the same path twice.
     pub written: Vec<String>,
+    /// Photo files put in place, counted per destination. Two catalog photos
+    /// racing for one name produce one copy, so this counts one.
     pub photos_copied: usize,
     pub photos_skipped: usize,
     pub bytes_copied: u64,
@@ -115,6 +118,19 @@ pub struct PublishResult {
     /// Files removed from the published folder because this album no longer
     /// publishes them. Only ever files this library put there itself.
     pub removed: Vec<String>,
+    /// Photos in this album that wanted the same published filename. Only the
+    /// first reached the site; the rest are named here and shipped nothing.
+    pub collisions: Vec<PublishCollision>,
+}
+
+/// Two or more photos in one album competing for a single published filename.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublishCollision {
+    /// The contested path, relative to the destination root.
+    pub dest: String,
+    /// The album's photos that map to it, in album order. The first is the one
+    /// that was published; every later one was left out.
+    pub sources: Vec<String>,
 }
 
 /// Publish one album into `dest_root` (the gallery's `src/content/albums`).
@@ -128,12 +144,14 @@ pub fn publish_album(
         .album_by_path(album_path)?
         .ok_or_else(|| Error::AlbumNotFound(album_path.to_string()))?;
 
-    let photos = select_photos(lib, &album, opts)?;
+    let selected = select_photos(lib, &album, opts)?;
+    let (photos, collisions) = split_filename_collisions(album_path, selected);
     let album_dir = dest_root.join(album_path.replace('/', std::path::MAIN_SEPARATOR_STR));
     std::fs::create_dir_all(&album_dir).map_err(|e| Error::io(&album_dir, e))?;
 
     let mut result = PublishResult {
         album_path: album_path.to_string(),
+        collisions,
         ..Default::default()
     };
 
@@ -270,6 +288,55 @@ fn select_photos(lib: &Library, album: &Album, opts: &PublishOptions) -> Result<
         p.kind != crate::model::PhotoKind::Raw
     });
     Ok(photos)
+}
+
+/// Split the selected photos into the ones that get published and the
+/// filename fights that stopped the rest.
+///
+/// A published album is one flat folder, but a library is not: two cards at
+/// one wedding both hand you a `DSC_0001.jpg`. Whichever comes second cannot
+/// have the name, and the copy loop would simply overwrite the first — the
+/// album then ships one frame while every count says two.
+///
+/// Renaming the loser would be the tidy fix and is deliberately not done: the
+/// published filename *is* the URL, and a photographer who has already sent a
+/// client their gallery cannot have this app quietly reshuffle it. So the
+/// first photo in album order keeps the name, the others ship nothing, and the
+/// result says exactly which frames those were.
+fn split_filename_collisions(
+    album_path: &str,
+    selected: Vec<Photo>,
+) -> (Vec<Photo>, Vec<PublishCollision>) {
+    let mut kept: Vec<Photo> = Vec::with_capacity(selected.len());
+    // Destination filename → index into `kept` of the photo holding it.
+    let mut claimed: BTreeMap<String, usize> = BTreeMap::new();
+    let mut losers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for photo in selected {
+        match claimed.get(&photo.filename) {
+            Some(_) => losers
+                .entry(photo.filename.clone())
+                .or_default()
+                .push(photo.rel_path),
+            None => {
+                claimed.insert(photo.filename.clone(), kept.len());
+                kept.push(photo);
+            }
+        }
+    }
+
+    let collisions = losers
+        .into_iter()
+        .map(|(filename, rest)| {
+            let winner = kept[claimed[&filename]].rel_path.clone();
+            PublishCollision {
+                dest: format!("{album_path}/{filename}"),
+                sources: std::iter::once(winner).chain(rest).collect(),
+            }
+        })
+        .collect();
+
+    (kept, collisions)
 }
 
 /// Render `index.md` — YAML frontmatter, no body (body lives in `body.md`).
@@ -591,6 +658,66 @@ mod tests {
         assert_eq!(r.unrenderable, vec!["a/corrupt.jpg".to_string()]);
         assert!(dest.path().join("a/good.jpg").exists());
         assert!(!dest.path().join("a/corrupt.jpg").exists());
+    }
+
+    /// Two cards at one wedding both start at `DSC_0001.jpg`. The published
+    /// album is a flat folder, so only one of them can have the name — and the
+    /// photographer has to be told which frame is not on the site, because the
+    /// only other way to find out is a client asking where their photo went.
+    #[test]
+    fn same_named_photos_from_two_cards_are_reported_not_silently_merged() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("cardA/DSC_0001.jpg"), 40, 40);
+        write_jpeg(&src.path().join("cardB/DSC_0001.jpg"), 60, 60);
+        write_jpeg(&src.path().join("cardA/DSC_0002.jpg"), 40, 40);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let first = lib.photo_by_rel_path("cardA/DSC_0001.jpg").unwrap().unwrap();
+        let second = lib.photo_by_rel_path("cardB/DSC_0001.jpg").unwrap().unwrap();
+        let other = lib.photo_by_rel_path("cardA/DSC_0002.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[first.id, second.id, other.id]).unwrap();
+        lib.update_album("a", &AlbumUpdate { sort: Some("custom".into()), ..Default::default() })
+            .unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+
+        assert_eq!(
+            r.collisions.len(),
+            1,
+            "the two DSC_0001.jpg frames want the same published name"
+        );
+        assert_eq!(r.collisions[0].dest, "a/DSC_0001.jpg");
+        assert_eq!(
+            r.collisions[0].sources,
+            vec!["cardA/DSC_0001.jpg".to_string(), "cardB/DSC_0001.jpg".to_string()]
+        );
+
+        // Two files reached the site, not three: the count must not claim a
+        // photo was published when its name was taken.
+        assert_eq!(r.photos_copied, 2);
+        let written: BTreeSet<&String> = r.written.iter().collect();
+        assert_eq!(written.len(), r.written.len(), "no destination listed twice");
+        assert!(r.written.contains(&"a/DSC_0001.jpg".to_string()));
+
+        assert_eq!(
+            lib.published_files("a").unwrap(),
+            ["DSC_0001.jpg".to_string(), "DSC_0002.jpg".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+
+        // A photoOrder naming the same file twice is a list the gallery cannot
+        // make sense of.
+        let index = std::fs::read_to_string(dest.path().join("a/index.md")).unwrap();
+        let order_block = index.split("photoOrder:\n").nth(1).unwrap();
+        let names: Vec<&str> = order_block
+            .lines()
+            .take_while(|l| l.trim_start().starts_with("- "))
+            .collect();
+        assert_eq!(names.len(), 2, "photoOrder lists each published file once: {names:?}");
     }
 
     #[test]

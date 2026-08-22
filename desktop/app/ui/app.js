@@ -1035,8 +1035,16 @@ $('publish-run-btn').addEventListener('click', async () => {
         if (r.missing.length) notes.push(`${r.missing.length} missing from disk`);
         if (r.unrenderable.length) notes.push(`${r.unrenderable.length} without a preview, not published`);
         if (r.removed.length) notes.push(`${r.removed.length} removed`);
-        return `${r.album_path}: ${r.photos_copied} copied, ${r.photos_skipped} unchanged` +
+        if (r.collisions.length) notes.push(`${r.collisions.length} name clash(es)`);
+        let line = `${r.album_path}: ${r.photos_copied} copied, ${r.photos_skipped} unchanged` +
           (notes.length ? ` · ${notes.join(' · ')}` : '');
+        // A clash needs both filenames spelled out — renaming one would change
+        // a URL the client may already hold, so this is the photographer's call.
+        for (const c of r.collisions) {
+          line += `\n  ${c.dest} — published ${c.sources[0]}`;
+          for (const skipped of c.sources.slice(1)) line += `\n    not published: ${skipped}`;
+        }
+        return line;
       })
       .join('\n');
     status(`Published ${results.length} album(s), ${total} file(s) copied`);
