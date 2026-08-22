@@ -222,7 +222,7 @@ The site has three main sections:
 | `/home` | `src/pages/home.astro` | Digital home - hero slider, intro text, content cards |
 | `/photos` | `src/pages/photos/index.astro` | Gallery root - album list with Public/Locked toggle and live search box |
 | `/photos/*` | `src/pages/photos/[...path].astro` | Album/Collection view - dynamic route for all albums |
-| `/photos/tags/[tag]` | `src/pages/photos/tags/[tag].astro` | Prerendered tag page - non-hidden albums with the tag (locked = no cover) |
+| `/photos/tags/[tag]` | `src/pages/photos/tags/[tag].astro` | Prerendered tag page - albums with the tag (locked = no cover; hidden or locked *by an ancestor* counts as hidden or locked) |
 | `/photos/search` | `src/pages/photos/search.astro` | SSR search - albums (title/description/tags) + photos (filename/camera/EXIF date); PUBLIC content only |
 
 ### Components
@@ -405,6 +405,7 @@ An album can have both — the share link then skips the password form.
 **Access inheritance:**
 - A locked ancestor blocks descendants until unlocked; an unlocked album grants its descendants
 - Share tokens of ancestors also grant descendants
+- **A grant stops at the nearest lock.** A descendant with its own `password` or `shareToken` stays locked whether the ancestor was opened by cookie or by share link — so handing a client the collection's secret link does not hand them the separately locked albums inside it
 
 **Single implementation:** `resolveAlbumAccess()` / `resolveFileAccess()` are used by the album page AND all media routes (`/albums/*`, thumbnail, exif, video-info, watermark, download-album). Never add a media route without calling them. Pure logic lives in `access-core.ts` (unit-tested in `tests/`).
 
@@ -556,6 +557,8 @@ Environment variables (`.env`) can override site URL for different environments.
 ## Admin Panel
 
 A local-only web-based CMS for content management. **Never deployed to production.**
+
+**SECURITY:** the server binds to loopback, but every page the photographer visits can reach loopback too, and `cors()` does not stop that — it decides who may *read* a response, long after the handler has run. A fetch-metadata guard (`Sec-Fetch-Site` / `Origin`, in `admin/server.js` before every route) rejects anything sent from another origin, which is what keeps a stray `<img src="http://localhost:4444/api/tools/run/deploy">` on someone else's website from pushing the site live. Non-browser clients (curl) send neither header and still work. `ADMIN_PORT` overrides the 4444 default.
 
 **Location:** `admin/` directory
 **Server:** Express.js on port 4444
@@ -828,6 +831,7 @@ sshpass -p 'PASSWORD' rsync -avz --progress \
 - `src/lib/access.ts` - Astro glue: resolveAlbumAccess/resolveFileAccess/setAccessCookie
 - `src/lib/albums.ts` - Album/photo discovery, breadcrumbs, cover photos
 - `src/lib/rate-limit.ts` - In-memory rate limiting (10 attempts / 15 minutes per IP)
+- `src/lib/media-info.ts` - Builds the lightbox EXIF/video-info overlay markup. Every interpolated value is HTML-escaped: EXIF strings (Make, Model, LensModel) ride inside the image file, so a photo from a client or second shooter can carry markup in them — unit-tested
 
 **Tests & CI:**
 - `tests/*.test.ts` - Vitest unit tests (access control, rate limiting)
