@@ -597,6 +597,84 @@ Admin Panel (browser) → Admin API (:4444) → File System → Dev Server (:432
 
 Changes made in admin are saved directly to `src/content/` and `public/`, then auto-reloaded by dev server.
 
+## Desktop App (`desktop/`)
+
+A native photo workflow — import, cull, develop, publish, sync — sitting in front of the same gallery the admin panel edits. Written in Rust so it can run where a browser cannot: macOS today, iPadOS and Windows on the same code.
+
+`desktop/ARCHITECTURE.md` is the long form. This is what you need before touching it.
+
+### The shape
+
+```
+gpp-core  ──  all the logic: catalog, import, albums, develop, publish, sync
+   │              no GUI, no async runtime, no shelling out
+   ├── gpp-cli       a command-line driver — the way to test without a GUI
+   └── gpp-desktop   a Tauri v2 shell: one #[tauri::command] per UI action
+```
+
+`Session` is the application-level API — roughly one method per thing the UI can do. The shell and the CLI are both thin wrappers over it; if logic is creeping into either, it belongs in the core instead.
+
+**The portability contract** (stated in `gpp-core/src/lib.rs`, and it is load-bearing): no GUI dependencies, no spawning external processes, anything platform-specific behind a trait the shell implements — `sync::RemoteTransport`, `media::RawDecoder`. Breaking it is how the iPad target quietly dies.
+
+### The library on disk
+
+A library is a folder of photos the user already has. The app never moves them; it writes a catalog beside them:
+
+```
+<library>/
+  2026/weddings/ana-ivan/*.jpg     the photographer's own folders, untouched
+  .gpp/catalog.db                  SQLite: photos, albums, edits, sync state
+  .gpp/thumbs/<shard>/<key>_*.jpg  content-addressed derived images
+```
+
+Importing a folder from **outside** the library copies it in, because the catalog addresses photos by their path under the root and cannot point anywhere else.
+
+### Develop is non-destructive
+
+An adjustment is a row in `edits`, never a write to the original. What identifies a rendered image is a **render key**: the photo's content hash when there are no edits, otherwise `blake3(content_hash + stack_json)`. Change an adjustment and the key changes, so the grid asks for a thumbnail that does not exist yet and gets a freshly rendered one; reset it and the key returns to the original's, which is still cached. Publishing ships the developed pixels.
+
+Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
+
+### Publish and sync are different things
+
+- **Publish** writes the gallery's content tree — `index.md` frontmatter plus the photo files — into `src/content/albums`. It only removes files this library published before, so nothing the admin panel or another tool put there is ever touched.
+- **Sync** moves that tree to a server. Per album, in a direction that album chose (`push`, `pull`, `both`, or untracked). **An album nobody tracks is never touched on either side** — not pushed, not pulled, not deleted.
+
+Three manifests decide every file: what is local, what was last synced, what the remote holds. Both sides changed since the baseline is a conflict, and a conflict is reported, never resolved by guessing. Deleting on the server needs `allow_deletes` — the UI asks first and names the files.
+
+Two transports, same trait: a folder (network share, external drive) or the gallery's own HTTP endpoints. `.meta/` is server-owned — the proofing submissions live there — and is excluded from every manifest in both directions.
+
+### Sync over HTTP
+
+`/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `desktop/UPLOAD-TRANSPORT.md` for the measurements and why the transport is what it is.
+
+### Commands
+
+```bash
+cd desktop
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings   # must be clean
+cargo run -p gpp-cli -- --help                          # drive the core headless
+
+cd desktop/app/src-tauri && cargo build                 # the shell
+node desktop/app/check-shell.mjs                        # contract checks, see below
+```
+
+`npm run check:licences` holds every Rust dependency to MIT / Apache-2.0 / BSD / CC0, per target.
+
+### The shell cannot be unit-tested, so it has contract checks
+
+`desktop/app/check-shell.mjs` encodes defects that shipped and were only found by launching the app: an `invoke()` with no registered command, an element id that is not in the markup, a missing Tauri capability, a CSP without `ipc:`, a `[hidden]` rule a class can override, a `build.rs` that does not watch the UI files. **The UI is embedded into the binary at compile time — rebuild after every UI edit or you are testing the previous JavaScript.**
+
+Two traps worth knowing before you write UI code:
+
+- `window.confirm()` inside a Tauri webview on Linux returns `true` without asking. Use `askConfirm` from the dialog plugin; the contract check enforces it.
+- Types crossing the IPC boundary are built in JavaScript and read by serde. A name serde does not recognise is dropped in silence — which is how the star filter and the album sidebar once filtered nothing. Multi-word fields need `rename_all = "camelCase"`, and `deny_unknown_fields` turns the next typo into an error.
+
+### Running it without a screen
+
+`desktop/app/run-headless.sh <library>` starts Xvfb, a window manager (without one, synthetic clicks land nowhere), a session bus and the XDG portal (without it the folder picker opens nothing and reports no error). Pass a library path to skip the picker. `GPP_DISPLAY` and `GPP_BUS` let several run at once.
+
 ## Deployment Workflow
 
 **Workflow:** Develop locally with admin panel → `npm run deploy` → Production server

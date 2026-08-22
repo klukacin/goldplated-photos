@@ -29,9 +29,13 @@ export const GET: APIRoute = async ({ request, url }) => {
   try {
     await walk(root, files);
   } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
     // A scope that does not exist yet is an empty manifest, not an error: it is
-    // exactly what a first push looks like.
-    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    // exactly what a first push looks like. A scope that names a file rather
+    // than a folder is the client's mistake, not the server's — ENOTDIR would
+    // otherwise surface as a 500.
+    if (code === 'ENOTDIR') return jsonError('Scope is not a folder', 400);
+    if (code !== 'ENOENT') throw err;
   }
   await flushHashCache();
 
