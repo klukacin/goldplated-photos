@@ -135,6 +135,12 @@ pub struct PhotoFilter {
     pub captured_to: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// Defaulted, unlike the `Option` fields above, because omitting a sort
+    /// means "the usual one" rather than "do not sort". Without this the
+    /// struct could not be deserialized from `{}` even though it derives
+    /// `Default` — a trap the web UI never hit only because it always sends a
+    /// sort, and one the first caller writing JSON by hand walks straight into.
+    #[serde(default)]
     pub sort: PhotoSort,
 }
 
@@ -246,6 +252,16 @@ mod serde_tests {
         assert_eq!(filter.album_path.as_deref(), Some("2026/weddings/ana-ivan"));
         assert_eq!(filter.text.as_deref(), Some("nikon"));
         assert_eq!(filter.limit, Some(2000));
+    }
+
+    /// A filter that constrains nothing is the commonest one there is, so the
+    /// empty object has to mean it. Whoever writes the JSON by hand — a CLI, a
+    /// Swift client over the FFI — starts from `{}` and adds keys.
+    #[test]
+    fn photo_filter_reads_back_from_an_empty_object() {
+        let filter: PhotoFilter = serde_json::from_str("{}").unwrap();
+        assert!(filter.min_rating.is_none());
+        assert_eq!(filter.sort, PhotoSort::default());
     }
 
     /// And a name that is not a field is a loud error, not a no-op.

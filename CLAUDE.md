@@ -609,10 +609,13 @@ A native photo workflow — import, cull, develop, publish, sync — sitting in 
 gpp-core  ──  all the logic: catalog, import, albums, develop, publish, sync
    │              no GUI, no async runtime, no shelling out
    ├── gpp-cli       a command-line driver — the way to test without a GUI
+   ├── gpp-ffi       a C ABI: one JSON call, for clients that are not Rust
    └── gpp-desktop   a Tauri v2 shell: one #[tauri::command] per UI action
 ```
 
-`Session` is the application-level API — roughly one method per thing the UI can do. The shell and the CLI are both thin wrappers over it; if logic is creeping into either, it belongs in the core instead.
+`Session` is the application-level API — roughly one method per thing the UI can do. The shell, the CLI and the C ABI are all thin wrappers over it; if logic is creeping into any of them, it belongs in the core instead.
+
+`gpp-ffi` is what makes a *native* iPad or Android client possible rather than only a webview one: four `extern "C"` functions, `gpp_call(session, method, args_json)` covering the whole of `Session`, replies always `{"ok": …}` or `{"error": …, "kind": …}`, and no panic ever allowed to unwind into C. Its header is hand-written and checked in — cbindgen and UniFFI are both MPL-2.0, which the licence policy does not allow even at build time. See `desktop/crates/gpp-ffi/README.md`.
 
 **The portability contract** (stated in `gpp-core/src/lib.rs`, and it is load-bearing): no GUI dependencies, no spawning external processes, anything platform-specific behind a trait the shell implements — `sync::RemoteTransport`, `media::RawDecoder`. Breaking it is how the iPad target quietly dies.
 
