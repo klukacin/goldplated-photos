@@ -545,75 +545,18 @@ function formatAmount(value, adj) {
   return adj.unit ? `${sign}${value.toFixed(2)}${adj.unit}` : `${sign}${value}`;
 }
 
-// Every applied adjustment re-renders each selected photo, so the core must
-// not be handed one job per keystroke: holding an arrow key on a slider would
-// queue a dozen full renders of the whole selection and leave the grid showing
-// pixels from several values ago. Work is queued by adjustment instead, so a
-// newer value replaces the pending one and a different slider gets its own
-// entry.
-//
-// The key has to include *which photos*, not only which slider. Keyed by
-// slider alone, adjusting exposure on one photo and then immediately on
-// another replaces the first job with the second and the first photo never
-// gets its adjustment — and the window for that is however long the core takes
-// to render a selection, which for a shoot is seconds, not milliseconds.
-const developPending = new Map();
-let developDraining = false;
-
-/// Presses counted but not yet sent, under the same key as the job that will
-/// send them. Only relative adjustments — rotate and the flips — use this;
-/// see `queueRelative`.
-const developPresses = new Map();
-
-function developKey(kind, ids) {
-  return `${kind}:${ids.join(',')}`;
-}
-
-function queueDevelop(kind, ids, run) {
-  developPending.set(developKey(kind, ids), { ids, run });
-  drainDevelop();
-}
-
-/// Drop queued work for photos that are about to be overruled — a reset makes
-/// any adjustment still waiting for those photos meaningless. Work queued for
-/// *other* photos is somebody's edit and stays.
-function forgetQueuedFor(ids) {
-  const targets = new Set(ids);
-  for (const [key, job] of developPending) {
-    if (!job.ids.some((id) => targets.has(id))) continue;
-    developPending.delete(key);
-    // A relative adjustment keeps its tally under the same key, so dropping
-    // the job has to drop the presses counted for it too — otherwise the next
-    // rotate on those photos would replay the ones this reset just discarded.
-    developPresses.delete(key);
-  }
-}
-
-async function drainDevelop() {
-  if (developDraining) return;
-  developDraining = true;
-  try {
-    while (developPending.size) {
-      const [key, job] = developPending.entries().next().value;
-      developPending.delete(key);
-      try {
-        await job.run();
-      } catch (err) {
-        status(`Develop failed: ${err}`);
-      }
-    }
-  } finally {
-    developDraining = false;
-  }
-  // One repaint for the whole burst, once the core has caught up.
-  await afterDevelop();
-}
+// Adjustments are coalesced rather than sent one per keystroke; the scheduling
+// itself lives in develop-queue.js, where it can be tested without a window.
+const developQueue = createDevelopQueue({
+  onError: (err) => status(`Develop failed: ${err}`),
+  onSettled: () => afterDevelop(),
+});
 
 function applyAdjustment(adj, value) {
   const ids = developTargets();
   if (!ids.length) return;
 
-  queueDevelop(adj.kind, ids, async () => {
+  developQueue.queue(adj.kind, ids, async () => {
     // A zero is not stored — the core drops the op and the photo returns to its
     // original render key, so this doubles as "clear this adjustment".
     const op = { op: adj.kind, [adj.field]: value };
@@ -626,7 +569,7 @@ $('dev-bw').addEventListener('change', (e) => {
   const ids = developTargets();
   if (!ids.length) return;
   const on = e.target.checked;
-  queueDevelop('black-and-white', ids, async () => {
+  developQueue.queue('black-and-white', ids, async () => {
     const n = on
       ? await invoke('set_photo_edit', { ids, op: { op: 'black-and-white' } })
       : await invoke('clear_photo_edit', { ids, kind: 'black-and-white' });
@@ -640,24 +583,12 @@ $('dev-bw').addEventListener('change', (e) => {
 // frame the sliders then work on. They queue like everything else, but they
 // coalesce differently: a slider sends a value, so the newest one may simply
 // replace the pending one, while these are *relative* — drop a press and the
-// photo ends up at an angle nobody asked for.
-
-/// Queue a relative adjustment: presses on the same photos add up into a single
-/// call once the core catches up.
-function queueRelative(kind, ids, send) {
-  const key = developKey(kind, ids);
-  developPresses.set(key, (developPresses.get(key) || 0) + 1);
-  queueDevelop(kind, ids, async () => {
-    const presses = developPresses.get(key) || 0;
-    developPresses.delete(key);
-    if (presses) await send(ids, presses);
-  });
-}
+// photo ends up at an angle nobody asked for. `queueRelative` counts them.
 
 function rotate(quarterTurns) {
   const ids = developTargets();
   if (!ids.length) return;
-  queueRelative(`rotate${quarterTurns}`, ids, async (targets, presses) => {
+  developQueue.queueRelative(`rotate${quarterTurns}`, ids, async (targets, presses) => {
     const n = await invoke('rotate_photos', {
       ids: targets,
       quarterTurns: quarterTurns * presses,
@@ -669,7 +600,7 @@ function rotate(quarterTurns) {
 function flip(kind, label) {
   const ids = developTargets();
   if (!ids.length) return;
-  queueRelative(kind, ids, async (targets, presses) => {
+  developQueue.queueRelative(kind, ids, async (targets, presses) => {
     // An even number of presses is back where it started, so there is nothing
     // to send — a flip has no value, only a state to switch.
     if (presses % 2 === 0) return;
@@ -707,8 +638,8 @@ $('develop-reset').addEventListener('click', () => {
   // presses counted for a rotate that has not been sent yet. Only for these
   // photos: clearing the whole queue would throw away an adjustment someone
   // just made to a different selection.
-  forgetQueuedFor(ids);
-  queueDevelop('reset', ids, async () => {
+  developQueue.forgetFor(ids);
+  developQueue.queue('reset', ids, async () => {
     const n = await invoke('reset_photo_edits', { ids });
     status(`Reset ${n} photo(s) to the original`);
   });

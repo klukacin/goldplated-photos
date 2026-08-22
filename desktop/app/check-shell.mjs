@@ -171,10 +171,13 @@ if (/\[hidden\]\s*\{[^}]*display:\s*none/.test(styleCss)) {
 // The UI is embedded at compile time. Without rerun-if-changed the build script
 // does not re-run, and `cargo build` silently produces a binary carrying the
 // previous frontend.
+// Read the UI directory rather than a list written down here: a list would
+// itself need remembering, and the file somebody forgets to add is exactly the
+// one whose edits then vanish from the build.
 const buildRs = readFileSync(join(tauri, 'build.rs'), 'utf8');
-const watched = ['index.html', 'app.js', 'style.css'].filter(
-  (f) => !buildRs.includes(f),
-);
+const watched = readdirSync(ui)
+  .filter((f) => /\.(html|js|css)$/.test(f))
+  .filter((f) => !buildRs.includes(f));
 if (watched.length) {
   fail('build.rs does not watch every UI file', `missing: ${watched.join(', ')}`);
 } else {
