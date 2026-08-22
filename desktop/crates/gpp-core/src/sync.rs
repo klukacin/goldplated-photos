@@ -272,8 +272,12 @@ pub fn plan_scoped(
             remote.get(path),
             direction,
         );
-        if action == Action::ForgetState {
-            continue; // nothing to do and nothing to report
+        // Nothing to transfer. Skip it only when the books are already right:
+        // a baseline that disagrees with the local side still has to be
+        // brought up to date, and dropping the change here is what left stale
+        // rows behind for `apply` to misread later.
+        if action == Action::ForgetState && synced.get(path) == local.get(path) {
+            continue;
         }
         changes.push(PlannedChange {
             path: path.clone(),
@@ -489,6 +493,31 @@ pub fn apply(
     Ok(out)
 }
 
+/// Place a manifest path under the local root, refusing anything that would
+/// land outside it.
+///
+/// Manifest paths come from the server, and both halves of a transfer trust
+/// them against the local disk: a push reads that file and uploads it, a pull
+/// overwrites it. Every caller scopes its plan to one album today, which
+/// already excludes a climbing path — this makes the guarantee belong to the
+/// transfer rather than to the callers who happen to precede it.
+fn local_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\0') {
+        return None;
+    }
+    let mut out = root.to_path_buf();
+    for segment in rel.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return None,
+            s => out.push(s),
+        }
+    }
+    // Catches what pushing a segment can still do on Windows — a drive letter
+    // or a backslash-separated path replaces the root rather than extending it.
+    out.starts_with(root).then_some(out)
+}
+
 /// One change, in isolation. Never returns `Err`: a single file failing is
 /// reported and the rest of the transfer continues.
 fn apply_one(
@@ -498,8 +527,10 @@ fn apply_one(
     local_root: &std::path::Path,
     allow_deletes: bool,
 ) -> Applied {
-    let local_path = local_root.join(&change.path);
     let failed = |e: crate::error::Error| Applied::Failed(change.path.clone(), e.to_string());
+    let Some(local_path) = local_under(local_root, &change.path) else {
+        return failed(crate::error::Error::InvalidPath(change.path.clone()));
+    };
 
     match change.action {
         Action::Push => {
@@ -548,7 +579,27 @@ fn apply_one(
         Action::Conflict => Applied::Conflict(change.path.clone()),
         Action::LeaveAlone => Applied::LeftAlone,
         Action::Skip => Applied::Skipped,
-        Action::ForgetState => Applied::Nothing,
+        // Nothing moves, but the bookkeeping still has to be settled, and which
+        // way depends on what is actually here. A file gone from both sides
+        // must stop being remembered: a stale baseline reads as "I deleted this
+        // on purpose" the day another machine republishes those bytes, and the
+        // file is taken off the server again. A file both sides already hold
+        // needs that agreement written down, or the next ordinary remote edit
+        // is measured against a baseline neither side holds and reported as a
+        // conflict nothing can clear.
+        Action::ForgetState => match std::fs::read(&local_path) {
+            Ok(bytes) => {
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                match lib.record_synced(&change.path, &hash) {
+                    Ok(()) => Applied::Nothing,
+                    Err(e) => failed(e),
+                }
+            }
+            Err(_) => match lib.forget_synced(&change.path) {
+                Ok(()) => Applied::Nothing,
+                Err(e) => failed(e),
+            },
+        },
     }
 }
 
@@ -777,6 +828,135 @@ mod tests {
         let out = apply(&lib, &transport, &p, dir.path(), true).unwrap();
         assert_eq!(out.deleted, 1);
         assert!(transport.manifest().unwrap().is_empty());
+    }
+
+    fn fake_transport() -> FakeTransport {
+        FakeTransport {
+            files: std::sync::Mutex::new(Manifest::new()),
+            blobs: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Every path in a plan came from the server's manifest, and both halves of
+    /// a transfer trust it against the local disk: a push reads that file, a
+    /// pull overwrites it. One that climbs out of the tree must be refused
+    /// rather than followed.
+    #[test]
+    fn a_path_that_climbs_out_of_the_local_tree_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir_all(&published).unwrap();
+        let outside = dir.path().join("precious.txt");
+        std::fs::write(&outside, b"not part of any gallery").unwrap();
+
+        let lib = Library::open_in_memory(&published).unwrap();
+        let transport = fake_transport();
+        transport.put("../precious.txt", b"overwritten").unwrap();
+
+        let plan = SyncPlan {
+            changes: vec![PlannedChange {
+                path: "../precious.txt".to_string(),
+                action: Action::Pull,
+            }],
+        };
+        let out = apply(&lib, &transport, &plan, &published, false).unwrap();
+
+        assert_eq!(out.pulled, 0);
+        assert_eq!(out.failed.len(), 1, "the path should be reported, not followed");
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"not part of any gallery",
+            "a file outside the published tree was overwritten"
+        );
+    }
+
+    /// A file gone from both sides has to stop being remembered. Keeping the
+    /// row means that the day another machine republishes that photo, this one
+    /// reads its own stale baseline as "I deleted this on purpose" and takes it
+    /// off the server again — the exact loss the third state exists to prevent.
+    #[test]
+    fn a_file_gone_from_both_sides_stops_being_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open_in_memory(dir.path()).unwrap();
+        let transport = fake_transport();
+
+        let bytes = b"the photograph";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        lib.record_synced("a/x.jpg", &hash).unwrap();
+
+        // It is gone here and gone there — someone removed it on the server.
+        let p = plan_album(
+            "a",
+            SyncDirection::Both,
+            &Manifest::new(),
+            &lib.synced_manifest().unwrap(),
+            &Manifest::new(),
+        );
+        apply(&lib, &transport, &p, dir.path(), true).unwrap();
+        assert!(
+            lib.synced_manifest().unwrap().is_empty(),
+            "a file gone from both sides is still on the books"
+        );
+
+        // Another machine now republishes exactly those bytes.
+        transport.put("a/x.jpg", bytes).unwrap();
+        let p2 = plan_album(
+            "a",
+            SyncDirection::Both,
+            &Manifest::new(),
+            &lib.synced_manifest().unwrap(),
+            &transport.manifest().unwrap(),
+        );
+        assert_eq!(
+            p2.count(Action::DeleteRemote),
+            0,
+            "a file this machine never had must not be deleted from the server"
+        );
+    }
+
+    /// Both sides arrived at the same bytes without either knowing. There is
+    /// nothing to transfer — but they *do* now agree, and that has to be
+    /// written down. Left at the older baseline, the next ordinary remote edit
+    /// is read as a divergence and reported as a conflict that no number of
+    /// syncs can clear.
+    #[test]
+    fn two_sides_that_converged_on_their_own_end_up_agreeing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a/x.jpg"), b"both landed here").unwrap();
+        let both = blake3::hash(b"both landed here").to_hex().to_string();
+
+        let lib = Library::open_in_memory(dir.path()).unwrap();
+        let transport = fake_transport();
+        transport.put("a/x.jpg", b"both landed here").unwrap();
+        lib.record_synced("a/x.jpg", "the-older-baseline").unwrap();
+
+        let local = m(&[("a/x.jpg", both.as_str())]);
+        let p = plan_album(
+            "a",
+            SyncDirection::Both,
+            &local,
+            &lib.synced_manifest().unwrap(),
+            &transport.manifest().unwrap(),
+        );
+        apply(&lib, &transport, &p, dir.path(), false).unwrap();
+        assert_eq!(
+            lib.synced_manifest().unwrap().get("a/x.jpg").map(String::as_str),
+            Some(both.as_str()),
+            "the two sides agree, so that is what the baseline must say"
+        );
+
+        // The server alone moves on. That is a plain pull, not a conflict.
+        transport.put("a/x.jpg", b"the server moved on").unwrap();
+        let p2 = plan_album(
+            "a",
+            SyncDirection::Both,
+            &local,
+            &lib.synced_manifest().unwrap(),
+            &transport.manifest().unwrap(),
+        );
+        assert_eq!(p2.count(Action::Conflict), 0, "nothing here diverged");
+        assert_eq!(p2.count(Action::Pull), 1);
     }
 }
 

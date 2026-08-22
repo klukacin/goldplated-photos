@@ -162,9 +162,17 @@ impl EditStack {
     /// render key.
     pub fn set(&mut self, op: EditOp) {
         let op = op.clamped();
-        self.ops.retain(|existing| existing.kind() != op.kind());
-        if !op.is_identity() {
-            self.ops.push(op);
+        if op.is_identity() {
+            self.ops.retain(|existing| existing.kind() != op.kind());
+            return;
+        }
+        // Replaced where it stands. Dropping it and appending would move the op
+        // to the end, and the stack *is* the order the operations run in: a
+        // second press of "rotate right" slid the turn past a crop that had
+        // been drawn on the turned frame, and the framing jumped.
+        match self.ops.iter_mut().find(|existing| existing.kind() == op.kind()) {
+            Some(existing) => *existing = op,
+            None => self.ops.push(op),
         }
     }
 
@@ -681,6 +689,38 @@ mod tests {
         // …and one to the right undoes it.
         s.rotate_by(1);
         assert!(s.is_empty());
+    }
+
+    /// The stack is the order the operations run in, so replacing one has to
+    /// leave it where it stands. Appending instead slid a second "rotate right"
+    /// past an existing crop, and the rectangle the photographer had drawn
+    /// landed on a different part of the frame.
+    #[test]
+    fn adjusting_an_op_again_leaves_it_where_it_stands_in_the_stack() {
+        let mut s = EditStack::new();
+        s.rotate_by(1);
+        s.set(EditOp::Crop { x: 0.0, y: 0.0, w: 1.0, h: 0.5 });
+        s.rotate_by(1);
+
+        assert_eq!(
+            s.ops,
+            vec![
+                EditOp::Rotate { quarter_turns: 2 },
+                EditOp::Crop { x: 0.0, y: 0.0, w: 1.0, h: 0.5 },
+            ],
+            "the turn must stay ahead of the crop that was drawn on it"
+        );
+
+        // And the pixels follow. Top row white, bottom row black: turned a
+        // half, the top of the frame is the old bottom, and keeping the top
+        // half of *that* is black.
+        let mut img = RgbImage::new(4, 2);
+        for (_x, y, p) in img.enumerate_pixels_mut() {
+            *p = if y == 0 { Rgb([255, 255, 255]) } else { Rgb([0, 0, 0]) };
+        }
+        let out = apply(&DynamicImage::ImageRgb8(img), &s);
+        assert_eq!((out.width(), out.height()), (4, 1));
+        assert_eq!(px(&out, 0, 0), [0, 0, 0], "the crop did not move with the turn");
     }
 
     /// A flip has no value to return to zero, so the same button has to take it
