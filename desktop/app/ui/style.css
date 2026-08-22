@@ -170,6 +170,9 @@ input:focus-visible, select:focus-visible, button:focus-visible {
    album" spread over three lines and dragged the whole bar taller. The search
    box gives up the width instead. */
 .toolbar .btn { white-space: nowrap; flex-shrink: 0; }
+/* The count broke across two lines mid-phrase — "1" above "selected" — which
+   reads as a rendering fault rather than a tight fit. */
+#selection-info { white-space: nowrap; }
 .filter-group { display: flex; gap: 2px; }
 .chip {
   background: var(--bg-raised);
@@ -268,7 +271,17 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border-left: 1px solid var(--border);
   overflow-y: auto;
 }
-.inspector-img { width: 100%; display: block; background: #0e0e11; }
+/* Cap the height as well as the width. A landscape frame turned upright is
+   twice as tall as it was wide, and an uncapped preview pushed the filename,
+   the stars and every adjustment below the fold — so the control you had just
+   used to rotate it scrolled out from under the pointer. */
+.inspector-img {
+  width: 100%;
+  max-height: 40vh;
+  object-fit: contain;
+  display: block;
+  background: #0e0e11;
+}
 .inspector-body { padding: 0.9rem; }
 .inspector-body h3 {
   margin: 0 0 0.6rem;
