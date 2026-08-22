@@ -662,6 +662,8 @@ node desktop/app/check-shell.mjs                        # contract checks, see b
 
 `npm run check:licences` holds every Rust dependency to MIT / Apache-2.0 / BSD / CC0, per target.
 
+**Do not share one `CARGO_TARGET_DIR` between git worktrees.** It looks like a way to save disk and it costs correctness: a build of one worktree's sources can be served artifacts built from another's, so a test passes or fails for reasons that are not in the tree you are reading. It has already produced both a phantom failure and a phantom extra dozen tests. Give each worktree its own target directory, or build them one at a time.
+
 ### The shell cannot be unit-tested, so it has contract checks
 
 `desktop/app/check-shell.mjs` encodes defects that shipped and were only found by launching the app: an `invoke()` with no registered command, an element id that is not in the markup, a missing Tauri capability, a CSP without `ipc:`, a `[hidden]` rule a class can override, a `build.rs` that does not watch the UI files. **The UI is embedded into the binary at compile time — rebuild after every UI edit or you are testing the previous JavaScript.**
