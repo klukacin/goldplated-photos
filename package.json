@@ -32,6 +32,7 @@
     "build": "astro build",
     "check": "astro check",
     "check:shell": "node desktop/app/check-shell.mjs",
+    "check:licences": "node scripts/check-licences.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "astro preview",

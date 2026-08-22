@@ -54,21 +54,34 @@ export const PUT: APIRoute = async ({ request, url }) => {
   if (!target) return jsonError('Invalid path', 400);
   const { full, rel } = target;
 
+  // Integrity is not optional. Every client we have computes this hash anyway,
+  // and without it a truncated upload is published as a photo.
+  const declared = request.headers.get('x-content-blake3')?.toLowerCase();
+  if (!declared) {
+    return jsonError('Missing X-Content-Blake3', 400);
+  }
+
+  // Refuse an oversized upload from its declared length, before reading it.
+  // `arrayBuffer()` below buffers the whole body in memory, so a body measured
+  // only after the fact is a body already held — this turns the honest case
+  // into a cheap rejection. A client that lies about its length is still
+  // caught underneath, just not cheaply.
+  const declaredLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_UPLOAD_BYTES) {
+    return jsonError('Too large', 413);
+  }
+
   const body = new Uint8Array(await request.arrayBuffer());
   if (body.byteLength > MAX_UPLOAD_BYTES) {
     return jsonError('Too large', 413);
   }
 
   // Reject rather than publish a file that did not survive the wire intact.
-  const declared = request.headers.get('x-content-blake3');
-  let verified: string | null = null;
-  if (declared) {
-    const actual = blake3HexOf(body);
-    if (actual !== declared) {
-      return jsonError(`Hash mismatch: declared ${declared}, received ${actual}`, 422);
-    }
-    verified = actual;
+  const actual = blake3HexOf(body);
+  if (actual !== declared) {
+    return jsonError(`Hash mismatch: declared ${declared}, received ${actual}`, 422);
   }
+  const verified = actual;
 
   await fs.mkdir(path.dirname(full), { recursive: true });
   // Write beside the target and rename: rename is atomic within a filesystem,
@@ -84,10 +97,8 @@ export const PUT: APIRoute = async ({ request, url }) => {
 
   // The hash was computed to verify the upload; keeping it means the next
   // manifest does not read this file again.
-  if (verified) {
-    await rememberHash(full, rel, verified);
-    await flushHashCache();
-  }
+  await rememberHash(full, rel, verified);
+  await flushHashCache();
 
   return new Response(null, { status: 204 });
 };
@@ -100,11 +111,29 @@ export const DELETE: APIRoute = async ({ request, url }) => {
   if (!target) return jsonError('Invalid path', 400);
   const { full, rel } = target;
 
-  await fs.rm(full, { force: true });
+  // A path may name a directory — `2026/weddings` is a perfectly well-formed
+  // request — and `rm` without `recursive` raises EISDIR. Sync deletes files;
+  // a directory disappears when the last file in it does.
+  try {
+    await fs.rm(full, { force: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'EISDIR' ||
+        (err as NodeJS.ErrnoException)?.code === 'ERR_FS_EISDIR') {
+      return jsonError('Path is a directory', 400);
+    }
+    throw err;
+  }
+
   await forgetHash(rel);
   await flushHashCache();
+
   // Tidy up a directory the deletion emptied, but never complain if it is not
-  // empty — another album's files may share the parent.
-  await fs.rmdir(path.dirname(full)).catch(() => {});
+  // empty — another album's files may share the parent. The content root is
+  // not a directory to tidy: deleting the last top-level file would otherwise
+  // remove the tree the gallery's content collection reads from.
+  const parent = path.dirname(full);
+  if (parent !== CONTENT_ROOT) {
+    await fs.rmdir(parent).catch(() => {});
+  }
   return new Response(null, { status: 204 });
 };
