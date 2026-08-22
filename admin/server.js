@@ -50,8 +50,14 @@ app.use((req, res, next) => {
   if (site && site !== 'same-origin' && site !== 'none') {
     return res.status(403).json({ error: 'Cross-site requests are not allowed' });
   }
+  // `Sec-Fetch-Site` is a forbidden header name: no page can set it, so a
+  // browser saying `same-origin` has already answered the question and the
+  // Origin it sent is this server's own, whatever hostname that is. Taking its
+  // word is what keeps the panel reachable at a name the allow-list cannot
+  // know in advance — a LAN address, a hosts-file alias — instead of 403ing
+  // every write the moment it is opened as anything but localhost.
   const origin = req.get('Origin');
-  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+  if (site !== 'same-origin' && origin && !ALLOWED_ORIGINS.includes(origin)) {
     return res.status(403).json({ error: 'Cross-site requests are not allowed' });
   }
   next();

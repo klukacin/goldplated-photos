@@ -122,4 +122,18 @@ describe('admin API same-origin requests', () => {
     const res = await fetch(`${base}/api/config`);
     expect(res.status).toBe(200);
   });
+
+  it('serves the panel opened at a hostname the allow-list never heard of', async () => {
+    // The allow-list can only name localhost and 127.0.0.1, but the panel is
+    // reachable at any name that resolves to this machine — a LAN address, a
+    // hosts-file alias, a container name. `Sec-Fetch-Site` is a forbidden
+    // header name, so no page can forge `same-origin`; when the browser says
+    // it, the Origin it sent is this server's own and the allow-list has
+    // nothing left to decide. Rejecting here would 403 every save the moment
+    // the photographer opened the panel as anything but localhost.
+    const res = await fetch(`${base}/api/albums`, {
+      headers: { 'Sec-Fetch-Site': 'same-origin', 'Origin': 'http://studio-mac.local:4444' }
+    });
+    expect(res.status).toBe(200);
+  });
 });
