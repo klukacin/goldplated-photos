@@ -157,6 +157,38 @@ async fn set_photo_edit(
     .map_err(|e| e.to_string())?
 }
 
+/// Relative, unlike `set_photo_edit`: the app's rotate buttons add a quarter
+/// turn to whatever each photo already carries.
+#[tauri::command]
+async fn rotate_photos(
+    app: tauri::AppHandle,
+    ids: Vec<i64>,
+    quarter_turns: i32,
+) -> CmdResult<usize> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .rotate_photos(ids, quarter_turns)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn toggle_photo_edit(
+    app: tauri::AppHandle,
+    ids: Vec<i64>,
+    op: EditOp,
+) -> CmdResult<usize> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .toggle_photo_edit(ids, op)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn clear_photo_edit(
     app: tauri::AppHandle,
@@ -417,6 +449,8 @@ pub fn run() {
             set_color_label,
             photo_edits,
             set_photo_edit,
+            rotate_photos,
+            toggle_photo_edit,
             clear_photo_edit,
             reset_photo_edits,
             list_albums,

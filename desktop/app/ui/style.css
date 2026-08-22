@@ -165,7 +165,11 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.toolbar input[type="search"] { max-width: 260px; }
+.toolbar input[type="search"] { max-width: 260px; min-width: 9rem; }
+/* With the inspector open the toolbar is tight, and a wrapped "Remove from
+   album" spread over three lines and dragged the whole bar taller. The search
+   box gives up the width instead. */
+.toolbar .btn { white-space: nowrap; flex-shrink: 0; }
 .filter-group { display: flex; gap: 2px; }
 .chip {
   background: var(--bg-raised);
@@ -427,6 +431,15 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 }
 .develop > summary::-webkit-details-marker { display: none; }
 .sliders { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.45rem; }
+
+/* Rotate and flip. The glyphs need a little more room than the label buttons
+   elsewhere, and the state readout takes whatever is left. */
+.geometry { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.6rem; }
+.geometry .btn { padding: 0.2rem 0.5rem; font-size: 1rem; line-height: 1.1; }
+/* A flip is on or off, so the button has to carry the state — nothing about a
+   mirrored photo looks wrong on its own. */
+.geometry .btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.geometry #dev-geometry-state { margin-left: auto; font-size: 0.75rem; text-align: right; }
 
 /* The readout column fits "-3.20 EV", the widest thing it ever holds. */
 .slider-row { display: grid; grid-template-columns: 5.5rem 1fr 3.9rem; align-items: center; gap: 0.4rem; }

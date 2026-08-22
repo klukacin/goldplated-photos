@@ -168,6 +168,36 @@ impl EditStack {
         }
     }
 
+    /// Turn a further quarter on top of whatever turn is already recorded.
+    ///
+    /// Rotate buttons are relative — two clicks of "right" mean 180°. Sending
+    /// an absolute `Rotate { quarter_turns: 1 }` each time would go nowhere,
+    /// because [`set`](Self::set) upserts by kind and the second one would only
+    /// replace the first. Wrapping back to zero removes the op, so a photo
+    /// turned all the way round is untouched again and keeps its render key.
+    pub fn rotate_by(&mut self, quarter_turns: i32) {
+        let current = match self.get("rotate") {
+            Some(EditOp::Rotate { quarter_turns: turns }) => i32::from(*turns),
+            _ => 0,
+        };
+        self.set(EditOp::Rotate {
+            quarter_turns: (current + quarter_turns).rem_euclid(4) as u8,
+        });
+    }
+
+    /// Switch an op that carries no value on, or off again.
+    ///
+    /// The flips are the only adjustments with nothing to set to zero, so
+    /// `set` alone could never undo one: it drops the existing op and pushes an
+    /// identical one straight back.
+    pub fn toggle(&mut self, op: EditOp) {
+        if self.get(op.kind()).is_some() {
+            self.remove(op.kind());
+        } else {
+            self.set(op);
+        }
+    }
+
     pub fn remove(&mut self, kind: &str) {
         self.ops.retain(|op| op.kind() != kind);
     }
@@ -618,6 +648,56 @@ mod tests {
 
         assert_eq!((out.width(), out.height()), (2, 2), "cropped to the right half");
         assert_eq!(px(&out, 0, 0), [128, 128, 128], "white, one stop down");
+    }
+
+    /// The button says "rotate right", not "be rotated 90°". Two presses have
+    /// to reach 180° — with `set` alone the second replaces the first and the
+    /// photo never turns past its first quarter.
+    #[test]
+    fn rotating_twice_is_a_half_turn() {
+        let mut s = EditStack::new();
+        s.rotate_by(1);
+        s.rotate_by(1);
+        assert_eq!(s.get("rotate"), Some(&EditOp::Rotate { quarter_turns: 2 }));
+        assert_eq!(s.ops.len(), 1, "one rotation, not a pile of them");
+    }
+
+    #[test]
+    fn rotating_the_whole_way_round_leaves_no_trace() {
+        let mut s = EditStack::new();
+        for _ in 0..4 {
+            s.rotate_by(1);
+        }
+        assert!(s.is_empty(), "back where it started, so nothing is stored");
+        assert_eq!(render_key("abc123", &s), "abc123", "and the thumbnails still fit");
+    }
+
+    #[test]
+    fn rotating_left_from_upright_wraps_to_three_quarters() {
+        let mut s = EditStack::new();
+        s.rotate_by(-1);
+        assert_eq!(s.get("rotate"), Some(&EditOp::Rotate { quarter_turns: 3 }));
+
+        // …and one to the right undoes it.
+        s.rotate_by(1);
+        assert!(s.is_empty());
+    }
+
+    /// A flip has no value to return to zero, so the same button has to take it
+    /// off again.
+    #[test]
+    fn a_flip_toggles_off_with_a_second_press() {
+        let mut s = EditStack::new();
+        s.toggle(EditOp::FlipHorizontal);
+        assert_eq!(s.get("flip-horizontal"), Some(&EditOp::FlipHorizontal));
+
+        s.toggle(EditOp::FlipHorizontal);
+        assert!(s.is_empty(), "pressed again, it is gone");
+
+        // The two axes are independent adjustments.
+        s.toggle(EditOp::FlipHorizontal);
+        s.toggle(EditOp::FlipVertical);
+        assert_eq!(s.ops.len(), 2);
     }
 
     #[test]
