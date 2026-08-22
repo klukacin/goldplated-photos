@@ -273,6 +273,9 @@ function updateSelectionUI() {
   const n = state.selected.size;
   $('selection-info').textContent = n ? `${n} selected` : '';
   $('add-to-album-btn').disabled = n === 0;
+  // Removing is a change to one album's membership, so it only means anything
+  // while that album is the thing being shown.
+  $('remove-from-album-btn').disabled = n === 0 || !state.currentAlbum;
   // The develop panel acts on the selection, so it has to say so here too —
   // otherwise Select All leaves it reading "one photo" while a slider drag
   // would repaint the whole shoot.
@@ -497,6 +500,7 @@ async function renderDevelop(photo, generation = inspectorGeneration) {
   }
 
   $('dev-bw').checked = stack.ops.some((o) => opKind(o) === 'black-and-white');
+  renderGeometry(stack);
 
   if (hadFocus) {
     panel.querySelector(`.slider-row[data-kind="${hadFocus}"] input`)?.focus();
@@ -572,11 +576,83 @@ $('dev-bw').addEventListener('change', (e) => {
   });
 });
 
+// ------------------------------------------------------- rotate and flip
+//
+// Geometry is applied before the tone operators, so these buttons decide the
+// frame the sliders then work on. They queue like everything else, but they
+// coalesce differently: a slider sends a value, so the newest one may simply
+// replace the pending one, while these are *relative* — drop a press and the
+// photo ends up at an angle nobody asked for.
+
+/// Presses counted but not yet sent, keyed by adjustment *and* selection, so a
+/// burst on one photo is never merged into a burst on another.
+const developPresses = new Map();
+
+/// Queue a relative adjustment: presses on the same photos add up into a single
+/// call once the core catches up.
+function queueRelative(kind, ids, send) {
+  const key = `${kind}:${ids.join(',')}`;
+  developPresses.set(key, (developPresses.get(key) || 0) + 1);
+  queueDevelop(key, async () => {
+    const presses = developPresses.get(key) || 0;
+    developPresses.delete(key);
+    if (presses) await send(ids, presses);
+  });
+}
+
+function rotate(quarterTurns) {
+  const ids = developTargets();
+  if (!ids.length) return;
+  queueRelative(`rotate${quarterTurns}`, ids, async (targets, presses) => {
+    const n = await invoke('rotate_photos', {
+      ids: targets,
+      quarterTurns: quarterTurns * presses,
+    });
+    status(n ? `Rotated ${n} photo(s)` : 'No change');
+  });
+}
+
+function flip(kind, label) {
+  const ids = developTargets();
+  if (!ids.length) return;
+  queueRelative(kind, ids, async (targets, presses) => {
+    // An even number of presses is back where it started, so there is nothing
+    // to send — a flip has no value, only a state to switch.
+    if (presses % 2 === 0) return;
+    const n = await invoke('toggle_photo_edit', { ids: targets, op: { op: kind } });
+    status(n ? `${label} ${n} photo(s)` : 'No change');
+  });
+}
+
+$('dev-rotate-left').addEventListener('click', () => rotate(-1));
+$('dev-rotate-right').addEventListener('click', () => rotate(1));
+$('dev-flip-h').addEventListener('click', () => flip('flip-horizontal', 'Flipped left to right,'));
+$('dev-flip-v').addEventListener('click', () => flip('flip-vertical', 'Flipped top to bottom,'));
+
+/// Say where the frame currently stands. The buttons are relative, so nothing
+/// about them can show that this photo is already lying on its side.
+function renderGeometry(stack) {
+  const rotated = stack.ops.find((o) => opKind(o) === 'rotate');
+  const flippedH = stack.ops.some((o) => opKind(o) === 'flip-horizontal');
+  const flippedV = stack.ops.some((o) => opKind(o) === 'flip-vertical');
+
+  $('dev-flip-h').classList.toggle('on', flippedH);
+  $('dev-flip-v').classList.toggle('on', flippedV);
+
+  const bits = [];
+  if (rotated) bits.push(`${rotated.quarter_turns * 90}°`);
+  if (flippedH) bits.push('mirrored');
+  if (flippedV) bits.push('upside down');
+  $('dev-geometry-state').textContent = bits.join(' · ');
+}
+
 $('develop-reset').addEventListener('click', () => {
   const ids = developTargets();
   if (!ids.length) return;
-  // A reset supersedes everything still queued for these photos.
+  // A reset supersedes everything still queued for these photos — including
+  // presses counted for a rotate that has not been sent yet.
   developPending.clear();
+  developPresses.clear();
   queueDevelop('reset', async () => {
     const n = await invoke('reset_photo_edits', { ids });
     status(`Reset ${n} photo(s) to the original`);
@@ -715,6 +791,7 @@ $('album-create-btn').addEventListener('click', async () => {
 function openAlbumSettings(entry) {
   state.editingAlbum = entry;
   $('settings-album-title').textContent = entry.path;
+  $('set-path').value = entry.path;
   $('set-title').value = entry.title || '';
   $('set-description').value = entry.description || '';
   $('set-sort').value = entry.sort;
@@ -743,6 +820,37 @@ $('share-link-btn').addEventListener('click', async () => {
   }
 });
 
+/// Move the album being edited, once the user has seen what comes with it.
+///
+/// Returns the path it ended up at — the core lowercases and tidies what was
+/// typed, so the rest of the save has to use its answer, not the field's —
+/// or null if the move was declined.
+async function moveEditedAlbum(from, to) {
+  const descendants = state.albums.filter((a) => a.path.startsWith(`${from}/`)).length;
+  const sure = await askConfirm(
+    (descendants
+      ? `${descendants} sub-album${descendants > 1 ? 's move' : ' moves'} with it.\n\n`
+      : '') +
+    'Photos stay in your library. The published copy moves the next time you publish.',
+    {
+      title: `Move "${from}" to "${to}"?`,
+      kind: 'warning',
+      okLabel: 'Move',
+    }
+  );
+  if (!sure) return null;
+
+  const album = await invoke('move_album', { from, to });
+  // Anything still pointing at the old path — the sidebar selection, the album
+  // the grid is showing — has to follow it, or the app is looking at nothing.
+  if (state.currentAlbum === from) {
+    state.currentAlbum = album.path;
+  } else if (state.currentAlbum.startsWith(`${from}/`)) {
+    state.currentAlbum = album.path + state.currentAlbum.slice(from.length);
+  }
+  return album.path;
+}
+
 $('album-save-btn').addEventListener('click', async () => {
   if (!state.editingAlbum) return;
   const password = $('set-password').value.trim();
@@ -759,10 +867,21 @@ $('album-save-btn').addEventListener('click', async () => {
     tags: $('set-tags').value.split(',').map((t) => t.trim()).filter(Boolean),
   };
   try {
-    await invoke('update_album', { path: state.editingAlbum.path, update });
+    // The path field renames or moves the album; everything else is a plain
+    // field update, and has to be applied where the album now lives.
+    let path = state.editingAlbum.path;
+    const typed = $('set-path').value.trim();
+    if (typed && typed !== path) {
+      const moved = await moveEditedAlbum(path, typed);
+      if (!moved) return;
+      path = moved;
+    }
+    await invoke('update_album', { path, update });
     closeModal('settings-album-modal');
-    await refreshAlbums();
-    status('Album saved');
+    await refreshAll();
+    status(path === state.editingAlbum.path
+      ? 'Album saved'
+      : `Moved to ${path} and saved`);
   } catch (err) {
     showError('settings-error', String(err));
   }
@@ -817,6 +936,33 @@ $('add-confirm-btn').addEventListener('click', async () => {
     status(`Added ${n} photo(s) to ${path}`);
   } catch (err) {
     showError('add-error', String(err));
+  }
+});
+
+// Take the selected photos out of the album on screen. An album is a view over
+// the library, so this is a membership change and nothing more — the wording
+// has to leave no room to read it as a delete.
+$('remove-from-album-btn').addEventListener('click', async () => {
+  const path = state.currentAlbum;
+  const ids = [...state.selected];
+  if (!path || !ids.length) return;
+
+  const sure = await askConfirm(
+    `The photo${ids.length > 1 ? 's stay' : ' stays'} in your library and in any ` +
+    `other album — this only takes ${ids.length > 1 ? 'them' : 'it'} out of "${path}".`,
+    {
+      title: `Take ${ids.length} photo${ids.length > 1 ? 's' : ''} out of "${path}"?`,
+      okLabel: 'Take out of album',
+    }
+  );
+  if (!sure) return;
+
+  try {
+    const n = await invoke('remove_from_album', { path, ids });
+    await refreshAll();
+    status(`Removed ${n} photo(s) from ${path} — still in your library`);
+  } catch (err) {
+    status(`Could not remove from ${path}: ${err}`);
   }
 });
 

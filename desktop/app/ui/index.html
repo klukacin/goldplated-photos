@@ -68,6 +68,12 @@
           <div class="spacer"></div>
           <span id="selection-info" class="muted"></span>
           <button id="add-to-album-btn" class="btn btn-sm" disabled>Add to album…</button>
+          <!-- Only means anything while looking at one album; it takes photos
+               out of that album and nowhere else. -->
+          <button id="remove-from-album-btn" class="btn btn-sm" disabled
+                  title="Take the selected photos out of this album. They stay in your library.">
+            Remove from album
+          </button>
         </div>
 
         <div id="grid" class="grid" tabindex="0"></div>
@@ -89,6 +95,15 @@
               Develop
               <span id="develop-scope" class="muted"></span>
             </summary>
+            <!-- Geometry first, as it is applied first: the tone sliders see
+                 the frame these leave behind. -->
+            <div class="geometry" role="group" aria-label="Rotate and flip">
+              <button id="dev-rotate-left" class="btn btn-sm" title="Rotate 90° left">↺</button>
+              <button id="dev-rotate-right" class="btn btn-sm" title="Rotate 90° right">↻</button>
+              <button id="dev-flip-h" class="btn btn-sm" title="Flip left to right">⇋</button>
+              <button id="dev-flip-v" class="btn btn-sm" title="Flip top to bottom">⇵</button>
+              <span id="dev-geometry-state" class="muted"></span>
+            </div>
             <div id="develop-sliders" class="sliders"></div>
             <div class="develop-actions">
               <label class="check"><input type="checkbox" id="dev-bw"> Black &amp; white</label>
@@ -129,6 +144,9 @@
   <div id="settings-album-modal" class="modal" hidden>
     <div class="modal-card">
       <h2 id="settings-album-title">Album settings</h2>
+      <label>Path <small>change it to rename or move the album — sub-albums come along</small>
+        <input type="text" id="set-path" placeholder="2026/weddings/ana-ivan">
+      </label>
       <label>Title <input type="text" id="set-title"></label>
       <label>Description <input type="text" id="set-description"></label>
       <div class="row">

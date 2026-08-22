@@ -188,6 +188,20 @@ impl Session {
         self.edit_each(ids, |stack| stack.set(op.clone()))
     }
 
+    /// Turn each selected photo a further quarter — positive clockwise.
+    ///
+    /// Relative, because the button is: a selection can hold photos at
+    /// different angles, and "rotate right" has to mean the same thing to each
+    /// of them.
+    pub fn rotate_photos(&self, ids: Vec<i64>, quarter_turns: i32) -> Result<usize> {
+        self.edit_each(ids, |stack| stack.rotate_by(quarter_turns))
+    }
+
+    /// Switch a valueless adjustment — a flip — on, or off again, per photo.
+    pub fn toggle_photo_edit(&self, ids: Vec<i64>, op: crate::develop::EditOp) -> Result<usize> {
+        self.edit_each(ids, |stack| stack.toggle(op.clone()))
+    }
+
     /// Drop one adjustment, leaving the rest.
     pub fn clear_photo_edit(&self, ids: Vec<i64>, kind: String) -> Result<usize> {
         self.edit_each(ids, |stack| stack.remove(&kind))
@@ -632,6 +646,92 @@ mod tests {
 
         assert!(Path::new(&s.photo_path(id).unwrap()).exists());
         assert!(Path::new(&s.thumbnail_path(id, "small").unwrap()).exists());
+    }
+
+    /// Rotate is the one adjustment the UI drives relatively, and it has to
+    /// survive the whole round trip: stack, catalog, and a re-render the grid
+    /// can actually point at.
+    #[test]
+    fn rotating_twice_turns_the_photo_half_way_and_re_renders_it() {
+        use crate::develop::EditOp;
+
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a.jpg"), 200, 100);
+
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.import(None, None).unwrap();
+        let id = s.photos(PhotoFilter::default()).unwrap()[0].id;
+        let upright = s.thumbnail_path(id, "medium").unwrap();
+
+        assert_eq!(s.rotate_photos(vec![id], 1).unwrap(), 1);
+        assert_eq!(s.rotate_photos(vec![id], 1).unwrap(), 1);
+        assert_eq!(
+            s.photo_edits(id).unwrap().get("rotate"),
+            Some(&EditOp::Rotate { quarter_turns: 2 })
+        );
+
+        // A new render key, and the thumbnail behind it really exists — this is
+        // what the grid asks for the moment the edit lands.
+        let turned = s.thumbnail_path(id, "medium").unwrap();
+        assert_ne!(turned, upright);
+        assert!(Path::new(&turned).exists());
+
+        // A quarter turn swaps the axes, so this one lands taller than wide.
+        let quarter = s.rotate_photos(vec![id], 1).unwrap();
+        assert_eq!(quarter, 1);
+        let img = image::open(s.thumbnail_path(id, "medium").unwrap()).unwrap();
+        assert!(img.height() > img.width(), "three quarters is on its side");
+
+        // All the way round is no edit at all, back on the original thumbnails.
+        s.rotate_photos(vec![id], 1).unwrap();
+        assert!(s.photo_edits(id).unwrap().is_empty());
+        assert_eq!(s.thumbnail_path(id, "medium").unwrap(), upright);
+    }
+
+    #[test]
+    fn a_flip_comes_off_with_the_same_button() {
+        use crate::develop::EditOp;
+
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a.jpg"), 120, 80);
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.import(None, None).unwrap();
+        let id = s.photos(PhotoFilter::default()).unwrap()[0].id;
+
+        s.toggle_photo_edit(vec![id], EditOp::FlipHorizontal).unwrap();
+        assert!(s.photo_edits(id).unwrap().get("flip-horizontal").is_some());
+        s.toggle_photo_edit(vec![id], EditOp::FlipHorizontal).unwrap();
+        assert!(s.photo_edits(id).unwrap().is_empty());
+    }
+
+    /// Taking a photo out of an album is a membership change, never a deletion —
+    /// the app says so, and the core has to mean it.
+    #[test]
+    fn removing_from_an_album_leaves_the_photo_in_the_library() {
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a.jpg"), 80, 60);
+        write_jpeg(&src.path().join("b.jpg"), 80, 60);
+
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.import(None, None).unwrap();
+        let ids: Vec<i64> = s
+            .photos(PhotoFilter::default())
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+
+        s.create_album(NewAlbum { path: "2026/x".into(), ..Default::default() }).unwrap();
+        s.add_to_album("2026/x".into(), ids.clone()).unwrap();
+        assert_eq!(s.album_photos("2026/x".into()).unwrap().len(), 2);
+
+        assert_eq!(s.remove_from_album("2026/x".into(), vec![ids[0]]).unwrap(), 1);
+        assert_eq!(s.album_photos("2026/x".into()).unwrap().len(), 1);
+        assert_eq!(s.status().unwrap().photo_count, 2, "the file is still catalogued");
+        assert!(Path::new(&s.photo_path(ids[0]).unwrap()).exists(), "and still on disk");
     }
 
     #[test]
