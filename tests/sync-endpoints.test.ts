@@ -346,10 +346,15 @@ describe('sync manifest', () => {
     expect((await manifest()).map((f) => f.path)).toEqual(['real/a.jpg']);
   });
 
-  // KNOWN GAP, not a property: a `scope` that names an existing *file* makes
-  // readdir raise ENOTDIR, which the handler rethrows because it only forgives
-  // ENOENT — the client gets a 500 instead of a 400 or an empty manifest.
-  it.todo('should answer a scope that names a file without a 500');
+  it('answers a scope that names a file with 400, not a 500', async () => {
+    // readdir raises ENOTDIR here, and only ENOENT means "empty manifest". A
+    // client mistake must read as a client mistake.
+    await writeFile(join(CONTENT_ROOT, 'a.jpg'), 'alpha');
+    const url = manifestUrl('a.jpg');
+    const response = await call(manifestGET, new Request(url, { headers: authorized() }), url);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe('Scope is not a folder');
+  });
 });
 
 describe('sync file upload', () => {
@@ -389,16 +394,37 @@ describe('sync file upload', () => {
     expect(left).toEqual([]);
   });
 
-  it('refuses a body over the 512 MB cap with 413', async () => {
+  it('refuses an oversized Content-Length with 413 without reading the body', async () => {
+    // The honest case, and the cheap one: the client says how big it is and is
+    // turned away before a byte is buffered. arrayBuffer() throws here so that
+    // a regression to measuring-after-reading shows up as a failure rather
+    // than as a test that quietly got slower.
+    const request = {
+      headers: authorized(undefined, {
+        'x-content-blake3': hashOf('irrelevant'),
+        'content-length': String(512 * 1024 * 1024 + 1),
+      }),
+      arrayBuffer: async () => {
+        throw new Error('body was read despite an oversized Content-Length');
+      },
+    };
+    const response = await call(filePUT, request, fileUrl('big.bin'));
+    expect(response.status).toBe(413);
+    expect(await exists(join(CONTENT_ROOT, 'big.bin'))).toBe(false);
+  });
+
+  it('refuses an oversized body that declared no length, with 413', async () => {
     // The buffer is allocated but never written to, so the pages are never
     // faulted in: this costs address space, not 512 MB of memory.
     //
-    // Note what this does and does not prove. The handler buffers the whole
-    // body before measuring it, so the cap keeps oversized files out of the
-    // gallery — it does not keep them out of memory.
+    // Note what this does and does not prove, because the Content-Length check
+    // above does not make it obsolete. A client that lies about its length, or
+    // omits it, still has its whole body buffered by arrayBuffer() before this
+    // second check can measure it. The cap keeps oversized files out of the
+    // gallery; it does not keep them out of memory.
     const oversized = new ArrayBuffer(512 * 1024 * 1024 + 1);
     const request = {
-      headers: authorized(),
+      headers: authorized(undefined, { 'x-content-blake3': hashOf('irrelevant') }),
       arrayBuffer: async () => oversized,
     };
     const response = await call(filePUT, request, fileUrl('big.bin'));
@@ -477,23 +503,55 @@ describe('sync file upload', () => {
     expect(response.status).toBe(204);
   });
 
-  // KNOWN GAPS, not properties. Both are reachable from a path that
-  // `safeRelPath` accepts, so a well-formed request produces a 500:
-  //
-  //  - DELETE on a path that is a directory: `fs.rm` without `recursive`
-  //    raises ERR_FS_EISDIR, which nothing catches.
-  //  - DELETE of a *top-level* file: the tidy-up `rmdir(dirname(full))` is
-  //    CONTENT_ROOT itself, so emptying the tree deletes src/content/albums.
-  it.todo('should answer a DELETE of a directory path without a 500');
-  it.todo('should never rmdir the album root when the last top-level file goes');
+  it('answers a DELETE of a directory path with 400, not a 500', async () => {
+    // `2025/wedding` is a well-formed path that safeRelPath accepts, and `rm`
+    // without `recursive` raises EISDIR on it. Sync deletes files; a directory
+    // goes when its last file does.
+    await upload('2025/wedding/a.jpg', 'alpha');
+    const url = fileUrl('2025/wedding');
+    const response = await call(fileDELETE, new Request(url, { method: 'DELETE', headers: authorized() }), url);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe('Path is a directory');
+    expect(await exists(join(CONTENT_ROOT, '2025/wedding/a.jpg'))).toBe(true);
+  });
 
-  it('writes an upload that declares no hash, without recording one', async () => {
-    // Documented as it is, not as one might wish: verification is opt-in per
-    // request. The desktop client always declares a hash, so an upload without
-    // one is written unverified and the manifest re-reads it from disk.
-    expect((await upload('2025/wedding/a.jpg', 'alpha', null)).status).toBe(204);
+  it('never removes the album root when the last top-level file goes', async () => {
+    // The tidy-up rmdir would otherwise be handed CONTENT_ROOT itself, and the
+    // gallery's content collection has no directory left to read.
+    await upload('a.jpg', 'alpha');
+    const url = fileUrl('a.jpg');
+    expect((await call(fileDELETE, new Request(url, { method: 'DELETE', headers: authorized() }), url)).status).toBe(204);
+    expect(await exists(CONTENT_ROOT)).toBe(true);
+  });
+
+  it('never removes the album root even when nothing is left in it at all', async () => {
+    // The reliable trigger, and the one a delete-only sync actually takes:
+    // forgetHash on a key that was never cached leaves `dirty` false, so the
+    // flush writes no .sync-hashes.json and the root is genuinely empty at
+    // rmdir time. Anything that relied on the cache file keeping the root
+    // non-empty would pass the test above and still lose the tree here.
+    await writeFile(join(CONTENT_ROOT, 'a.jpg'), 'alpha');
+    const url = fileUrl('a.jpg');
+    expect((await call(fileDELETE, new Request(url, { method: 'DELETE', headers: authorized() }), url)).status).toBe(204);
+    expect(await exists(CONTENT_ROOT)).toBe(true);
+    expect(await listing(CONTENT_ROOT)).toEqual([]);
+  });
+
+  it('refuses an upload that declares no hash, and writes nothing', async () => {
+    // Verification is not opt-in. If a missing header meant "write it
+    // unverified", the 422 rule above would guard only the clients that chose
+    // to be guarded, and a truncated upload would publish as a photo.
+    const response = await upload('2025/wedding/a.jpg', 'alpha', null);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe('Missing X-Content-Blake3');
+    expect(await exists(join(CONTENT_ROOT, '2025/wedding/a.jpg'))).toBe(false);
+  });
+
+  it('accepts a declared hash in upper-case hex', async () => {
+    // Hex has no case, and a client that spells it in capitals is not sending
+    // corrupt bytes. Rejecting it would be a 422 that says "corruption".
+    expect((await upload('2025/wedding/a.jpg', 'alpha', hashOf('alpha').toUpperCase())).status).toBe(204);
     expect(await readFile(join(CONTENT_ROOT, '2025/wedding/a.jpg'), 'utf8')).toBe('alpha');
-    expect(await manifest()).toEqual([{ path: '2025/wedding/a.jpg', hash: hashOf('alpha') }]);
   });
 });
 
