@@ -224,6 +224,23 @@ impl EditStack {
     /// render key.
     pub fn set(&mut self, op: EditOp) {
         let op = op.clamped();
+
+        // Orientation has exactly one road in, whoever is driving. This setter
+        // is the generic one the C ABI exposes, and a foreign client reaching
+        // geometry through it used to edit the op where it lay — the model that
+        // turned a mirrored photograph the wrong way. Sending "turn right,
+        // mirror, turn right" that way ended at a half turn plus a mirror where
+        // the buttons end at a mirror alone: a different picture, on the same
+        // three instructions.
+        match op {
+            EditOp::Rotate { quarter_turns } => {
+                return self.set_orientation(i32::from(quarter_turns));
+            }
+            // A mirror carries no value, so "set" can only mean "apply it".
+            EditOp::FlipHorizontal | EditOp::FlipVertical => return self.toggle(op),
+            _ => {}
+        }
+
         if op.is_identity() {
             self.ops.retain(|existing| existing.kind() != op.kind());
             return;
@@ -313,6 +330,23 @@ impl EditStack {
     /// carried through whatever framing used to follow it.
     ///
     /// [`set_framing`]: Self::set_framing
+    /// Put the photograph at an absolute number of quarter turns, keeping any
+    /// mirror and carrying the crop through the difference.
+    ///
+    /// The relative form the buttons use is [`rotate_by`](Self::rotate_by);
+    /// this is what an absolute `Rotate` op means when one arrives from a
+    /// caller that tracks the angle itself.
+    fn set_orientation(&mut self, turns: i32) {
+        self.normalize_geometry();
+        let current = self.framing();
+        let delta = turns - current.turns;
+        self.set_framing(Framing {
+            turns: turns.rem_euclid(4),
+            ..current
+        });
+        self.carry_crop(delta, false, false);
+    }
+
     fn normalize_geometry(&mut self) {
         let Some(at) = self.ops.iter().position(|op| op.kind() == "crop") else {
             return;
