@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { siteConfig } from '../../config';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
+import { isSafeMediaPath } from '../../lib/access-core';
 
 export const prerender = false;
 
@@ -26,13 +27,10 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     return new Response('Path required', { status: 400 });
   }
 
-  // Security: Prevent directory traversal
-  if (photoPath.includes('..') || photoPath.startsWith('/') || photoPath.includes('\0')) {
-    return new Response('Invalid path', { status: 400 });
-  }
-
-  // Security: Block metadata files (markdown, .meta cache, dotfiles)
-  if (photoPath.endsWith('.md') || photoPath.split('/').some(s => s.startsWith('.'))) {
+  // Security: shared rule set — traversal, absolute paths, NUL, backslash
+  // (a separator on Windows), dot segments (.meta cache) and markdown
+  // (contains passwords) are all rejected in one place.
+  if (!isSafeMediaPath(photoPath)) {
     return new Response('Not found', { status: 404 });
   }
 

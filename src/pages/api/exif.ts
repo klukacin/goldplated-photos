@@ -3,6 +3,7 @@ import * as exifr from 'exifr';
 import fs from 'fs/promises';
 import path from 'path';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
+import { isSafeMediaPath } from '../../lib/access-core';
 
 export const prerender = false;
 
@@ -20,24 +21,24 @@ export const POST: APIRoute = async ({ request, cookies }) => {
     // Convert URL to file path
     const photoPath = photoUrl.replace('/albums/', '');
 
-    // SECURITY: Block path traversal attempts
-    if (photoPath.includes('..') || photoPath.startsWith('/') || photoPath.includes('\0')) {
-      return new Response(JSON.stringify({ error: 'Invalid path' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // SECURITY: Block metadata files (markdown, .meta cache, dotfiles)
-    if (photoPath.endsWith('.md') || photoPath.split('/').some((s: string) => s.startsWith('.'))) {
+    // SECURITY: shared rule set — traversal, absolute paths, NUL, backslash
+    // (a separator on Windows), dot segments (.meta cache) and markdown
+    // (contains passwords) are all rejected in one place.
+    if (!isSafeMediaPath(photoPath)) {
       return new Response(JSON.stringify({ error: 'Photo not found' }), {
         status: 404,
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // SECURITY: Enforce album access (EXIF can contain GPS coordinates)
-    const access = await resolveFileAccess(photoPath, getAccessCookieValue(cookies));
+    // SECURITY: Enforce album access (EXIF can contain GPS coordinates).
+    // Same token sources as the other media routes: ?token= or X-Album-Token.
+    const url = new URL(request.url);
+    const access = await resolveFileAccess(
+      photoPath,
+      getAccessCookieValue(cookies),
+      url.searchParams.get('token') || request.headers.get('X-Album-Token')
+    );
     if (!access.hasAccess) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), {
         status: 401,
