@@ -169,20 +169,45 @@ function linkedPackages() {
   return found;
 }
 
+// -sys crates that may link native code, each with the native licence stated.
+//
+// This list exists because cargo metadata describes the *binding*, not the C
+// library behind it: libheif-rs is MIT while libheif itself is LGPL-3.0, so a
+// plain licence check waves the wrapper through and ships copyleft C code
+// underneath it. Native code enters a Rust tree through `-sys` crates, so any
+// `-sys` crate not named here fails the check until a person has looked at
+// what it actually links and written the answer down.
+export const NATIVE_SYS_ALLOWED = new Map([
+  // Bundles SQLite itself — public domain.
+  ['libsqlite3-sys', 'SQLite: public domain (bundled)'],
+  // Bindings to Apple's OS frameworks; the OS provides the code, nothing is
+  // shipped or statically linked.
+  ['core-foundation-sys', 'Apple system framework (OS-provided)'],
+  ['security-framework-sys', 'Apple system framework (OS-provided)'],
+]);
+
+/** True when a crate either links no native code or its native side is vetted. */
+export function nativeSideVetted(pkg) {
+  return !pkg.endsWith('-sys') || NATIVE_SYS_ALLOWED.has(pkg);
+}
+
 function main() {
   const packages = linkedPackages();
   const offenders = [];
   const unknown = [];
+  const unvettedNative = [];
 
   for (const [pkg, { licence, targets }] of packages) {
     if (!licence || licence === '(unknown)') {
       unknown.push({ pkg, targets });
     } else if (!acceptable(licence)) {
       offenders.push({ pkg, licence, targets });
+    } else if (!nativeSideVetted(pkg)) {
+      unvettedNative.push({ pkg, licence, targets });
     }
   }
 
-  if (offenders.length || unknown.length) {
+  if (offenders.length || unknown.length || unvettedNative.length) {
     console.error('Licence policy violated.\n');
     for (const { pkg, licence, targets } of offenders) {
       console.error(`  ${pkg}`);
@@ -191,6 +216,13 @@ function main() {
     }
     for (const { pkg, targets } of unknown) {
       console.error(`  ${pkg}\n    no licence declared\n    linked on: ${[...targets].join(', ')}\n`);
+    }
+    for (const { pkg, licence, targets } of unvettedNative) {
+      console.error(`  ${pkg}`);
+      console.error(`    binding licence ${licence}, but the native code behind a -sys crate`);
+      console.error(`    carries its own licence which cargo cannot see. Look at what it`);
+      console.error(`    links, then add it to NATIVE_SYS_ALLOWED with the answer.`);
+      console.error(`    linked on: ${[...targets].join(', ')}\n`);
     }
     console.error(
       'Allowed: ' + [...ALLOWED].join(', ') + '\n' +
