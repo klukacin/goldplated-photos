@@ -70,3 +70,10 @@ docs/site/
 
 # Agent worktrees live here; they are full checkouts of other branches.
 .claude/worktrees/
+
+# Test fixtures are not personal photos — without these negations the *.heic
+# and *.webp ignores above silently drop them from the repo, and CI fails on
+# files that exist on every dev machine (the same way the app icons once
+# vanished under *.png).
+!desktop/crates/gpp-core/tests/fixtures/*.heic
+!desktop/crates/gpp-core/tests/fixtures/*.webp
