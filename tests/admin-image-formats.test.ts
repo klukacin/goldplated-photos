@@ -84,6 +84,13 @@ beforeAll(async () => {
 
   landingBackup = await fs.readFile(LANDING_BG).catch(() => null);
 
+  // A crashed earlier run skips afterAll and leaves its uploads behind — and
+  // *.heic is gitignored, so git status shows a clean tree over a dirty one.
+  // The refusal tests assert the file does NOT exist, so a stale one fails
+  // them forever until someone thinks to look on disk. Start clean instead.
+  await fs.rm(path.join(HERO_DIR, 'sunset.heic'), { force: true });
+  await fs.rm(path.join(PROJECT_ROOT, 'public/home/cards/card.heic'), { force: true });
+
   await fs.mkdir(ALBUM_DIR, { recursive: true });
   await fs.writeFile(path.join(ALBUM_DIR, 'index.md'), '---\ntitle: "Format test"\nhidden: true\n---\n');
 

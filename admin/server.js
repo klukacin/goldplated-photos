@@ -8,6 +8,12 @@ import { fileURLToPath } from 'url';
 import { dirname, join, extname, basename, resolve, sep } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, rmSync } from 'fs';
 import crypto from 'crypto';
+import {
+  resolveFeatures,
+  imageExtensionsFor,
+  BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+  VIDEO_EXTENSIONS
+} from '../src/site-features.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,6 +27,11 @@ const PUBLIC_DIR = join(PROJECT_ROOT, 'public');
 try {
   process.loadEnvFile(join(PROJECT_ROOT, '.env'));
 } catch { /* no .env — fine */ }
+
+// Feature flags, resolved here rather than taken from the module's singleton:
+// imports run before loadEnvFile above, so the singleton would miss FEATURE_*
+// values that live in .env instead of the shell environment.
+const features = resolveFeatures(process.env);
 
 const app = express();
 // 4444 unless told otherwise. Overridable so a test can take a free port
@@ -114,22 +125,18 @@ function sanitizePath(inputPath) {
   return inputPath.split('/').map(segment => segment.toLowerCase()).join('/');
 }
 
-// Helper: Get file extensions
-const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
-const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
-
-// The subset a browser can paint on its own.
+// File extension lists, from the same shared module the gallery reads
+// (src/site-features.mjs) — so the FEATURE_HEIC flag moves the admin's upload
+// filter and the gallery's discovery together, and nothing is hand-copied.
 //
 // Album photos may be any of IMAGE_EXTENSIONS: the gallery only ever shows
 // them through /api/thumbnail, which converts to JPEG or WebP. Public assets —
 // hero slides, home cards, the landing background — are served raw out of
 // public/, with no conversion anywhere in the chain, so HEIC/HEIF there is a
 // hero slider that renders on the photographer's Safari and nowhere else.
-// Chrome and Firefox cannot decode HEIC at all.
-//
-// Kept in step with src/lib/image-formats.ts (unit-tested there); this file is
-// plain Node ESM and cannot import the TypeScript module.
-const BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+// Chrome and Firefox cannot decode HEIC at all — which is why
+// BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS is a constant no flag can widen.
+const IMAGE_EXTENSIONS = imageExtensionsFor(features);
 
 // Multer setup for file uploads
 const storage = multer.diskStorage({
@@ -1362,11 +1369,18 @@ app.get('/api/share-token', (req, res) => {
   res.json({ shareToken: generateShareToken() });
 });
 
-// GET /api/config - Admin-relevant configuration for the frontend
+// GET /api/config - Admin-relevant configuration for the frontend.
+// The extension lists ride along because admin/js/* are classic <script>s
+// that cannot import src/site-features.mjs — this endpoint is how the shared
+// module's computed values reach the browser side of the admin.
 app.get('/api/config', (req, res) => {
   res.json({
     previewUrl: process.env.ADMIN_PREVIEW_URL || 'http://localhost:4321',
-    siteUrl: process.env.SITE_URL || null
+    siteUrl: process.env.SITE_URL || null,
+    features,
+    imageExtensions: IMAGE_EXTENSIONS,
+    browserDisplayableImageExtensions: BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+    videoExtensions: VIDEO_EXTENSIONS
   });
 });
 

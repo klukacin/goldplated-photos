@@ -761,6 +761,9 @@ function syncCropUi() {
 }
 
 function enterCrop() {
+  // The switch's second half (see features.js): the button is hidden at boot,
+  // but a shortcut or a stray listener could still land here.
+  if (!FEATURES.crop) return;
   const ids = developTargets();
   if (!ids.length || state.cursor < 0) return;
 
@@ -837,6 +840,14 @@ $('dev-crop').addEventListener('click', () => (cropMode.active ? cancelCrop() : 
 $('crop-apply').addEventListener('click', applyCrop);
 $('crop-cancel').addEventListener('click', cancelCrop);
 $('crop-remove').addEventListener('click', removeCrop);
+
+// The crop switch (features.js). Hiding the button is the visible half; the
+// early return in enterCrop is what holds when something else still reaches
+// for the tool. The action row and overlay start hidden in the markup and only
+// enterCrop un-hides them, so cutting the entry cuts everything. A crop a
+// photo already carries still renders — the switch removes the tool, not the
+// photographer's framing.
+if (!FEATURES.crop) $('dev-crop').hidden = true;
 
 // A new preview is a new picture box, and while cropping the rectangle has to
 // follow it. Without this the overlay keeps the previous photo's dimensions

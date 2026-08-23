@@ -7,6 +7,7 @@ fn main() {
         "../ui/index.html",
         "../ui/app.js",
         "../ui/develop-queue.js",
+        "../ui/features.js",
         "../ui/style.css",
     ] {
         println!("cargo:rerun-if-changed={asset}");

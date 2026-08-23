@@ -106,17 +106,25 @@ if (publicAlbumsWithCovers.length > 0 && publicAlbumsWithCovers[0].coverPhotoUrl
       </select>
     </div>
 
-    <form class="album-search" method="GET" action="/photos/search" role="search">
-      <input
-        type="search"
-        id="album-search-input"
-        name="q"
-        placeholder="Filter albums… (Enter searches photos too)"
-        aria-label="Filter albums by name, description or tag; press Enter to search individual photos"
-        autocomplete="off"
-      />
-    </form>
-    <p id="album-search-empty" class="search-empty" hidden>No albums match — press Enter to search individual photos.</p>
+    {/* This page is prerendered, so FEATURE_SEARCH is read at build time —
+        a flag change shows up here on the next build. The /photos/search
+        route itself is SSR and 404s at the next server start. The client
+        script below already guards on the input's existence. */}
+    {siteConfig.features.search && (
+      <>
+        <form class="album-search" method="GET" action="/photos/search" role="search">
+          <input
+            type="search"
+            id="album-search-input"
+            name="q"
+            placeholder="Filter albums… (Enter searches photos too)"
+            aria-label="Filter albums by name, description or tag; press Enter to search individual photos"
+            autocomplete="off"
+          />
+        </form>
+        <p id="album-search-empty" class="search-empty" hidden>No albums match — press Enter to search individual photos.</p>
+      </>
+    )}
 
     <div id="album-grid" data-view="public">
       <AlbumGrid albums={publicAlbumsWithCovers} />

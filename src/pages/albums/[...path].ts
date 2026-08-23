@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { lookup } from 'mrmime';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
+import { isDisabledImageFormat } from '../../lib/image-formats';
 
 export const prerender = false;
 
@@ -22,6 +23,12 @@ export const GET: APIRoute = async ({ params, url, cookies }) => {
   // and any dotfile/dot-directory segment
   const segments = photoPath.split('/');
   if (photoPath.endsWith('.md') || segments.some(s => s.startsWith('.'))) {
+    return new Response('Not found', { status: 404 });
+  }
+
+  // A format the feature flags have disabled (FEATURE_HEIC=0) is invisible:
+  // discovery skips it, and this route must not serve it to a remembered URL.
+  if (isDisabledImageFormat(photoPath)) {
     return new Response('Not found', { status: 404 });
   }
 

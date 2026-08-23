@@ -4,6 +4,7 @@ import path from 'path';
 import { getAlbumByPath, getPhotosForAlbum } from '../../lib/albums';
 import { resolveAlbumAccess, getAccessCookieValue, getClientIp } from '../../lib/access';
 import { validateProofingPayload, submissionFilename, type ProofingSubmission } from '../../lib/proofing';
+import { siteConfig } from '../../config';
 
 export const prerender = false;
 
@@ -34,6 +35,12 @@ function jsonError(message: string, status: number): Response {
 }
 
 export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
+  // Global kill-switch over the per-album setting: with FEATURE_PROOFING off
+  // the route does not exist, whatever any album's frontmatter says. 404, not
+  // 403 — a disabled feature should not confirm what would otherwise be here.
+  if (!siteConfig.features.proofing) {
+    return jsonError('Not found', 404);
+  }
   try {
     // Cap the payload before parsing
     const raw = await request.text();

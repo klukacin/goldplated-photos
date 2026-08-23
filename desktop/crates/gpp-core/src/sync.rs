@@ -471,24 +471,6 @@ impl Library {
             Ok(())
         })
     }
-
-    /// Persist an entire agreed manifest in one transaction.
-    pub fn record_synced_all(&self, manifest: &Manifest) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        self.with_tx(|tx| {
-            let mut stmt = tx.prepare(
-                "INSERT INTO sync_state(entity_kind, entity_key, synced_hash, last_synced_at) \
-                 VALUES(?1, ?2, ?3, ?4) \
-                 ON CONFLICT(entity_kind, entity_key) DO UPDATE SET \
-                   synced_hash = excluded.synced_hash, \
-                   last_synced_at = excluded.last_synced_at",
-            )?;
-            for (path, hash) in manifest {
-                stmt.execute(params![ENTITY_FILE, path, hash, now])?;
-            }
-            Ok(())
-        })
-    }
 }
 
 /// Outcome of applying a plan.
@@ -527,7 +509,7 @@ pub struct SyncOutcome {
 /// geometrically, so one-at-a-time leaves most of an upstream link idle no
 /// matter how fast it is. Parallel flows ramp independently and fill it. Four
 /// to eight is the useful band — rclone defaults to four — and above that you
-/// mostly buy packet loss. See UPLOAD-TRANSPORT.md §5.
+/// mostly buy packet loss. See dev-docs/sync-transport.md §5.
 pub const TRANSFER_CONCURRENCY: usize = 6;
 
 /// What one change turned into. Collected in parallel, folded in order.
@@ -1489,7 +1471,7 @@ mod direction_tests {
 
 /// The server half of a sync, over plain HTTP.
 ///
-/// Three deliberate choices, all argued in `desktop/UPLOAD-TRANSPORT.md`:
+/// Three deliberate choices, all argued in `dev-docs/sync-transport.md`:
 ///
 /// **HTTP/1.1, pinned.** Stock Apache and nginx both cap an HTTP/2 request body
 /// at a 64 KB flow-control window, which puts a per-stream ceiling of
@@ -1510,9 +1492,6 @@ pub struct HttpTransport {
     base: String,
     /// Shared secret proving this client may write. Sent as a bearer token.
     token: String,
-    /// Restricts every request to one subtree, so a misconfigured client cannot
-    /// enumerate or overwrite the whole gallery.
-    scope: Option<String>,
 }
 
 /// One entry of the manifest the server returns.
@@ -1539,14 +1518,7 @@ impl HttpTransport {
             agent: config.into(),
             base: base.into().trim_end_matches('/').to_string(),
             token: token.into(),
-            scope: None,
         }
-    }
-
-    /// Limit every request to one album subtree.
-    pub fn scoped(mut self, prefix: impl Into<String>) -> Self {
-        self.scope = Some(prefix.into());
-        self
     }
 
     fn url(&self, suffix: &str) -> String {
@@ -1560,13 +1532,9 @@ impl HttpTransport {
 
 impl RemoteTransport for HttpTransport {
     fn manifest(&self) -> Result<Manifest> {
-        let mut url = self.url("manifest");
-        if let Some(scope) = &self.scope {
-            url = format!("{url}?scope={}", urlencode(scope));
-        }
         let body: ManifestResponse = self
             .agent
-            .get(&url)
+            .get(&self.url("manifest"))
             .header("Authorization", self.auth())
             .call()
             .map_err(http_error)?
