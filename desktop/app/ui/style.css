@@ -275,12 +275,58 @@ input:focus-visible, select:focus-visible, button:focus-visible {
    twice as tall as it was wide, and an uncapped preview pushed the filename,
    the stars and every adjustment below the fold — so the control you had just
    used to rotate it scrolled out from under the pointer. */
+.inspector-frame { position: relative; }
 .inspector-img {
   width: 100%;
   max-height: 40vh;
   object-fit: contain;
   display: block;
   background: #0e0e11;
+}
+
+/* Crop. The overlay is sized by JS to the picture the preview actually draws —
+   `object-fit: contain` leaves bars on one axis, and a rectangle laid over the
+   element box instead would name a different part of the photograph than the
+   one under the pointer. */
+.crop-overlay {
+  position: absolute;
+  overflow: hidden;
+  /* Without this a drag on a touch screen scrolls the inspector instead. */
+  touch-action: none;
+  /* A press that starts here must not begin a text selection: a drag then
+     leaves half the panel highlighted in blue and the rectangle never moves. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* The dimming is the rectangle's own shadow, clipped by the overlay. One
+   element, so the dark area can never drift out of step with the bright one. */
+.crop-rect {
+  position: absolute;
+  cursor: move;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.62);
+}
+/* Wholly inside the rectangle, not straddling its corners. The overlay clips
+   to the picture, so a handle hanging outside the rectangle at the edge of the
+   frame is half cut away — and the half that is gone is the half the pointer
+   reaches for, which makes the outermost corners impossible to grab. */
+.crop-handle {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+.crop-handle.nw { left: -1px; top: -1px; cursor: nwse-resize; }
+.crop-handle.ne { right: -1px; top: -1px; cursor: nesw-resize; }
+.crop-handle.sw { left: -1px; bottom: -1px; cursor: nesw-resize; }
+.crop-handle.se { right: -1px; bottom: -1px; cursor: nwse-resize; }
+
+.crop-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
 }
 .inspector-body { padding: 0.9rem; }
 .inspector-body h3 {

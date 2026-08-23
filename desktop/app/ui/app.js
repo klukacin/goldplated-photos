@@ -64,8 +64,13 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
+  if (e.key !== 'Escape') return;
+  // A dialog is in front of everything, so it goes first; only once nothing is
+  // open does Escape mean "stop framing".
+  if (modalIsOpen()) {
     document.querySelectorAll('.modal:not([hidden])').forEach((m) => (m.hidden = true));
+  } else if (cropMode.active) {
+    cancelCrop();
   }
 });
 
@@ -398,6 +403,11 @@ async function showInspector(photo) {
   panel.hidden = false;
   $('inspector-name').textContent = photo.filename;
 
+  // Framing is about one picture. Moving to another leaves the rectangle
+  // describing a frame that is no longer on screen, so put back whatever crop
+  // the photo being left had and close the tool.
+  if (cropMode.active && photo.id !== cropMode.photoId) cancelCrop();
+
   try {
     const p = await invoke('thumbnail_path', { id: photo.id, size: 'medium' });
     if (generation !== inspectorGeneration) return;
@@ -588,6 +598,12 @@ $('dev-bw').addEventListener('change', (e) => {
 function rotate(quarterTurns) {
   const ids = developTargets();
   if (!ids.length) return;
+  // An applied crop is carried through the turn by the core, but the rectangle
+  // being dragged right now is not: it is fractions of the frame on screen, and
+  // that frame is about to become a different shape. Close the tool rather than
+  // commit it to a framing the photographer never saw. Cancel queues the
+  // restore first, so the crop goes back before the turn is sent.
+  if (cropMode.active) cancelCrop();
   developQueue.queueRelative(`rotate${quarterTurns}`, ids, async (targets, presses) => {
     const n = await invoke('rotate_photos', {
       ids: targets,
@@ -600,6 +616,7 @@ function rotate(quarterTurns) {
 function flip(kind, label) {
   const ids = developTargets();
   if (!ids.length) return;
+  if (cropMode.active) cancelCrop();
   developQueue.queueRelative(kind, ids, async (targets, presses) => {
     // An even number of presses is back where it started, so there is nothing
     // to send — a flip has no value, only a state to switch.
@@ -647,15 +664,262 @@ function renderGeometry(stack) {
   $('dev-flip-h').classList.toggle('on', mirrored);
   $('dev-flip-v').classList.toggle('on', mirrored);
 
+  currentCrop = stack.ops.find((o) => opKind(o) === 'crop') || null;
+  syncCropUi();
+
   const bits = [];
   if (turns) bits.push(`${turns * 90}°`);
   if (mirrored) bits.push('mirrored');
+  if (currentCrop) bits.push('cropped');
   $('dev-geometry-state').textContent = bits.join(' · ');
+}
+
+// ------------------------------------------------------------------- crop
+//
+// The core takes a crop as four fractions of the frame *after* rotation and
+// flips — which is exactly the frame the inspector preview shows, so the
+// rectangle can be read straight off the picture on screen. Two things make
+// that less obvious than it sounds, and both name the wrong part of the
+// photograph when got wrong:
+//
+//  - The preview is `object-fit: contain` in a box capped at 40vh, so the
+//    drawn picture is usually smaller than the element and letterboxed on one
+//    axis. Fractions of the element box are not fractions of the photograph.
+//  - A photo that already carries a crop *renders cropped*, so its preview is
+//    no longer the frame those fractions are measured against. Opening the
+//    tool therefore takes the crop off first and reopens the rectangle where
+//    it stood; Cancel puts it back.
+
+/// The smallest side the rectangle may be dragged to, as a fraction of the
+/// frame. A zero-width crop is not a picture, and the core would clamp it to
+/// something arbitrary rather than refuse it.
+const MIN_CROP = 0.02;
+
+/// The crop on the photo the inspector is showing, as last read from the core.
+/// Read by `syncCropUi`, so the Crop button carries the state the way the flip
+/// buttons do — nothing about a cropped photo looks wrong on its own.
+let currentCrop = null;
+
+const cropMode = {
+  active: false,
+  /// Which photo the rectangle was drawn on. Everything else may be selected
+  /// too, but this is the one the user is looking at.
+  photoId: null,
+  ids: [],
+  /// The rectangle being dragged, in fractions of the whole frame.
+  rect: null,
+  /// The crop that was on the photo when the tool opened, for Cancel.
+  restore: null,
+};
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/// Where the picture actually sits inside the img element, in the element's own
+/// coordinates. `object-fit: contain` centres it and leaves bars on one axis.
+function drawnPictureBox() {
+  const img = $('inspector-img');
+  const { naturalWidth: nw, naturalHeight: nh } = img;
+  const box = img.getBoundingClientRect();
+  if (!nw || !nh || !box.width || !box.height) return null;
+  const scale = Math.min(box.width / nw, box.height / nh);
+  const w = nw * scale;
+  const h = nh * scale;
+  return { left: (box.width - w) / 2, top: (box.height - h) / 2, width: w, height: h };
+}
+
+/// Lay the overlay over the picture and the rectangle over the overlay. Called
+/// again on every drag, on every preview that loads, and on resize: 40vh is a
+/// window measurement, so the picture changes size without the photo changing.
+function positionCropOverlay() {
+  if (!cropMode.active) return;
+  const overlay = $('crop-overlay');
+  const pic = drawnPictureBox();
+  if (!pic) {
+    overlay.hidden = true;
+    return;
+  }
+  overlay.hidden = false;
+  overlay.style.left = `${pic.left}px`;
+  overlay.style.top = `${pic.top}px`;
+  overlay.style.width = `${pic.width}px`;
+  overlay.style.height = `${pic.height}px`;
+
+  const r = cropMode.rect;
+  const rect = $('crop-rect');
+  rect.style.left = `${r.x * pic.width}px`;
+  rect.style.top = `${r.y * pic.height}px`;
+  rect.style.width = `${r.w * pic.width}px`;
+  rect.style.height = `${r.h * pic.height}px`;
+  $('crop-readout').textContent = `${Math.round(r.w * 100)}% × ${Math.round(r.h * 100)}%`;
+}
+
+function syncCropUi() {
+  $('crop-overlay').hidden = !cropMode.active;
+  $('crop-actions').hidden = !cropMode.active;
+  $('crop-remove').hidden = !cropMode.restore;
+  $('dev-crop').classList.toggle('on', cropMode.active || Boolean(currentCrop));
+}
+
+function enterCrop() {
+  const ids = developTargets();
+  if (!ids.length || state.cursor < 0) return;
+
+  cropMode.active = true;
+  cropMode.photoId = state.photos[state.cursor].id;
+  cropMode.ids = ids;
+  cropMode.restore = currentCrop;
+  cropMode.rect = currentCrop
+    ? { x: currentCrop.x, y: currentCrop.y, w: currentCrop.w, h: currentCrop.h }
+    : { x: 0, y: 0, w: 1, h: 1 };
+
+  // Take the crop off while framing so the preview is the whole frame again.
+  // The queue then repaints the inspector, and the `load` handler puts the
+  // rectangle back over the picture at its new size.
+  if (cropMode.restore) {
+    developQueue.queue('crop', ids, async () => {
+      await invoke('clear_photo_edit', { ids, kind: 'crop' });
+    });
+  }
+  syncCropUi();
+  positionCropOverlay();
+  status('Drag the rectangle or its corners, then Apply.');
+}
+
+/// Close the tool. Callers decide what, if anything, to send to the core.
+function closeCrop() {
+  const { ids, restore } = cropMode;
+  cropMode.active = false;
+  cropMode.photoId = null;
+  cropMode.ids = [];
+  cropMode.rect = null;
+  cropMode.restore = null;
+  syncCropUi();
+  return { ids, restore };
+}
+
+function applyCrop() {
+  const rect = { ...cropMode.rect };
+  const { ids } = closeCrop();
+  developQueue.queue('crop', ids, async () => {
+    // A rectangle still covering the whole frame is an identity op, which the
+    // core drops — so dragging nothing and pressing Apply removes the crop
+    // rather than storing a no-op and a pointless new render key.
+    const n = await invoke('set_photo_edit', { ids, op: { op: 'crop', ...rect } });
+    status(n ? `Cropped ${n} photo(s)` : 'No change');
+  });
+}
+
+function cancelCrop() {
+  const { ids, restore } = closeCrop();
+  if (!restore) {
+    // Nothing was taken off, so nothing has to go back — and no repaint either.
+    status('Crop cancelled');
+    return;
+  }
+  developQueue.queue('crop', ids, async () => {
+    const { x, y, w, h } = restore;
+    await invoke('set_photo_edit', { ids, op: { op: 'crop', x, y, w, h } });
+    status('Crop left as it was');
+  });
+}
+
+function removeCrop() {
+  const { ids } = closeCrop();
+  // Opening the tool already cleared it; this clear is what makes leaving it
+  // cleared deliberate rather than a side effect nobody asked for.
+  developQueue.queue('crop', ids, async () => {
+    await invoke('clear_photo_edit', { ids, kind: 'crop' });
+    status(`Removed the crop from ${ids.length} photo(s)`);
+  });
+}
+
+$('dev-crop').addEventListener('click', () => (cropMode.active ? cancelCrop() : enterCrop()));
+$('crop-apply').addEventListener('click', applyCrop);
+$('crop-cancel').addEventListener('click', cancelCrop);
+$('crop-remove').addEventListener('click', removeCrop);
+
+// A new preview is a new picture box, and while cropping the rectangle has to
+// follow it. Without this the overlay keeps the previous photo's dimensions
+// after the tool takes an existing crop off.
+$('inspector-img').addEventListener('load', positionCropOverlay);
+window.addEventListener('resize', positionCropOverlay);
+
+$('crop-overlay').addEventListener('pointerdown', (e) => {
+  if (!cropMode.active) return;
+  // Nothing inside the overlay is a native gesture, and the webview's default
+  // for a press-and-drag is to select text.
+  e.preventDefault();
+
+  const handle = e.target.dataset.handle || null;
+  // A press on the dimmed area is not a drag. Treating it as one would jump the
+  // frame to wherever the pointer happened to land.
+  if (!handle && !e.target.closest('.crop-rect')) return;
+
+  const overlay = $('crop-overlay');
+  const box = overlay.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+
+  const at = (ev) => ({
+    x: clamp((ev.clientX - box.left) / box.width, 0, 1),
+    y: clamp((ev.clientY - box.top) / box.height, 0, 1),
+  });
+  const start = { ...cropMode.rect };
+  const origin = at(e);
+
+  // Capture, or a drag that leaves the small preview stops reporting and the
+  // rectangle freezes halfway through the gesture.
+  overlay.setPointerCapture(e.pointerId);
+  const onMove = (ev) => {
+    const p = at(ev);
+    cropMode.rect = handle
+      ? resizeCropRect(start, handle, p)
+      : moveCropRect(start, p.x - origin.x, p.y - origin.y);
+    positionCropOverlay();
+  };
+  const onUp = () => {
+    overlay.removeEventListener('pointermove', onMove);
+    overlay.removeEventListener('pointerup', onUp);
+    overlay.removeEventListener('pointercancel', onUp);
+  };
+  overlay.addEventListener('pointermove', onMove);
+  overlay.addEventListener('pointerup', onUp);
+  overlay.addEventListener('pointercancel', onUp);
+});
+
+/// Slide the rectangle, keeping every edge on the picture. A crop that hangs
+/// off the frame is not one the core can express; it would clamp it to some
+/// other rectangle and crop a part of the photograph nobody chose.
+function moveCropRect(start, dx, dy) {
+  return {
+    x: clamp(start.x + dx, 0, 1 - start.w),
+    y: clamp(start.y + dy, 0, 1 - start.h),
+    w: start.w,
+    h: start.h,
+  };
+}
+
+/// Drag one corner; the opposite one is pinned. Clamping against that pinned
+/// corner is what stops the rectangle collapsing to nothing or turning inside
+/// out as the pointer crosses it.
+function resizeCropRect(start, handle, p) {
+  const west = handle[1] === 'w';
+  const north = handle[0] === 'n';
+  const right = start.x + start.w;
+  const bottom = start.y + start.h;
+
+  const x0 = west ? Math.min(p.x, right - MIN_CROP) : start.x;
+  const x1 = west ? right : Math.max(p.x, start.x + MIN_CROP);
+  const y0 = north ? Math.min(p.y, bottom - MIN_CROP) : start.y;
+  const y1 = north ? bottom : Math.max(p.y, start.y + MIN_CROP);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 $('develop-reset').addEventListener('click', () => {
   const ids = developTargets();
   if (!ids.length) return;
+  // Closing the tool first, without restoring: a reset is about to take the
+  // crop off anyway, and putting it back on the way out would race the reset.
+  if (cropMode.active) closeCrop();
   // A reset supersedes everything still queued for these photos — including
   // presses counted for a rotate that has not been sent yet. Only for these
   // photos: clearing the whole queue would throw away an adjustment someone
