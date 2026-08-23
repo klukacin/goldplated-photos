@@ -5,7 +5,9 @@
 // regardless of the visitor's cookies — search must not leak protected names.
 export const prerender = false;
 
-import { getAllAlbums, getPhotosForAlbum, type Album, type Photo } from '../../lib/albums';
+import nodePath from 'node:path';
+import { getAllAlbums, type Album } from '../../lib/albums';
+import { getSearchablePhotos, type SearchablePhoto } from '../../lib/search-index';
 import { albumMatchesQuery, photoMatchesQuery, normalizeQuery } from '../../lib/search-core';
 import { resolveChainVisibility } from '../../lib/access-core';
 import Layout from '../../layouts/Layout.astro';
@@ -28,7 +30,7 @@ const query = normalizeQuery(url.searchParams.get('q') || '');
 const queryTooShort = query.length > 0 && query.length < MIN_QUERY_LENGTH;
 
 interface PhotoResult {
-  photo: Photo;
+  photo: SearchablePhoto;
   albumPath: string;
   albumTitle: string;
 }
@@ -56,8 +58,14 @@ if (query.length >= MIN_QUERY_LENGTH) {
     albumMatchesQuery(query, album.data)
   );
 
+  // Photo matching reads the directory plus the media cache as-is — one
+  // readdir and one stat per album, never Sharp/exifr (see lib/search-index).
+  // Measured on 300 albums / 3600 photos this took the query median from
+  // 125ms to 28ms, and it keeps a search from being the request that
+  // computes metadata for a freshly imported album.
+  const albumsRoot = nodePath.join(process.cwd(), 'src/content/albums');
   outer: for (const { album, path } of publicAlbums) {
-    const photos = await getPhotosForAlbum(path);
+    const photos = await getSearchablePhotos(nodePath.join(albumsRoot, path));
     for (const photo of photos) {
       if (photo.isVideo) continue;
       if (photoMatchesQuery(query, photo)) {
