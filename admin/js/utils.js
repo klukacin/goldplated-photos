@@ -221,6 +221,39 @@ function getAlbumImageUrl(albumPath, filename) {
   return `/albums/${albumPath}/${filename}`;
 }
 
+// The gallery's thumbnail endpoint, on the dev server. The admin panel has no
+// image pipeline of its own; it borrows :4321's, which is also what already
+// fills the photo grid.
+function getPreviewThumbnailUrl(albumPath, filename, size = 'large') {
+  return `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(`${albumPath}/${filename}`)}&size=${size}`;
+}
+
+// Which image formats a browser can paint.
+//
+// Chrome and Firefox cannot decode HEIC — only Safari can. The photographer
+// uploads straight off an iPhone, so pointing an <img> at the original file
+// gives most of them a broken-image icon while it looks fine on a Mac. Every
+// admin preview therefore goes through the dev server's thumbnail endpoint,
+// which converts to JPEG/WebP, and never falls back to a raw .heic.
+//
+// Kept in step with src/lib/image-formats.ts (unit-tested there) — this file
+// is a classic <script>, so it cannot import the TypeScript module.
+const BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+
+function isBrowserDisplayableImage(filenameOrUrl) {
+  if (!filenameOrUrl) return false;
+  const base = filenameOrUrl.split(/[?#]/)[0];
+  const name = base.slice(base.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS.includes(name.slice(dot).toLowerCase());
+}
+
+// The original when the browser can render it, the transcode when it cannot.
+function browserSafeImageUrl(originalUrl, transcodedUrl) {
+  return isBrowserDisplayableImage(originalUrl) ? originalUrl : transcodedUrl;
+}
+
 // Initialize close buttons for all modals
 function initModals() {
   document.querySelectorAll('.modal-close, .modal-cancel').forEach(btn => {
