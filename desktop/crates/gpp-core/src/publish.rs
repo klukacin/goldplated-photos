@@ -192,12 +192,29 @@ pub fn publish_album(
             // What ships is the developed photo. With no adjustments this is the
             // original file itself — no copy, no render, nothing cached.
             let original = lib.resolve(&photo.rel_path)?;
-            let src = crate::develop::ensure_rendered(
+            let src = match crate::develop::ensure_rendered(
                 &original,
                 &lib.thumb_dir(),
                 photo,
                 &lib.edits(photo.id)?,
-            )?;
+            ) {
+                Ok(src) => src,
+                // Rendering means opening the original, so the two losses the
+                // unedited path already survives — a drive unplugged, a file
+                // gone unreadable — arrive here as an error instead the moment
+                // a photo carries an adjustment. One bad frame in a developed
+                // wedding must not stop the other four hundred from reaching
+                // the client; the album says which one it was.
+                Err(e) => {
+                    if original.exists() {
+                        tracing::warn!(photo = %photo.rel_path, error = %e, "develop failed");
+                        result.unrenderable.push(photo.rel_path.clone());
+                    } else {
+                        result.missing.push(photo.rel_path.clone());
+                    }
+                    continue;
+                }
+            };
             let dest = album_dir.join(&photo.filename);
 
             // Skip when destination already matches by size — cheap and
@@ -216,8 +233,11 @@ pub fn publish_album(
                 continue;
             }
 
-            std::fs::copy(&src, &dest).map_err(|e| Error::io(&src, e))?;
-            result.bytes_copied += photo.file_size.max(0) as u64;
+            // Count what the copy actually wrote. The catalog's `file_size` is
+            // the *original's*, and what ships is the developed frame — on a
+            // delivered album, mostly a crop — so charging the original's bytes
+            // reported a figure that was never written anywhere.
+            result.bytes_copied += std::fs::copy(&src, &dest).map_err(|e| Error::io(&src, e))?;
             result.photos_copied += 1;
             result.written.push(format!("{album_path}/{}", photo.filename));
         }
@@ -793,6 +813,44 @@ mod tests {
         assert_eq!(names.len(), 2, "photoOrder lists each published file once: {names:?}");
     }
 
+    /// The same two losses the unedited path already survives — an original
+    /// gone from disk, an original nothing can decode — reached the caller as
+    /// an error the moment the photo carried an adjustment, because rendering
+    /// it means opening it. So the wedding published fine right up until the
+    /// photographer put a crop on the one frame whose drive had gone, and then
+    /// stopped publishing at all, with an i/o error naming a path in `.gpp`.
+    #[test]
+    fn an_edited_photo_that_cannot_be_rendered_does_not_take_the_album_down() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        for name in ["good.jpg", "gone.jpg", "corrupt.jpg"] {
+            write_jpeg(&src.path().join("a").join(name), 40, 40);
+        }
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let ids: Vec<i64> = lib.photos(&Default::default()).unwrap().iter().map(|p| p.id).collect();
+        lib.add_photos_to_album("a", &ids).unwrap();
+
+        // Every frame is developed — this is a delivered album.
+        for id in &ids {
+            let mut stack = lib.edits(*id).unwrap();
+            stack.set(crate::develop::EditOp::Exposure { ev: 0.2 });
+            lib.set_edits(*id, &stack).unwrap();
+        }
+
+        // Then the card goes bad: one original vanishes, one is left unreadable.
+        std::fs::remove_file(src.path().join("a/gone.jpg")).unwrap();
+        std::fs::write(src.path().join("a/corrupt.jpg"), b"\xff\xd8\xff\xe0 not a jpeg").unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 1, "the frames that survived still ship");
+        assert!(dest.path().join("a/good.jpg").exists());
+        assert_eq!(r.missing, vec!["a/gone.jpg".to_string()]);
+        assert_eq!(r.unrenderable, vec!["a/corrupt.jpg".to_string()]);
+    }
+
     /// A crop handle dragged flat against the edge of one frame.
     ///
     /// It rounded to a rectangle with no pixels in it, the JPEG encoder refused
@@ -820,6 +878,38 @@ mod tests {
         let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
         assert_eq!(r.photos_copied, 2, "both frames reached the gallery");
         assert!(dest.path().join("a/two.jpg").exists());
+    }
+
+    /// `bytes_copied` is the number the photographer watches to know how much
+    /// of a wedding is still going onto the disk, and what ships is the
+    /// developed frame, not the original. Counting the original's size instead
+    /// reported a figure that was never written anywhere — badly wrong the
+    /// moment a crop is involved, which on a delivered album is most of them.
+    #[test]
+    fn bytes_copied_counts_the_file_that_was_written() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/one.jpg"), 400, 300);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let one = lib.photo_by_rel_path("a/one.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[one.id]).unwrap();
+
+        let mut stack = lib.edits(one.id).unwrap();
+        stack.set(crate::develop::EditOp::Crop { x: 0.0, y: 0.0, w: 0.25, h: 0.25 });
+        lib.set_edits(one.id, &stack).unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 1);
+
+        let on_disk = std::fs::metadata(dest.path().join("a/one.jpg")).unwrap().len();
+        assert_ne!(
+            on_disk, one.file_size as u64,
+            "the crop has to change the byte count or this test proves nothing"
+        );
+        assert_eq!(r.bytes_copied, on_disk);
     }
 
     #[test]

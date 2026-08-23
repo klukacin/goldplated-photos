@@ -188,10 +188,10 @@ impl Library {
             args.push(Box::new(model.clone()));
         }
         if let Some(text) = &filter.text {
-            let like = format!("%{}%", text.to_lowercase());
+            let like = format!("%{}%", like_literal(&text.to_lowercase()));
             wheres.push(
-                "(LOWER(p.filename) LIKE ? OR LOWER(IFNULL(p.camera_make,'') || ' ' \
-                 || IFNULL(p.camera_model,'')) LIKE ?)"
+                "(LOWER(p.filename) LIKE ? ESCAPE '\\' OR LOWER(IFNULL(p.camera_make,'') || ' ' \
+                 || IFNULL(p.camera_model,'')) LIKE ? ESCAPE '\\')"
                     .into(),
             );
             args.push(Box::new(like.clone()));
@@ -387,6 +387,25 @@ impl Library {
     }
 }
 
+/// Quote the LIKE wildcards out of a free-text search term.
+///
+/// `_` matches any single character and `%` any run of them, and `_` is in the
+/// filename of nearly every frame a Nikon writes. Pasted into the pattern as
+/// typed, a search for the `DSC_0042` off one card also returns the Fuji's
+/// `DSCF0042` — a different photograph, sitting at the top of a list the
+/// photographer is using to find one frame. Callers must pair this with an
+/// `ESCAPE '\'` clause.
+fn like_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 // -------------------------------------------------------------------- schema
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -415,6 +434,20 @@ fn migrate(conn: &Connection) -> Result<()> {
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
             )?;
+        }
+        Some(v) if v > SCHEMA_VERSION => {
+            // A newer build has already been at this catalog. Two machines
+            // share a library over a network share or a carried drive, and one
+            // of them is a version behind — that one used to open this happily,
+            // select the columns it knows about, and write rows the newer
+            // schema's constraints were never applied to. Nothing complains
+            // until the up-to-date machine reads it back. Say which build is
+            // needed instead; the catalog is safe as long as nobody writes to
+            // it with the wrong one.
+            return Err(Error::Other(format!(
+                "this library's catalog is schema v{v}, and this build understands \
+                 v{SCHEMA_VERSION} — open it with a newer version of the app"
+            )));
         }
         Some(v) => {
             // Stepped: a catalog two versions behind runs both migrations.
@@ -719,6 +752,37 @@ mod tests {
         assert!(lib.album_subscriptions().unwrap().is_empty());
     }
 
+    /// A catalog written by a newer build must be refused, not run against.
+    ///
+    /// Two machines share a library over a network share or a carried drive,
+    /// and one of them is a version behind. The older build used to open the
+    /// newer catalog and work happily: it selects the columns it knows, writes
+    /// rows the new schema's constraints were never applied to, and the damage
+    /// only shows up later, on the machine that is up to date.
+    #[test]
+    fn a_catalog_from_a_newer_build_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Library::open(dir.path()).unwrap());
+        {
+            let conn = Connection::open(dir.path().join(GPP_DIR).join("catalog.db")).unwrap();
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+
+        let Err(err) = Library::open(dir.path()) else {
+            panic!("an older build must not open a newer catalog");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("v{}", SCHEMA_VERSION + 1))
+                && msg.contains(&format!("v{SCHEMA_VERSION}")),
+            "the refusal has to name both versions, or nobody knows which build to reach for: {msg}"
+        );
+    }
+
     #[test]
     fn resolve_rejects_traversal() {
         let lib = Library::open_in_memory("/tmp/lib").unwrap();
@@ -741,6 +805,54 @@ mod tests {
             ..Default::default()
         });
         assert!(listed.is_ok(), "{:?}", listed.err());
+    }
+
+    fn insert_photo(lib: &Library, rel_path: &str) {
+        let filename = rel_path.rsplit('/').next().unwrap();
+        lib.with_conn(|c| {
+            c.execute(
+                "INSERT INTO photos(rel_path, filename, content_hash, file_size, \
+                 mtime_ms, imported_at) VALUES(?1, ?2, 'h', 0, 0, '')",
+                params![rel_path, filename],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn search(lib: &Library, text: &str) -> Vec<String> {
+        lib.photos(&PhotoFilter {
+            text: Some(text.to_string()),
+            sort: PhotoSort::NameAsc,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.filename)
+        .collect()
+    }
+
+    /// `_` matches any single character in SQL LIKE, and it is in the filename
+    /// of nearly every frame a Nikon writes. Pasted straight into the pattern,
+    /// searching for the `DSC_0042` off one card also turned up the Fuji's
+    /// `DSCF0042` — a different photograph, from a different camera, at the top
+    /// of a list the photographer is using to find one frame.
+    #[test]
+    fn a_wildcard_in_a_filename_is_searched_for_literally() {
+        let lib = Library::open_in_memory("/tmp/lib").unwrap();
+        for name in ["DSC_0042.jpg", "DSCF0042.jpg", "DSC-0042.jpg"] {
+            insert_photo(&lib, name);
+        }
+        assert_eq!(search(&lib, "DSC_0042"), vec!["DSC_0042.jpg"]);
+
+        // `%` stands for any run of characters, so a bare one used to select
+        // the whole library instead of the files actually named with it.
+        insert_photo(&lib, "100% crop.jpg");
+        assert_eq!(search(&lib, "%"), vec!["100% crop.jpg"]);
+
+        // And the escape character itself is a legal byte in a Unix filename.
+        insert_photo(&lib, "back\\slash.jpg");
+        assert_eq!(search(&lib, "back\\slash"), vec!["back\\slash.jpg"]);
     }
 
     #[test]

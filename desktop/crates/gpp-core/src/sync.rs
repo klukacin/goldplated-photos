@@ -934,6 +934,40 @@ mod tests {
         }
     }
 
+    /// The folder transport is the reference the other transports copy, and it
+    /// is the one pointed at a mounted network share — so its idea of "inside
+    /// the remote root" is the one that decides whether a manifest can reach
+    /// the rest of that share.
+    ///
+    /// [`local_under`] already refuses a leading backslash and re-checks
+    /// containment at the end; this had neither. Both matter only on Windows,
+    /// where a backslash separates path segments and `C:` is a root of its own,
+    /// so `PathBuf::push` throws the remote root away rather than extending it
+    /// — and this is a unit test on the path logic precisely because a Linux
+    /// run cannot show that.
+    #[test]
+    fn the_folder_transport_refuses_a_path_that_would_leave_its_root() {
+        let t = FsTransport::new("/srv/gallery/albums");
+        for ok in ["2026/ana/a1.jpg", "index.md", "./2026/ana/index.md"] {
+            assert!(t.resolve(ok).is_ok(), "{ok:?} is an ordinary album file");
+        }
+        for refused in [
+            "",
+            "/etc/passwd",
+            "2026/../../escaped.jpg",
+            "2026/ana/a\0.jpg",
+            // Windows separators and roots. `push` treats each as absolute
+            // there, and the remote root silently stops applying.
+            "\\\\fileserver\\share\\x.jpg",
+            "\\Windows\\system32\\x.dll",
+        ] {
+            let Err(e) = t.resolve(refused) else {
+                panic!("{refused:?} must not resolve inside the remote root");
+            };
+            assert!(matches!(e, crate::error::Error::InvalidPath(_)), "{e}");
+        }
+    }
+
     /// A file gone from both sides has to stop being remembered. Keeping the
     /// row means that the day another machine republishes that photo, this one
     /// reads its own stale baseline as "I deleted this on purpose" and takes it
@@ -1119,8 +1153,18 @@ impl FsTransport {
     }
 
     /// Reject anything that would escape the remote root.
+    ///
+    /// The same two rules as [`local_under`], and for the same reason: a
+    /// backslash separates segments on Windows and `C:` is a root of its own
+    /// there, so `push` throws the remote root away instead of extending it.
+    /// The remote root is often a mounted share, and everything else on that
+    /// share is one such path away.
     fn resolve(&self, rel: &str) -> Result<std::path::PathBuf> {
-        if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') {
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.starts_with('\\')
+            || rel.contains('\0')
+        {
             return Err(crate::error::Error::InvalidPath(rel.to_string()));
         }
         let mut out = self.root.clone();
@@ -1130,6 +1174,9 @@ impl FsTransport {
                 ".." => return Err(crate::error::Error::InvalidPath(rel.to_string())),
                 s => out.push(s),
             }
+        }
+        if !out.starts_with(&self.root) {
+            return Err(crate::error::Error::InvalidPath(rel.to_string()));
         }
         Ok(out)
     }
