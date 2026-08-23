@@ -12,6 +12,14 @@ repository.workspace = true
 name = "gpp"
 path = "src/main.rs"
 
+# Mirrors the core's `heif` feature so `--no-default-features` on this binary
+# really produces a HEIF-less build. Without the mirror, `default-features =
+# false` below would *always* strip HEIF, and there would be no flag to put it
+# back per-binary.
+[features]
+default = ["heif"]
+heif = ["gpp-core/heif"]
+
 [dependencies]
-gpp-core = { path = "../gpp-core" }
+gpp-core = { path = "../gpp-core", default-features = false }
 serde_json.workspace = true

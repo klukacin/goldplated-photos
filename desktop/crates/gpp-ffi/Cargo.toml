@@ -16,12 +16,19 @@ name = "gpp_ffi"
 # can use it without going through the loader.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+# Mirrors the core's `heif` feature so a foreign shell can build a HEIF-less
+# library with `--no-default-features` — the size-constrained ports this ABI
+# exists for are the builds most likely to want that.
+[features]
+default = ["heif"]
+heif = ["gpp-core/heif"]
+
 # No new dependencies. serde_json is already in the workspace and already
 # drives the Tauri boundary, so the JSON door adds nothing that was not
 # shipping. Deliberately absent: UniFFI and cbindgen, both MPL-2.0 (see the
 # licence note in the workspace manifest and the README).
 [dependencies]
-gpp-core = { path = "../gpp-core" }
+gpp-core = { path = "../gpp-core", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 

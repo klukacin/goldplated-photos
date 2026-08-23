@@ -186,13 +186,14 @@ pub struct PublishCollision {
 /// Converting either way keeps the name stable across a develop, which matters
 /// because the published filename is the URL. A client who has the link should
 /// not lose it because the photographer moved a slider.
+///
+/// All of this rides on `media::is_heif`, which is `false` in a build without
+/// the `heif` feature — such a build cannot transcode, so it must not promise a
+/// `.jpg` it has no way to produce. (It also cannot *catalogue* a HEIF, so the
+/// case only arises on a catalog written by a heif-enabled build; the file is
+/// then copied under its own name, as any other photo is.)
 pub fn published_filename(photo: &Photo) -> String {
-    let is_heif = std::path::Path::new(&photo.filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_lowercase().as_str(), "heic" | "heif"))
-        .unwrap_or(false);
-    if !is_heif {
+    if !crate::media::is_heif(std::path::Path::new(&photo.filename)) {
         return photo.filename.clone();
     }
     let stem = photo.filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&photo.filename);
