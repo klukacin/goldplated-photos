@@ -205,24 +205,6 @@ function parseDate(dateString) {
   return new Date(dateString).toISOString();
 }
 
-// Debounce function
-function debounce(func, wait) {
-  let timeout;
-  return function executedFunction(...args) {
-    const later = () => {
-      clearTimeout(timeout);
-      func(...args);
-    };
-    clearTimeout(timeout);
-    timeout = setTimeout(later, wait);
-  };
-}
-
-// Get thumbnail URL
-function getThumbnailUrl(albumPath, filename, size = 'small') {
-  return `/api/thumbnail?path=${encodeURIComponent(`${albumPath}/${filename}`)}&size=${size}`;
-}
-
 // Get album image URL
 function getAlbumImageUrl(albumPath, filename) {
   return `/albums/${albumPath}/${filename}`;

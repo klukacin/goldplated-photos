@@ -1389,6 +1389,7 @@ function getVideoMimeType(filename: string): string {
   // Chrome and Firefox cannot decode HEIC, so the Original-quality toggle has
   // to keep serving the transcoded thumbnail for those files.
   import { browserSafeImageUrl, needsBrowserTranscode } from '../lib/image-formats';
+  import { buildPhotoShareUrl } from '../lib/share-url';
 
   // Current photo URL for EXIF data
   let currentPhotoUrl = '';
@@ -1691,19 +1692,10 @@ function getVideoMimeType(filename: string): string {
   }
 
   // Build share URL with optional token for protected albums
+  // URL construction lives in lib/share-url.ts (unit-tested) — the
+  // photo/token query-parameter interplay is too easy to break blind here.
   function getPhotoShareUrl(filename: string): string {
-    let url = `${shareConfig.siteUrl}/photos/${shareConfig.albumPath}`;
-
-    if (filename) {
-      url += `?photo=${encodeURIComponent(filename)}`;
-    }
-
-    // Add token for protected albums
-    if (shareConfig.isProtected && shareConfig.albumToken) {
-      url += (filename ? '&' : '?') + `token=${shareConfig.albumToken}`;
-    }
-
-    return url;
+    return buildPhotoShareUrl(shareConfig, filename);
   }
 
   // Copy link to clipboard
