@@ -32,6 +32,16 @@ use crate::model::Photo;
 /// Current stack format. Bumped only if the meaning of stored ops changes.
 pub const STACK_VERSION: u32 = 1;
 
+/// JPEG quality for a developed frame — the file a client is actually sent.
+///
+/// An untouched photo is published by copying the camera's own file, so it
+/// arrives at whatever quality the body wrote, typically the low nineties. An
+/// adjusted one is re-encoded here, and it has to land in the same range or
+/// moving one slider silently costs the delivered frame detail that was
+/// recorded at the wedding. Grid thumbnails are a separate decision — see
+/// [`media::THUMBNAIL_JPEG_QUALITY`].
+pub const DELIVERY_JPEG_QUALITY: u8 = 92;
+
 /// One adjustment.
 ///
 /// Amounts are the -100..100 scale a slider hands over, except exposure, which
@@ -422,11 +432,24 @@ impl EditStack {
 /// Identical to the content hash when nothing has been adjusted, so untouched
 /// photos keep every thumbnail that already exists.
 pub fn render_key(content_hash: &str, stack: &EditStack) -> String {
+    render_key_with_quality(content_hash, stack, DELIVERY_JPEG_QUALITY)
+}
+
+/// The key, for a stated encoder quality.
+///
+/// The cache is addressed by what the pixels *are*, and how they are encoded is
+/// part of that: without the quality in the hash, a library that had already
+/// rendered a photo would go on serving and publishing bytes from the old
+/// encoder for ever, while photos rendered after the change got the new one —
+/// two qualities in one delivery, and nothing to show which was which.
+fn render_key_with_quality(content_hash: &str, stack: &EditStack, quality: u8) -> String {
     if stack.is_empty() {
+        // No edits means the original file itself is the render, so nothing was
+        // encoded here and the quality cannot apply.
         return content_hash.to_string();
     }
     let json = stack.to_json().unwrap_or_default();
-    blake3::hash(format!("{content_hash}\u{1}{json}").as_bytes())
+    blake3::hash(format!("{content_hash}\u{1}{json}\u{1}q{quality}").as_bytes())
         .to_hex()
         .to_string()
 }
@@ -622,7 +645,7 @@ pub fn ensure_rendered(
 
     let img = media::load_oriented(original, photo.orientation)?;
     let developed = apply(&img, stack);
-    media::write_atomic(&dest, &media::encode_jpeg(&developed)?)?;
+    media::write_atomic(&dest, &media::encode_jpeg(&developed, DELIVERY_JPEG_QUALITY)?)?;
     Ok(dest)
 }
 
@@ -1087,5 +1110,68 @@ mod tests {
         let s = EditStack::from_json(r#"{"ops":[{"op":"exposure","ev":1.0}]}"#).unwrap();
         assert_eq!(s.version, STACK_VERSION);
         assert_eq!(s.ops.len(), 1);
+    }
+
+    /// What a client is sent must not be quietly worse than what was shot.
+    ///
+    /// An untouched photo is published by copying the camera's own file, so it
+    /// keeps whatever quality the body wrote. An adjusted one is re-encoded,
+    /// and it went out at the image crate's default of 75 — so moving a single
+    /// slider cost the delivered frame real detail, on the one copy the client
+    /// actually receives, with nothing anywhere saying so.
+    #[test]
+    fn a_developed_frame_is_delivered_at_camera_quality() {
+        // Fine detail, because that is what a low quality setting destroys and
+        // a flat field would hide.
+        let mut seed: u64 = 7;
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(320, 240, |x, y| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let n = ((seed >> 33) & 0x7f) as u32;
+            Rgb([((x + n) % 256) as u8, ((y * 2 + n) % 256) as u8, ((x + y + n) % 256) as u8])
+        }));
+
+        let encoded = media::encode_jpeg(&img, DELIVERY_JPEG_QUALITY).unwrap();
+        let back = image::load_from_memory(&encoded).unwrap();
+
+        let error = mean_abs_error(&img, &back);
+        let at_old_default = mean_abs_error(
+            &img,
+            &image::load_from_memory(&media::encode_jpeg(&img, 75).unwrap()).unwrap(),
+        );
+
+        assert!(
+            error < at_old_default * 0.75,
+            "delivery is no better than the old default: {error:.2} vs {at_old_default:.2}"
+        );
+    }
+
+    /// The render cache is addressed by the edit stack, not by how the pixels
+    /// were encoded — so changing the encoder has to change the key, or a
+    /// library that already rendered a photo goes on serving and publishing the
+    /// old bytes for ever while new photos get the new ones.
+    #[test]
+    fn the_render_key_follows_the_delivery_quality() {
+        let stack = stack_of(&[EditOp::Exposure { ev: 0.5 }]);
+        let key = render_key("abc123", &stack);
+        assert!(
+            key.contains(char::is_alphanumeric) && key != "abc123",
+            "an adjusted photo must not sit on the original's key"
+        );
+        assert_ne!(
+            key,
+            render_key_with_quality("abc123", &stack, DELIVERY_JPEG_QUALITY + 1),
+            "the key ignored the encoder, so old renders would be served as new"
+        );
+    }
+
+    fn mean_abs_error(a: &DynamicImage, b: &DynamicImage) -> f64 {
+        let (a, b) = (a.to_rgb8(), b.to_rgb8());
+        let n = a.as_raw().len() as f64;
+        a.as_raw()
+            .iter()
+            .zip(b.as_raw())
+            .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as f64)
+            .sum::<f64>()
+            / n
     }
 }

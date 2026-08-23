@@ -59,13 +59,36 @@ pub fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// JPEG quality for the grid and preview thumbnails.
+///
+/// Deliberately below [`crate::develop::DELIVERY_JPEG_QUALITY`]: these are
+/// never delivered to anyone, they are redrawn constantly while culling, and at
+/// a few hundred pixels the difference is invisible while the size is not. This
+/// is the value the crate defaulted to before the encoder was made explicit, so
+/// no existing thumbnail is invalidated by naming it.
+pub(crate) const THUMBNAIL_JPEG_QUALITY: u8 = 75;
+
 /// Encode an image as JPEG into memory, ready for [`write_atomic`].
-pub(crate) fn encode_jpeg(img: &DynamicImage) -> Result<Vec<u8>> {
-    let mut buf = std::io::Cursor::new(Vec::new());
-    img.to_rgb8()
-        .write_to(&mut buf, ImageFormat::Jpeg)
+pub(crate) fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ImageEncoder;
+
+    // Spelled out rather than left to `write_to`, whose default is 75. That
+    // default was reaching the one copy a client receives: an untouched photo
+    // is published by copying the camera's own file, so an adjusted one going
+    // out at 75 meant a single slider quietly cost the delivered frame detail
+    // the camera had recorded.
+    let rgb = img.to_rgb8();
+    let mut buf = Vec::new();
+    JpegEncoder::new_with_quality(&mut buf, quality)
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
         .map_err(Error::Image)?;
-    Ok(buf.into_inner())
+    Ok(buf)
 }
 
 /// Classify a file by extension.
@@ -301,7 +324,7 @@ pub fn generate_derived(
             continue;
         }
         let resized = resize_to_fit(&img, max_edge);
-        write_atomic(&dest, &encode_jpeg(&resized)?)?;
+        write_atomic(&dest, &encode_jpeg(&resized, THUMBNAIL_JPEG_QUALITY)?)?;
     }
 
     out.lqip = Some(make_lqip(&img)?);
