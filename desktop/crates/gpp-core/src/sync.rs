@@ -7,6 +7,28 @@
 //! Keeping a third state — what we last agreed on with the server — makes the
 //! distinction decidable. [`plan`] is a pure function over three manifests, so
 //! the entire decision table is unit-tested.
+//!
+//! # The rules this module is here to keep
+//!
+//! - **An album nobody tracks is never touched, on either side.** Scope comes
+//!   from an explicit subscription ([`AlbumSubscription`]); everything else is
+//!   filtered out of all three manifests before a single decision is made, so
+//!   it cannot be pushed, pulled or deleted even by a bug in the table.
+//! - **Both sides changed since the baseline is a conflict, and a conflict is
+//!   reported, never guessed.** Nothing here knows which version the
+//!   photographer wants, and inventing an answer is how the wrong one wins.
+//! - **Removing anything from the server needs an explicit `allow_deletes`.**
+//!   Withheld deletions are named in the outcome so a UI can ask, and the run
+//!   repeated once someone has said yes.
+//! - **`.meta/` is the server's own** — the proofing submissions live there —
+//!   and dot-names are excluded from every manifest, in both directions.
+//! - **A remote manifest is a document the server writes**, so every path in it
+//!   is checked before use (`accepts_remote_path`). An honest server never
+//!   names a path that fails; a compromised one would only have to name
+//!   `.htaccess` once for the next deploy to rsync it to the live site.
+//! - **One file's failure never stops the transfer.** [`apply`] carries on and
+//!   names the casualty in [`SyncOutcome::failed`], because a gallery that
+//!   arrives one frame short otherwise looks exactly like a clean run.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,11 +46,29 @@ pub type Manifest = BTreeMap<String, String>;
 /// A trait, not a hard-coded `rsync` call, because the core must compile for
 /// iPadOS where spawning `ssh` is not an option. Desktop supplies an SFTP
 /// implementation; mobile supplies an HTTP one.
+///
+/// Every `rel_path` is relative to the sync root and `/`-separated whatever the
+/// platform underneath uses. An implementation has to refuse anything that
+/// would resolve outside that root — including the Windows shapes a POSIX check
+/// waves through, a backslash separator and a `C:` drive letter — because the
+/// root is frequently a mounted share with the rest of someone's work beside it.
+///
+/// Implementations are called from several threads at once (see
+/// [`TRANSFER_CONCURRENCY`]), hence the `Send + Sync` bound.
 pub trait RemoteTransport: Send + Sync {
     /// Hashes of everything currently on the server, under the sync scope.
     fn manifest(&self) -> Result<Manifest>;
+    /// Write one file, creating whatever folders it needs, replacing whatever
+    /// is there. The plan has already decided this file should be replaced; a
+    /// transport that second-guessed it would make the plan a lie.
     fn put(&self, rel_path: &str, bytes: &[u8]) -> Result<()>;
+    /// Read one file whole. There is no streaming form because a gallery file
+    /// is a JPEG or a few kilobytes of frontmatter — but the length is the
+    /// server's claim, so an implementation still has to cap what it accepts.
     fn get(&self, rel_path: &str) -> Result<Vec<u8>>;
+    /// Remove one file from the server. Only ever reached from
+    /// [`Action::DeleteRemote`], which [`apply`] refuses to act on unless the
+    /// caller passed `allow_deletes`.
     fn delete(&self, rel_path: &str) -> Result<()>;
 }
 
@@ -53,26 +93,44 @@ pub enum Action {
     Skip,
 }
 
+/// One path, and what the plan says should happen to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedChange {
+    /// Relative to the published tree, `/`-separated. The same key names the
+    /// same file on both sides of the wire — that is what makes three
+    /// separately-built manifests comparable at all.
     pub path: String,
     pub action: Action,
 }
 
+/// Everything a sync run is about to do, and nothing it has done.
+///
+/// Building a plan reads three manifests and writes nothing, which is what lets
+/// the UI show a photographer the deletions *before* they agree to them.
+/// [`apply`] is the only thing that acts on one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncPlan {
+    /// One entry per path any of the three manifests mentioned, in path order.
+    /// Entries that move no bytes are still here when the bookkeeping needs
+    /// settling — a baseline out of step with reality is what later reads as a
+    /// deliberate deletion.
     pub changes: Vec<PlannedChange>,
 }
 
 impl SyncPlan {
+    /// The changes carrying one action — the list behind "12 files to upload",
+    /// and the one a confirmation dialog reads out before a deletion.
     pub fn of(&self, action: Action) -> Vec<&PlannedChange> {
         self.changes.iter().filter(|c| c.action == action).collect()
     }
 
+    /// How many changes carry one action.
     pub fn count(&self, action: Action) -> usize {
         self.changes.iter().filter(|c| c.action == action).count()
     }
 
+    /// Whether anything diverged on both sides. Nothing here resolves one, so a
+    /// plan that has conflicts is a plan a person still has to look at.
     pub fn has_conflicts(&self) -> bool {
         self.count(Action::Conflict) > 0
     }
@@ -179,6 +237,9 @@ pub enum SyncDirection {
 }
 
 impl SyncDirection {
+    /// The value stored in the catalog's `album_sync` table. Stable: it is
+    /// written into every library out there, so it is not a display string to
+    /// be reworded.
     pub fn as_str(self) -> &'static str {
         match self {
             SyncDirection::Push => "push",
@@ -187,6 +248,12 @@ impl SyncDirection {
         }
     }
 
+    /// Read a stored direction back. Total rather than fallible: an
+    /// unrecognised value becomes [`SyncDirection::Both`], so one odd row can
+    /// never be the reason a whole sync refuses to start. The cost is that a
+    /// direction written by some future version reads here as full
+    /// reconciliation — which at least reports conflicts rather than
+    /// overwriting anything.
     pub fn parse(s: &str) -> Self {
         match s {
             "push" => SyncDirection::Push,
@@ -309,14 +376,24 @@ pub struct SyncScope {
 }
 
 impl SyncScope {
+    /// No restriction at all. Only sound on a machine that really does hold the
+    /// whole library — anywhere else, this is the setting that lets a partial
+    /// catalog decide the server is missing two hundred albums.
     pub fn everything() -> Self {
         Self::default()
     }
 
+    /// Restrict to these path prefixes. In practice there is exactly one — the
+    /// path the photographer asked to sync — and every caller here builds it
+    /// that way; the vector is what lets a future "sync these four" not need a
+    /// second scope type.
     pub fn with(prefixes: Vec<String>) -> Self {
         Self { prefixes }
     }
 
+    /// Whether a manifest path is in scope. Matching is on segment boundaries,
+    /// so `2026/ana` covers `2026/ana/one.jpg` and never `2026/anastasia` —
+    /// the difference between syncing one couple's wedding and a stranger's.
     pub fn includes(&self, path: &str) -> bool {
         if self.prefixes.is_empty() {
             return true;
@@ -326,6 +403,10 @@ impl SyncScope {
             .any(|p| path == p || path.starts_with(&format!("{p}/")))
     }
 
+    /// The manifest cut down to what is in scope. Every plan begins with all
+    /// three manifests passed through here, which is the real safety property:
+    /// a path that does not survive this filter cannot be pushed, pulled or
+    /// deleted whatever the decision table would have said about it.
     pub fn filter(&self, manifest: &Manifest) -> Manifest {
         manifest
             .iter()
@@ -375,6 +456,12 @@ impl Library {
         })
     }
 
+    /// Drop the bookkeeping row for a path.
+    ///
+    /// It deletes nothing but the memory of an agreement. Keeping a row past
+    /// the file's life is the more dangerous mistake: the day another machine
+    /// republishes those bytes, a stale baseline reads as "deleted here on
+    /// purpose" and the file comes off the server again.
     pub fn forget_synced(&self, path: &str) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
@@ -405,25 +492,35 @@ impl Library {
 }
 
 /// Outcome of applying a plan.
+///
+/// Counts for what moved, names for everything that did not. A run whose only
+/// non-zero field is a count is the one clean result; every other field exists
+/// so that a partial run cannot be mistaken for it.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncOutcome {
+    /// Files uploaded, downloaded, and removed from the server.
     pub pushed: usize,
     pub pulled: usize,
     pub deleted: usize,
+    /// Files the server has that this machine has no record of. Untouched —
+    /// the case the three-way design exists for.
     pub left_alone: usize,
     /// Changes the chosen direction excluded.
     pub skipped: usize,
     /// Server files this run would have removed but didn't, because
     /// `allow_deletes` was false. Naming them lets a caller ask, then re-run.
     pub withheld_deletes: Vec<String>,
+    /// Paths that moved on both sides since the baseline. Nothing was
+    /// transferred for these in either direction: which version the
+    /// photographer wants is not a question this code can answer.
     pub conflicts: Vec<String>,
+    /// Path and error for each file that did not make it. [`apply`] carries on
+    /// past one so the rest of the album still moves, which only works if the
+    /// casualty is named — a gallery arriving one frame short otherwise looks
+    /// exactly like a clean run, and the client is the one who notices.
     pub failed: Vec<(String, String)>,
 }
 
-/// Execute a plan against a transport.
-///
-/// `allow_deletes` must be an explicit, confirmed decision by the caller —
-/// nothing is removed from the server without it.
 /// How many transfers run at once.
 ///
 /// A single TCP flow starts at a ~14 KB congestion window and ramps
@@ -1063,8 +1160,16 @@ mod tests {
 /// A machine's interest in one album.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumSubscription {
+    /// The album's gallery path. It follows the album: renaming or moving one
+    /// carries its subscription, and its sub-albums', to the new path — left
+    /// behind, a subscription silently stops syncing the album, with no error
+    /// and only a client's gallery that never updates again to show for it.
     pub album_path: String,
+    /// The direction the *user* chose. One-off pushes and pulls never rewrite
+    /// it: a pull-only machine stays pull-only after it pulls.
     pub direction: SyncDirection,
+    /// When a sync of this album last completed, RFC 3339. `None` until one
+    /// does — subscribing records an interest, not a transfer.
     pub last_synced_at: Option<String>,
 }
 
@@ -1092,6 +1197,9 @@ impl Library {
         })
     }
 
+    /// One album's subscription, or `None` when this machine does not track it.
+    /// `None` is the answer for most of the library on most machines, and it is
+    /// what keeps the rest of it out of every plan.
     pub fn album_subscription(&self, album_path: &str) -> Result<Option<AlbumSubscription>> {
         Ok(self
             .album_subscriptions()?
@@ -1148,6 +1256,9 @@ pub struct FsTransport {
 }
 
 impl FsTransport {
+    /// `root` is the folder standing in for the server — the mount point or the
+    /// drive's sync directory, not a path inside it. Every transferred path is
+    /// resolved beneath it and refused if it would land anywhere else.
     pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
         Self { root: root.into() }
     }

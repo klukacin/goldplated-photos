@@ -4,6 +4,19 @@
 //! layer is a one-line wrapper per command, which keeps the untestable part of
 //! the stack (the webview shell) trivial and puts all real behaviour under
 //! test on any platform.
+//!
+//! Three clients wrap this same surface: the Tauri shell, `gpp-cli`, and the C
+//! ABI in `gpp-ffi` that a native iPad or Android front end would call. So a
+//! method here is not "a Rust function some GUI happens to use" — it is the
+//! whole of what that platform can do, and anything it cannot express is a
+//! thing no client will ever be able to do. Logic that drifts into a shell is
+//! logic the other two clients silently lack.
+//!
+//! Two consequences worth knowing before adding a method. Arguments and returns
+//! cross a JSON boundary, so they are owned, serde-derived types rather than
+//! borrowed views — and a field name serde does not recognise is dropped in
+//! silence, which is how a filter once filtered nothing. And ids, not paths,
+//! identify photos: a path stops naming the same frame the moment a file moves.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,26 +46,49 @@ pub struct Session {
 /// What the UI shows in the sidebar for one album.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumSummary {
+    /// Flattened, so the shell reads `path`, `title` and the rest at the top
+    /// level of the JSON instead of nested under `album` — the sidebar and the
+    /// album editor bind to one object.
     #[serde(flatten)]
     pub album: Album,
+    /// Members of *this* album only. A collection reads zero however many
+    /// frames sit in the albums beneath it, which is the honest number: a
+    /// collection publishes an `index.md` and no photos.
     pub photo_count: usize,
+    /// Password and/or share token — the padlock in the sidebar, decided by the
+    /// same rule the web gallery applies when it chooses whether to ask.
     pub is_locked: bool,
 }
 
 /// Library-level status for the header bar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryStatus {
+    /// Absolute path of the library root, exactly as the user picked it.
     pub root: String,
+    /// Rows in the catalog, not files on the disk. A folder copied in beside
+    /// the others counts for nothing until an import walks it, and a row whose
+    /// file has since been deleted keeps counting until [`Session::prune`].
     pub photo_count: i64,
     pub album_count: usize,
+    /// Distinct camera models in the catalog. The filter bar's dropdown is
+    /// built from this, so a body disappears from it when its last frame does.
     pub cameras: Vec<String>,
 }
 
 /// Settings the UI persists between launches.
+///
+/// Kept in the catalog rather than in the app's own preferences, so they belong
+/// to the library: carry the drive to another machine and the destination comes
+/// with it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PublishTarget {
-    /// Absolute path of the gallery's `src/content/albums`.
+    /// Absolute path of the gallery's `src/content/albums`. `None` means no
+    /// destination has been chosen yet, and both publish and sync refuse to run
+    /// — sync moves the published tree, so it needs one too.
     pub dest: Option<String>,
+    /// Stars a photo needs before it ships. `None` is "publish everything", a
+    /// choice the panel actually offers rather than a missing value — see
+    /// [`Session::set_publish_target`] for why that distinction cost a shoot.
     pub min_rating: Option<u8>,
 }
 
@@ -62,6 +98,9 @@ const SETTING_REMOTE_DIR: &str = "remote.dir";
 const SETTING_REMOTE_TOKEN: &str = "remote.token";
 
 impl Session {
+    /// A session with nothing open. Every method below fails with "no library
+    /// is open" until [`Session::open_library`] succeeds — which is the state
+    /// the shell's folder picker exists to get out of.
     pub fn new() -> Self {
         Self::default()
     }
@@ -74,6 +113,8 @@ impl Session {
         Ok(status)
     }
 
+    /// Whether a library is open — what the shell asks on start-up to choose
+    /// between the picker and the grid.
     pub fn is_open(&self) -> bool {
         self.library.read().expect("session lock poisoned").is_some()
     }
@@ -96,6 +137,9 @@ impl Session {
         })
     }
 
+    /// Re-read the header counts. Three queries, so the shell calls it after
+    /// anything that could move them rather than trying to track deltas of its
+    /// own and drifting out of step with the catalog.
     pub fn status(&self) -> Result<LibraryStatus> {
         self.with(Self::status_of)
     }
@@ -144,10 +188,15 @@ impl Session {
 
     // -------------------------------------------------------------- photos
 
+    /// The grid's contents: everything matching the filter, ordered by the
+    /// catalog. Filtering is done here and not in the client, so the shell and
+    /// a future iPad app agree about what "3 stars and up, Leica only" means.
     pub fn photos(&self, filter: PhotoFilter) -> Result<Vec<Photo>> {
         self.with(|lib| lib.photos(&filter))
     }
 
+    /// One photo, by catalog id — the identifier every other method takes, and
+    /// the only one that survives a file being renamed or moved.
     pub fn photo(&self, id: i64) -> Result<Photo> {
         self.with(|lib| lib.photo_by_id(id))
     }
@@ -183,14 +232,25 @@ impl Session {
         })
     }
 
+    /// Stars for a whole selection; `0` is unrated, anything above five is
+    /// clamped. Returns how many photos it reached, which is what the UI
+    /// reports rather than assuming every id took — an id whose row has since
+    /// gone is not counted, and over a hundred-frame cull that gap is otherwise
+    /// invisible.
     pub fn set_rating(&self, ids: Vec<i64>, rating: u8) -> Result<usize> {
         self.with(|lib| lib.set_rating_bulk(&ids, rating))
     }
 
+    /// Pick or reject a selection. A reject is a mark on a row, never a
+    /// deletion: the negative stays on disk, and publishing is what leaves it
+    /// out (`PublishOptions::exclude_rejected`, on by default).
     pub fn set_flag(&self, ids: Vec<i64>, flag: Flag) -> Result<usize> {
         self.with(|lib| lib.set_flag_bulk(&ids, flag))
     }
 
+    /// One photo's colour label, `None` to clear it. Single-photo on purpose:
+    /// a label marks one frame out of a run, so there is no bulk form to
+    /// mis-click.
     pub fn set_color_label(&self, id: i64, label: Option<String>) -> Result<()> {
         self.with(|lib| lib.set_color_label(id, label.as_deref()))
     }
@@ -282,6 +342,10 @@ impl Session {
 
     // -------------------------------------------------------------- albums
 
+    /// Every album, flat and already sorted so a parent precedes its children.
+    /// The sidebar indents from `path` rather than the catalog handing back a
+    /// nested shape — one list is far easier to keep in step across the wire
+    /// than a tree the client has to rebuild after every edit.
     pub fn albums(&self) -> Result<Vec<AlbumSummary>> {
         self.with(|lib| {
             let mut out = Vec::new();
@@ -297,34 +361,63 @@ impl Session {
         })
     }
 
+    /// Create an album at a gallery path, and any folders above it that do not
+    /// exist yet — the gallery cannot navigate to an album whose parents are
+    /// missing, so asking for `2026/weddings/ana-ivan` in an empty library
+    /// yields three rows, not one.
     pub fn create_album(&self, new: NewAlbum) -> Result<Album> {
         self.with(|lib| lib.create_album(&new))
     }
 
+    /// Change album settings. Every field of the update is optional and an
+    /// absent one is left alone, so a panel that edits the title cannot blank
+    /// the password it never showed.
     pub fn update_album(&self, path: String, update: AlbumUpdate) -> Result<Album> {
         self.with(|lib| lib.update_album(&path, &update))
     }
 
+    /// Rename or move an album, carrying its sub-albums and every sync
+    /// subscription among them.
+    ///
+    /// Nothing moves on disk and nothing moves on the server. Photos are
+    /// members, not contents, so they stay where they were imported; and a
+    /// tracked album that was already pushed keeps its old copy up there while
+    /// the next sync publishes the new path, so the server holds both until
+    /// someone removes one deliberately with `allow_deletes`.
     pub fn move_album(&self, from: String, to: String) -> Result<Album> {
         self.with(|lib| lib.move_album(&from, &to))
     }
 
+    /// Delete the album and its subscription. Not the photos — an album is a
+    /// view over them, and every frame it held is still in the library
+    /// afterwards. The published copy and the server's copy also survive;
+    /// removing those is a sync with deletions allowed.
     pub fn delete_album(&self, path: String) -> Result<()> {
         self.with(|lib| lib.delete_album(&path))
     }
 
+    /// The album's members, in the order the gallery will show them.
     pub fn album_photos(&self, path: String) -> Result<Vec<Photo>> {
         self.with(|lib| lib.album_photos(&path))
     }
 
+    /// Add photos to an album, appended in the order given. A photo may belong
+    /// to several albums at once; a collection refuses them, because the
+    /// gallery renders one as a grid of sub-albums and would never draw them.
     pub fn add_to_album(&self, path: String, photo_ids: Vec<i64>) -> Result<usize> {
         self.with(|lib| lib.add_photos_to_album(&path, &photo_ids))
     }
 
+    /// Drop photos from an album. A membership change and nothing more: the
+    /// files stay in the library and in every other album that holds them.
     pub fn remove_from_album(&self, path: String, photo_ids: Vec<i64>) -> Result<usize> {
         self.with(|lib| lib.remove_photos_from_album(&path, &photo_ids))
     }
 
+    /// Set the album's running order — what the drag-and-drop grid saves, and
+    /// what publishing writes out as `photoOrder` for the gallery to obey.
+    /// Members left out of the list follow the listed ones, keeping the order
+    /// they already had.
     pub fn reorder_album(&self, path: String, photo_ids: Vec<i64>) -> Result<()> {
         self.with(|lib| lib.reorder_album(&path, &photo_ids))
     }
@@ -346,6 +439,7 @@ impl Session {
 
     // ------------------------------------------------------------- publish
 
+    /// Read back where publishing writes, and how much of the album it ships.
     pub fn publish_target(&self) -> Result<PublishTarget> {
         self.with(|lib| {
             Ok(PublishTarget {
@@ -357,6 +451,9 @@ impl Session {
         })
     }
 
+    /// Save both settings. The two halves are treated differently on purpose:
+    /// an absent destination leaves the stored one alone, while an absent
+    /// minimum rating really does clear it.
     pub fn set_publish_target(&self, target: PublishTarget) -> Result<()> {
         self.with(|lib| {
             if let Some(dest) = &target.dest {
@@ -407,6 +504,9 @@ impl Session {
         self.with(|lib| lib.get_setting(SETTING_REMOTE_DIR))
     }
 
+    /// Point this library at a remote: a folder path, or the `http(s)` URL of a
+    /// gallery's sync API. One text box in the UI — which kind it is gets read
+    /// off the string, so there is no type to pick and no way to pick it wrong.
     pub fn set_remote_dir(&self, dir: String) -> Result<()> {
         self.with(|lib| lib.set_setting(SETTING_REMOTE_DIR, &dir))
     }
@@ -439,6 +539,9 @@ impl Session {
         self.with(|lib| lib.get_setting(SETTING_REMOTE_TOKEN))
     }
 
+    /// Store the secret an HTTP remote requires. It has to equal the gallery's
+    /// `SYNC_TOKEN`; a gallery with none configured answers 503 and stays shut
+    /// rather than open, so a blank on either side never quietly works.
     pub fn set_remote_token(&self, token: String) -> Result<()> {
         self.with(|lib| lib.set_setting(SETTING_REMOTE_TOKEN, &token))
     }
@@ -467,10 +570,20 @@ impl Session {
         self.with(|lib| lib.album_subscriptions())
     }
 
+    /// Subscribe to an album and say which way it may move, replacing any
+    /// direction already chosen for it.
+    ///
+    /// This is the opt-in the whole design rests on: an album nobody tracks is
+    /// out of scope entirely — never pushed, never pulled, never deleted on
+    /// either side — so a laptop holding three albums out of two hundred can
+    /// sync without endangering the other hundred and ninety-seven.
     pub fn track_album(&self, album_path: String, direction: crate::sync::SyncDirection) -> Result<()> {
         self.with(|lib| lib.track_album(&album_path, direction))
     }
 
+    /// Stop syncing an album. Files stay exactly where they are on both sides;
+    /// this only takes the album out of scope, so "I don't want this synced any
+    /// more" can never be the click that removes a wedding from the server.
     pub fn untrack_album(&self, album_path: String) -> Result<()> {
         self.with(|lib| lib.untrack_album(&album_path))
     }
@@ -487,9 +600,15 @@ impl Session {
         self.with(|lib| crate::remote::plan_album_sync(lib, transport, &album_path, direction, &root))
     }
 
-    /// Adopt an album from the remote into this library.
     /// Adopt a path from the remote: the folders above it, the album or
     /// collection itself, and everything under it.
+    ///
+    /// Only ever *adds* a photo to the library. Where a frame is already here,
+    /// this machine's file is the negative and it is kept untouched, with the
+    /// server's version named in [`crate::remote::PullOutcome::kept_originals`]
+    /// for a person to look at. Paths the server named that this machine
+    /// refused to write come back in `rejected`; both are warnings a UI should
+    /// show, because a well-behaved server produces neither.
     pub fn pull_album(&self, album_path: String) -> Result<crate::remote::PullOutcome> {
         let transport = self.transport()?;
         let transport = transport.as_ref();
@@ -497,8 +616,14 @@ impl Session {
         self.with(|lib| crate::remote::pull_path(lib, transport, &album_path, &root))
     }
 
-    /// Publish one album and upload it.
-    /// Contribute a path to the remote: its folders, itself, everything under it.
+    /// Contribute a path to the remote: its folders, itself, everything under
+    /// it. Publishes first, so what goes up is byte-for-byte what the gallery
+    /// would read.
+    ///
+    /// `allow_deletes` has to be an answered question, never a default: without
+    /// it, files this run would have removed from the server are listed in
+    /// [`crate::remote::PushOutcome::withheld_deletes`] and left alone, for the
+    /// UI to name and ask about before a second run.
     pub fn push_album(&self, album_path: String, allow_deletes: bool) -> Result<crate::remote::PushOutcome> {
         let transport = self.transport()?;
         let transport = transport.as_ref();
@@ -528,6 +653,12 @@ impl Session {
     }
 
     /// Sync every subscribed album, each in its own direction.
+    ///
+    /// One album's failure never stops the batch: it is reported against that
+    /// album in its own outcome's `failed` and the rest carry on. An album
+    /// renamed on the server on Wednesday used to abort the whole run, and the
+    /// photographer had no way to see which one was at fault, or that nothing
+    /// else had gone up either.
     pub fn sync_all_tracked(&self, allow_deletes: bool) -> Result<Vec<(String, crate::sync::SyncOutcome)>> {
         let transport = self.transport()?;
         let transport = transport.as_ref();
