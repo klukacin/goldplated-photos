@@ -125,16 +125,236 @@ fn decode_heif(path: &Path) -> Result<DynamicImage> {
 /// The frame's size, as cheaply as the format allows.
 ///
 /// The metadata-only import path exists to be fast — it reads the header rather
-/// than decoding twenty-four megapixels to learn two numbers. HEIF has no such
-/// shortcut here, so it costs a full decode; a caller with EXIF dimensions
-/// already in hand should not call this at all.
+/// than decoding twenty-four megapixels to learn two numbers. For everything
+/// the `image` crate opens that is `image_dimensions`, which parses only the
+/// header. For HEIF the container itself carries the answer: the primary
+/// item's `ispe` property, read by [`heif_container_dimensions`] without
+/// touching the HEVC payload — a few KB against the ~2.5 s a 24 MP decode
+/// costs. When that read cannot answer for certain (an unusual container, a
+/// `clap` crop, an essential property we don't know), it falls back to the
+/// full decode rather than guessing, so this function's result always equals
+/// the decoded frame's size.
+///
+/// Same convention as [`decode`]: for HEIF the container transforms
+/// (`irot`/`imir`) are already applied, and any *EXIF* orientation is not —
+/// callers put that on top with [`swap_for_orientation`], exactly as they
+/// would for a JPEG.
 pub fn read_dimensions(path: &Path) -> Result<(u32, u32)> {
     #[cfg(feature = "heif")]
     if is_heif(path) {
+        if let Some(dims) = heif_container_dimensions(path) {
+            return Ok(dims);
+        }
         let img = decode_heif(path)?;
         return Ok((img.width(), img.height()));
     }
     Ok(image::image_dimensions(path)?)
+}
+
+/// HEIF dimensions straight from the container, no HEVC decode.
+///
+/// ISO 23008-12 stores the primary item's pixel size in an `ispe` box
+/// (`meta` → `iprp` → `ipco`), tied to the item by the `ipma` association
+/// table — for an iPhone grid image the grid item's `ispe` is the declared
+/// final size, so tiling never enters into it. Orientation lives beside it as
+/// `irot`/`imir` properties, which [`decode`] applies to the pixels; an odd
+/// number of quarter turns swaps width and height, a mirror changes nothing.
+///
+/// `None` — never an error — whenever the answer is not certain: no parseable
+/// `meta`, no `ispe` for the primary item, a `clap` crop (which changes the
+/// output size in ways only worth computing in one place, the decoder), or an
+/// unrecognised *essential* property (the spec forbids processing the item at
+/// all, so its effect on the size is unknowable here). The caller then pays
+/// the full decode, which is exactly what every caller did before this
+/// shortcut existed.
+///
+/// `heif-oxide` 0.1 keeps its container parser private and offers only
+/// full-file decode, which is why this minimal reader exists at all; it reads
+/// nothing but box headers and the small `meta` box.
+#[cfg(feature = "heif")]
+fn heif_container_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let meta = heif_read_meta_box(path)?;
+    heif_dimensions_from_meta(&meta)
+}
+
+/// Find the top-level `meta` box and return its payload (version/flags
+/// included), seeking past everything else — `mdat` is most of the file and is
+/// never read.
+#[cfg(feature = "heif")]
+fn heif_read_meta_box(path: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// A `meta` box is a directory of the file, a few KB in practice; a claim
+    /// of more than this is a file we'd rather hand to the real decoder.
+    const META_CAP: u64 = 16 * 1024 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut pos = 0u64;
+    loop {
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header).ok()?;
+        let size32 = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        let box_type = &header[4..8];
+        let (size, header_len) = match size32 {
+            0 => (file_len.checked_sub(pos)?, 8u64), // box runs to end of file
+            1 => {
+                let mut large = [0u8; 8];
+                file.read_exact(&mut large).ok()?;
+                (u64::from_be_bytes(large), 16u64)
+            }
+            n => (n as u64, 8u64),
+        };
+        if size < header_len {
+            return None;
+        }
+        if box_type == b"meta" {
+            let payload = size - header_len;
+            if payload > META_CAP {
+                return None;
+            }
+            let mut buf = vec![0u8; payload as usize];
+            file.read_exact(&mut buf).ok()?;
+            return Some(buf);
+        }
+        pos = pos.checked_add(size)?;
+        if pos >= file_len {
+            return None;
+        }
+        file.seek(SeekFrom::Start(pos)).ok()?;
+    }
+}
+
+/// Walk a `meta` payload (a FullBox: 4 bytes of version/flags, then child
+/// boxes) and fold the primary item's properties into displayed dimensions.
+#[cfg(feature = "heif")]
+fn heif_dimensions_from_meta(meta: &[u8]) -> Option<(u32, u32)> {
+    /// What a property in `ipco` can mean for the primary item's size.
+    enum Prop {
+        /// `ispe`: the pixel size itself.
+        Size(u32, u32),
+        /// `irot`: anti-clockwise quarter turns; odd counts swap the axes.
+        Turns(u8),
+        /// `imir` or any descriptive property: no effect on the size.
+        Neutral,
+        /// `clap`: a crop, whose output size only the decoder computes.
+        Crop,
+        /// Anything unrecognised — could be transformative if marked
+        /// essential, harmlessly descriptive otherwise.
+        Opaque,
+    }
+
+    let be32 = |d: &[u8]| -> Option<u32> { Some(u32::from_be_bytes(d.get(..4)?.try_into().ok()?)) };
+
+    // Child boxes of a payload as (type, payload) pairs.
+    fn children(data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            // 64-bit and to-end sizes never appear inside `meta` in practice;
+            // stop rather than misparse.
+            if size < 8 || off + size > data.len() {
+                break;
+            }
+            let typ: [u8; 4] = data[off + 4..off + 8].try_into().unwrap();
+            out.push((typ, &data[off + 8..off + size]));
+            off += size;
+        }
+        out
+    }
+
+    let boxes = children(meta.get(4..)?);
+    fn find<'a>(list: &[([u8; 4], &'a [u8])], name: &[u8; 4]) -> Option<&'a [u8]> {
+        list.iter().find(|(t, _)| t == name).map(|(_, p)| *p)
+    }
+
+    // pitm — which item is the photograph.
+    let pitm = find(&boxes, b"pitm")?;
+    let primary: u32 = match *pitm.first()? {
+        0 => u16::from_be_bytes(pitm.get(4..6)?.try_into().ok()?) as u32,
+        _ => be32(pitm.get(4..)?)?,
+    };
+
+    let iprp = find(&boxes, b"iprp")?;
+    let iprp_children = children(iprp);
+
+    // ipco — the property pool, in order; `ipma` indexes into it 1-based.
+    let ipco = find(&iprp_children, b"ipco")?;
+    let props: Vec<Prop> = children(ipco)
+        .into_iter()
+        .map(|(t, p)| match &t {
+            b"ispe" => match (be32(p.get(4..)?), be32(p.get(8..)?)) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some(Prop::Size(w, h)),
+                _ => None,
+            },
+            b"irot" => Some(Prop::Turns(p.first()? & 0x03)),
+            b"imir" => Some(Prop::Neutral),
+            b"clap" => Some(Prop::Crop),
+            // Descriptive properties that say nothing about the size. `hvcC`
+            // is on this list deliberately: it is always marked essential (it
+            // is the codec configuration), so the essential-means-bail rule
+            // below must not apply to it or no HEIC ever takes the shortcut.
+            b"hvcC" | b"colr" | b"pixi" | b"auxC" | b"pasp" => Some(Prop::Neutral),
+            _ => Some(Prop::Opaque),
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // ipma — walk entries for the primary item.
+    let ipma = find(&iprp_children, b"ipma")?;
+    let version = *ipma.first()?;
+    let wide_index = ipma.get(3)? & 0x01 != 0;
+    let entry_count = be32(ipma.get(4..)?)?;
+    let mut off = 8usize;
+    let mut dims: Option<(u32, u32)> = None;
+    for _ in 0..entry_count {
+        let item_id = if version < 1 {
+            let id = u16::from_be_bytes(ipma.get(off..off + 2)?.try_into().ok()?) as u32;
+            off += 2;
+            id
+        } else {
+            let id = be32(ipma.get(off..)?)?;
+            off += 4;
+            id
+        };
+        let assoc_count = *ipma.get(off)? as usize;
+        off += 1;
+        for _ in 0..assoc_count {
+            let (essential, index) = if wide_index {
+                let raw = u16::from_be_bytes(ipma.get(off..off + 2)?.try_into().ok()?);
+                off += 2;
+                (raw & 0x8000 != 0, (raw & 0x7fff) as usize)
+            } else {
+                let raw = *ipma.get(off)?;
+                off += 1;
+                (raw & 0x80 != 0, (raw & 0x7f) as usize)
+            };
+            if item_id != primary || index == 0 {
+                continue;
+            }
+            match props.get(index - 1)? {
+                Prop::Size(w, h) => dims = Some((*w, *h)),
+                Prop::Turns(angle) => {
+                    if angle % 2 == 1 {
+                        dims = dims.map(|(w, h)| (h, w));
+                    }
+                }
+                Prop::Neutral => {}
+                Prop::Crop => return None,
+                // Essential-and-unknown may resize the image; the spec says an
+                // item carrying one must not be processed at all, so the
+                // decode we fall back to fails too — the same answer the
+                // import gave before this shortcut. Non-essential unknowns are
+                // descriptive by definition and change nothing.
+                Prop::Opaque => {
+                    if essential {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    dims
 }
 
 /// Write a file so that nothing ever observes it half-finished.
@@ -579,6 +799,125 @@ mod tests {
         );
         assert_eq!(normalize_exif_datetime("0000:00:00 00:00:00"), None);
         assert_eq!(normalize_exif_datetime("garbage"), None);
+    }
+
+    /// The `ispe` shortcut, unit-tested against hand-built `meta` payloads —
+    /// small enough to build in code, and the only way to exercise the corners
+    /// (rotation, crop, essential-unknown, a thumbnail item's competing size)
+    /// without minting binary fixtures for each.
+    #[cfg(feature = "heif")]
+    mod heif_container_dims {
+        use super::super::{heif_dimensions_from_meta, heif_read_meta_box};
+
+        fn boxx(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(typ);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        fn ispe(w: u32, h: u32) -> Vec<u8> {
+            let mut p = vec![0u8; 4]; // fullbox version/flags
+            p.extend_from_slice(&w.to_be_bytes());
+            p.extend_from_slice(&h.to_be_bytes());
+            boxx(b"ispe", &p)
+        }
+
+        /// A `meta` payload: primary item id, the `ipco` pool, and one `ipma`
+        /// entry per item as (item_id, [(essential, 1-based property index)]).
+        fn meta(
+            primary: u16,
+            pool: &[Vec<u8>],
+            entries: &[(u16, &[(bool, u8)])],
+        ) -> Vec<u8> {
+            let mut pitm = vec![0u8; 4];
+            pitm.extend_from_slice(&primary.to_be_bytes());
+
+            let ipco: Vec<u8> = pool.concat();
+
+            let mut ipma = vec![0u8; 4]; // version 0, flags 0 (narrow indices)
+            ipma.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (item, assocs) in entries {
+                ipma.extend_from_slice(&item.to_be_bytes());
+                ipma.push(assocs.len() as u8);
+                for (essential, index) in *assocs {
+                    ipma.push(if *essential { 0x80 | index } else { *index });
+                }
+            }
+
+            let iprp = [boxx(b"ipco", &ipco), boxx(b"ipma", &ipma)].concat();
+            let mut out = vec![0u8; 4]; // meta's own fullbox header
+            out.extend(boxx(b"pitm", &pitm));
+            out.extend(boxx(b"iprp", &iprp));
+            out
+        }
+
+        #[test]
+        fn reads_the_primary_items_ispe() {
+            let m = meta(1, &[ispe(4032, 3024)], &[(1, &[(false, 1)])]);
+            assert_eq!(heif_dimensions_from_meta(&m), Some((4032, 3024)));
+        }
+
+        /// An iPhone shot upright on a turned phone carries `irot`; the
+        /// decoder turns the pixels, so the shortcut must swap the axes or
+        /// every portrait frame reserves a landscape hole in the grid.
+        #[test]
+        fn an_odd_quarter_turn_swaps_the_axes() {
+            let irot = boxx(b"irot", &[1]);
+            let m = meta(1, &[ispe(4032, 3024), irot], &[(1, &[(false, 1), (true, 2)])]);
+            assert_eq!(heif_dimensions_from_meta(&m), Some((3024, 4032)));
+
+            let irot2 = boxx(b"irot", &[2]);
+            let m = meta(1, &[ispe(4032, 3024), irot2], &[(1, &[(false, 1), (true, 2)])]);
+            assert_eq!(heif_dimensions_from_meta(&m), Some((4032, 3024)));
+        }
+
+        /// A clean-aperture crop changes the output size in a way only the
+        /// decoder computes; claiming the uncropped numbers would be wrong,
+        /// so the shortcut declines and the caller pays the decode.
+        #[test]
+        fn a_clap_crop_defers_to_the_decoder() {
+            let clap = boxx(b"clap", &[0u8; 32]);
+            let m = meta(1, &[ispe(4032, 3024), clap], &[(1, &[(false, 1), (true, 2)])]);
+            assert_eq!(heif_dimensions_from_meta(&m), None);
+        }
+
+        /// The spec forbids processing an item whose essential property we do
+        /// not understand — it could be transformative. A non-essential
+        /// unknown is descriptive by definition and changes nothing.
+        #[test]
+        fn an_unknown_property_matters_only_when_essential() {
+            let mystery = boxx(b"xyzw", &[0u8; 4]);
+            let m = meta(1, &[ispe(64, 48), mystery.clone()], &[(1, &[(false, 1), (true, 2)])]);
+            assert_eq!(heif_dimensions_from_meta(&m), None);
+
+            let m = meta(1, &[ispe(64, 48), mystery], &[(1, &[(false, 1), (false, 2)])]);
+            assert_eq!(heif_dimensions_from_meta(&m), Some((64, 48)));
+        }
+
+        /// Real files carry an `ispe` per item — the embedded thumbnail's is
+        /// a few hundred pixels. Reading "the first ispe" instead of the
+        /// primary item's would catalog thumbnail-sized photographs.
+        #[test]
+        fn a_thumbnail_items_ispe_is_not_the_answer() {
+            let m = meta(
+                2,
+                &[ispe(320, 240), ispe(4032, 3024)],
+                &[(1, &[(false, 1)]), (2, &[(false, 2)])],
+            );
+            assert_eq!(heif_dimensions_from_meta(&m), Some((4032, 3024)));
+        }
+
+        /// And the whole path against the real HEVC fixture: the shortcut
+        /// itself must answer — `read_dimensions` falling back to a full
+        /// decode would hide a broken parser behind a passing test.
+        #[test]
+        fn answers_for_a_real_heic_without_decoding() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/hevc.heic");
+            let meta = heif_read_meta_box(&path).expect("fixture has a meta box");
+            assert_eq!(heif_dimensions_from_meta(&meta), Some((1024, 768)));
+        }
     }
 
     #[test]

@@ -547,9 +547,14 @@ fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<
             }
         }
     } else if cand.kind == PhotoKind::Photo && (width.is_none() || height.is_none()) {
-        // The no-thumbnail path exists to be fast, so read the header rather
-        // than decoding twenty-four megapixels to learn two numbers. Only
-        // needed when EXIF did not already carry them.
+        // The no-thumbnail path exists to be fast, so read the size from the
+        // container rather than decoding twenty-four megapixels to learn two
+        // numbers: the image crate parses only the header, and for HEIF the
+        // primary item's `ispe` property answers without an HEVC decode
+        // (`read_dimensions` falls back to the full decode only when the
+        // container cannot say for certain). Either way the numbers are the
+        // pre-EXIF-orientation ones, so the swap below stores what the
+        // viewer will see — the same convention the thumbnail path stores.
         match media::read_dimensions(&cand.abs_path) {
             Ok((w, h)) => {
                 let (w, h) = media::swap_for_orientation(w, h, metadata.orientation);

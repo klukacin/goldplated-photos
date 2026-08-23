@@ -64,6 +64,69 @@ fn webp_dimensions_are_readable_without_a_full_decode() {
     assert_eq!(media::read_dimensions(&fixture("sample.webp")).unwrap(), (64, 48));
 }
 
+/// The cheap read and the full decode are two answers to one question, and
+/// they must never disagree — the catalog stores whichever path ran, and the
+/// grid reserves space with it.
+#[cfg(feature = "heif")]
+#[test]
+fn cheap_dimensions_equal_decoded_dimensions() {
+    for name in ["hevc.heic", "sample.webp"] {
+        let path = fixture(name);
+        let img = media::decode(&path).unwrap();
+        assert_eq!(
+            media::read_dimensions(&path).unwrap(),
+            (img.width(), img.height()),
+            "{name}: the shortcut and the decoder disagree"
+        );
+    }
+}
+
+/// A metadata-only import exists to be fast, but it must still catalog the
+/// same dimensions a full import would — `--no-thumbs` is a speed choice, not
+/// a different answer. This is the path that used to pay a full HEVC decode
+/// per HEIC just to learn two numbers; now the container's `ispe` answers.
+#[cfg(feature = "heif")]
+#[test]
+fn a_no_thumbs_import_records_the_same_dimensions_as_a_full_one() {
+    use gpp_core::import::{import_dir, ImportOptions};
+
+    let dims = |thumbs: bool| -> Vec<(String, Option<u32>, Option<u32>)> {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let lib = gpp_core::Library::open(lib_dir.path()).unwrap();
+        let shoot = lib_dir.path().join("shoot");
+        std::fs::create_dir_all(&shoot).unwrap();
+        std::fs::copy(fixture("hevc.heic"), shoot.join("IMG_4021.HEIC")).unwrap();
+        std::fs::copy(fixture("sample.webp"), shoot.join("export.webp")).unwrap();
+        image::DynamicImage::new_rgb8(40, 30)
+            .save_with_format(shoot.join("b.jpg"), image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let opts = ImportOptions { generate_thumbnails: thumbs, ..Default::default() };
+        import_dir(&lib, &shoot, &opts, None, None).unwrap();
+
+        let mut rows: Vec<_> = lib
+            .photos(&Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.filename, p.width, p.height))
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let full = dims(true);
+    let cheap = dims(false);
+    assert_eq!(
+        full,
+        vec![
+            ("IMG_4021.HEIC".to_string(), Some(1024), Some(768)),
+            ("b.jpg".to_string(), Some(40), Some(30)),
+            ("export.webp".to_string(), Some(64), Some(48)),
+        ]
+    );
+    assert_eq!(cheap, full, "--no-thumbs catalogued different dimensions");
+}
+
 /// What reaches a client has to be a file their browser can open.
 ///
 /// Chrome and Firefox cannot display HEIC at all — only Safari can — so a HEIC
