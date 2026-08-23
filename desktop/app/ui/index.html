@@ -83,7 +83,20 @@
       </main>
 
       <aside id="inspector" class="inspector" hidden>
-        <img id="inspector-img" class="inspector-img" alt="">
+        <!-- The crop rectangle is measured against the picture the preview
+             actually draws, so it has to sit in a box that matches the image
+             element exactly — hence the wrapper rather than a floating layer. -->
+        <div id="inspector-frame" class="inspector-frame">
+          <img id="inspector-img" class="inspector-img" alt="">
+          <div id="crop-overlay" class="crop-overlay" hidden>
+            <div id="crop-rect" class="crop-rect">
+              <span class="crop-handle nw" data-handle="nw"></span>
+              <span class="crop-handle ne" data-handle="ne"></span>
+              <span class="crop-handle sw" data-handle="sw"></span>
+              <span class="crop-handle se" data-handle="se"></span>
+            </div>
+          </div>
+        </div>
         <div class="inspector-body">
           <h3 id="inspector-name"></h3>
           <div class="rating-row" id="inspector-rating"></div>
@@ -102,7 +115,17 @@
               <button id="dev-rotate-right" class="btn btn-sm" title="Rotate 90° right">↻</button>
               <button id="dev-flip-h" class="btn btn-sm" title="Flip left to right">⇋</button>
               <button id="dev-flip-v" class="btn btn-sm" title="Flip top to bottom">⇵</button>
+              <button id="dev-crop" class="btn btn-sm" title="Crop">⛶</button>
               <span id="dev-geometry-state" class="muted"></span>
+            </div>
+            <!-- Only while framing. Cancel puts back whatever crop was on the
+                 photo when the tool opened; Remove leaves it off. -->
+            <div id="crop-actions" class="crop-actions" hidden>
+              <span id="crop-readout" class="muted"></span>
+              <div class="spacer"></div>
+              <button id="crop-remove" class="btn btn-sm" hidden>Remove crop</button>
+              <button id="crop-cancel" class="btn btn-sm">Cancel</button>
+              <button id="crop-apply" class="btn btn-sm btn-primary">Apply</button>
             </div>
             <div id="develop-sliders" class="sliders"></div>
             <div class="develop-actions">
