@@ -224,10 +224,18 @@ const albums = {
           cell.className = 'proofing-thumb';
 
           const img = document.createElement('img');
-          img.src = `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(albumPath + '/' + sel.filename)}&size=small`;
+          img.src = getPreviewThumbnailUrl(albumPath, sel.filename, 'small');
           img.alt = sel.filename;
           img.loading = 'lazy';
-          img.onerror = () => { img.src = getAlbumImageUrl(albumPath, sel.filename); };
+          // Only fall back to the original for formats a browser can paint —
+          // a raw .heic here is a broken image on everything but Safari.
+          img.onerror = () => {
+            if (isBrowserDisplayableImage(sel.filename)) {
+              img.src = getAlbumImageUrl(albumPath, sel.filename);
+            } else {
+              img.remove();
+            }
+          };
           cell.appendChild(img);
 
           const label = document.createElement('div');

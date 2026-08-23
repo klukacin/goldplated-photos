@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { marked } from 'marked';
 import { getAlbumMediaMeta } from './media-cache';
+import { IMAGE_EXTENSIONS } from './image-formats';
 
 export type Album = CollectionEntry<'albums'>;
 
@@ -22,8 +23,10 @@ export interface Photo {
   camera?: string | null;
 }
 
-// Supported file extensions
-export const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
+// Supported file extensions. The image list lives in image-formats.ts next to
+// the rule about which of them a browser can actually paint — the two have to
+// move together, or adding a format quietly adds broken images.
+export { IMAGE_EXTENSIONS } from './image-formats';
 export const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
 export const ARCHIVE_EXTENSIONS = ['.zip', '.rar', '.7z'];
 

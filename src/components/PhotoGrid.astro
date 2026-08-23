@@ -1381,6 +1381,9 @@ function getVideoMimeType(filename: string): string {
   // Overlay markup lives in src/lib/media-info.ts so the escaping of
   // file-supplied EXIF/ffprobe strings can be unit-tested.
   import { formatExifData, formatVideoInfo } from '../lib/media-info';
+  // Chrome and Firefox cannot decode HEIC, so the Original-quality toggle has
+  // to keep serving the transcoded thumbnail for those files.
+  import { browserSafeImageUrl, needsBrowserTranscode } from '../lib/image-formats';
 
   // Current photo URL for EXIF data
   let currentPhotoUrl = '';
@@ -2087,8 +2090,15 @@ function getVideoMimeType(filename: string): string {
       const originalSizeBytes = parseInt(photoItem?.getAttribute('data-photo-size') || '0');
 
       // Update size display based on mode
+      const photoUrlForFormat = element?.getAttribute('data-photo-url') || '';
+      const originalIsUndisplayable = needsBrowserTranscode(photoUrlForFormat);
+
       if (isOriginalMode) {
-        sizeDisplay.textContent = `Original · ${originalW}×${originalH} · ${formatFileSize(originalSizeBytes)}`;
+        // The pixels on screen are still the 1920px transcode for a HEIC — say
+        // so rather than claiming the browser is showing a 48-megapixel file it
+        // cannot even decode.
+        const label = originalIsUndisplayable ? 'Original (converted)' : 'Original';
+        sizeDisplay.textContent = `${label} · ${originalW}×${originalH} · ${formatFileSize(originalSizeBytes)}`;
       } else {
         // Thumbnail mode - calculate actual thumbnail dimensions (1920px max on longest side)
         const origW = parseInt(originalW) || 1920;
@@ -2120,6 +2130,9 @@ function getVideoMimeType(filename: string): string {
 
       // Update original button state
       originalBtn.classList.toggle('active', isOriginalMode);
+      originalBtn.title = originalIsUndisplayable
+        ? 'Original quality (O) — HEIC is shown converted; browsers cannot display it'
+        : 'Original quality (O)';
 
       // Update proofing heart state for the current photo
       proofingUpdateUI();
@@ -2132,13 +2145,19 @@ function getVideoMimeType(filename: string): string {
 
       const photoUrl = pswp.currSlide.data?.element?.getAttribute('data-photo-url');
       if (photoUrl) {
+        const path = photoUrl.replace('/albums/', '');
+        const largeThumb = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
         if (isOriginalMode) {
-          // Load original image for current slide
-          pswp.currSlide.data.src = photoUrl;
+          // Load the original file — except for HEIC/HEIF, which Chrome and
+          // Firefox cannot decode at all. Pointing an <img> at one of those
+          // replaces the photo with a broken-image icon, and only Safari users
+          // would ever see it work. Those stay on the 1920px transcode; the
+          // size readout below still reports the original's true dimensions
+          // and weight, so the toggle is honest about what exists on disk.
+          pswp.currSlide.data.src = browserSafeImageUrl(photoUrl, largeThumb);
         } else {
           // Revert to thumbnail
-          const path = photoUrl.replace('/albums/', '');
-          pswp.currSlide.data.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
+          pswp.currSlide.data.src = largeThumb;
         }
         pswp.refreshSlideContent(pswp.currIndex);
       }

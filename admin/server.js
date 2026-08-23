@@ -118,6 +118,19 @@ function sanitizePath(inputPath) {
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
 const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
 
+// The subset a browser can paint on its own.
+//
+// Album photos may be any of IMAGE_EXTENSIONS: the gallery only ever shows
+// them through /api/thumbnail, which converts to JPEG or WebP. Public assets —
+// hero slides, home cards, the landing background — are served raw out of
+// public/, with no conversion anywhere in the chain, so HEIC/HEIF there is a
+// hero slider that renders on the photographer's Safari and nowhere else.
+// Chrome and Firefox cannot decode HEIC at all.
+//
+// Kept in step with src/lib/image-formats.ts (unit-tested there); this file is
+// plain Node ESM and cannot import the TypeScript module.
+const BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+
 // Multer setup for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -162,13 +175,14 @@ const storage = multer.diskStorage({
 const MAX_IMAGE_SIZE = 100 * 1024 * 1024;  // 100 MB per image
 const MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB per video
 
-function extFilter(allowedExtensions) {
+function extFilter(allowedExtensions, reason) {
   return (req, file, cb) => {
     const ext = extname(file.originalname || '').toLowerCase();
     if (allowedExtensions.includes(ext)) {
       cb(null, true);
     } else {
-      cb(new HttpError(400, `File type not allowed: ${file.originalname}`));
+      const because = reason ? ` — ${reason}` : '';
+      cb(new HttpError(400, `File type not allowed: ${file.originalname}${because}`));
     }
   };
 }
@@ -183,10 +197,26 @@ const uploadVideos = multer({
   limits: { fileSize: MAX_VIDEO_SIZE, files: 20 },
   fileFilter: extFilter(VIDEO_EXTENSIONS)
 });
+// Uploads that land in public/ and are served to browsers verbatim. Nothing
+// converts these, so HEIC/HEIF has to be turned away at the door rather than
+// becoming a permanently broken image on the home page.
+const uploadPublicAssets = multer({
+  storage,
+  limits: { fileSize: MAX_IMAGE_SIZE, files: 1 },
+  fileFilter: extFilter(
+    BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+    'site images are served to browsers as-is, and HEIC/HEIF only render in Safari. Convert to JPEG, PNG or WebP first'
+  )
+});
 
 // Helper: Check if file is an image
 function isImage(filename) {
   return IMAGE_EXTENSIONS.includes(extname(filename).toLowerCase());
+}
+
+// Helper: Check if a file can go straight into an <img> (see the constant above)
+function isBrowserDisplayableImage(filename) {
+  return BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS.includes(extname(filename).toLowerCase());
 }
 
 // Helper: Check if file is a video
@@ -761,8 +791,11 @@ app.get('/api/assets/hero', (req, res, next) => {
       return res.json([]);
     }
 
+    // Only formats a browser paints — a .heic dropped into public/home/hero by
+    // hand is invisible to home.astro's slider too, so listing it here would
+    // just offer the photographer a slide that never shows.
     const images = readdirSync(heroDir)
-      .filter(f => isImage(f))
+      .filter(f => isBrowserDisplayableImage(f))
       .map(f => ({
         filename: f,
         url: `/home/hero/${f}`
@@ -778,7 +811,7 @@ app.get('/api/assets/hero', (req, res, next) => {
 app.post('/api/assets/hero', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'home/hero');
   next();
-}, uploadImages.single('image'), (req, res, next) => {
+}, uploadPublicAssets.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     res.json({ success: true, filename: req.file.filename });
@@ -809,8 +842,9 @@ app.get('/api/assets/cards', (req, res, next) => {
       return res.json([]);
     }
 
+    // Same rule as hero images: card images are served raw from public/.
     const images = readdirSync(cardsDir)
-      .filter(f => isImage(f))
+      .filter(f => isBrowserDisplayableImage(f))
       .map(f => ({
         filename: f,
         url: `/home/cards/${f}`
@@ -826,7 +860,7 @@ app.get('/api/assets/cards', (req, res, next) => {
 app.post('/api/assets/cards', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'home/cards');
   next();
-}, uploadImages.single('image'), (req, res, next) => {
+}, uploadPublicAssets.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     const filename = req.file.filename;
@@ -855,7 +889,7 @@ app.delete('/api/assets/cards/:name', (req, res, next) => {
 app.post('/api/assets/landing', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'images');
   next();
-}, uploadImages.single('image'), (req, res, next) => {
+}, uploadPublicAssets.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     // Rename to landing-bg.jpg (this endpoint always replaces the background)

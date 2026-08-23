@@ -341,6 +341,15 @@ Photos are discovered by scanning the album directory for image files (see `getP
 - **To regenerate:** Delete `.meta/thumbnails` directory (ignored by git)
 - PhotoGrid component automatically requests thumbnails via `getThumbnailUrl()` helper
 
+**HEIC/HEIF and WebP:** Sharp reads both (libvips is built with libheif), so albums accept whatever an iPhone shoots — but **Chrome and Firefox cannot display HEIC at all**, and neither can the Facebook or X crawlers. Only Safari can, which is how a broken gallery ships unnoticed from a Mac. So:
+
+- Every HEIC that reaches an `<img src>`, a CSS background or an `og:image` goes through `/api/thumbnail`, which always *writes* JPEG or WebP — the source format never gets a vote in content negotiation. The lightbox's Original-quality toggle (`O`) is included: it stays on the 1920px transcode for HEIC and labels the readout "Original (converted)".
+- Downloads are exempt. `/albums/*` and the ZIP endpoint serve the untouched original — a file is a file.
+- Public assets (`public/home/hero`, `public/home/cards`, the landing background) are served **raw**, with no conversion anywhere, so the admin refuses a HEIC/HEIF upload there and does not list one it finds.
+- WebP needs none of this; browsers decode it natively.
+
+The rule lives in one place, `src/lib/image-formats.ts` (unit-tested in `tests/image-formats.test.ts`), and `IMAGE_EXTENSIONS` is re-exported from there so adding a format cannot quietly skip the displayability question. `admin/server.js` and `admin/js/utils.js` keep hand-copies — plain JS cannot import the TS module — with comments saying so.
+
 **EXIF Orientation:** Sharp's `.rotate()` is applied during thumbnail generation to auto-rotate images based on EXIF orientation metadata.
 - **IMPORTANT:** Always use thumbnails for display (not original images) to ensure correct orientation
 - Original images may display rotated wrong because browsers don't consistently respect EXIF orientation
