@@ -439,6 +439,11 @@ fn scan(lib: &Library, dir: &Path, recursive: bool) -> Result<Vec<Candidate>> {
     } else {
         root.join(dir)
     };
+    // The root is canonical (`Library::open` sees to that), so the folder has
+    // to be compared in the same spelling — a caller may name it through a
+    // symlink, and `/tmp` on macOS is one. Without this, an in-place import of
+    // a folder that is plainly inside the library failed as "invalid path".
+    let dir = dir.canonicalize().unwrap_or(dir);
     if !dir.starts_with(root) {
         return Err(Error::InvalidPath(dir.display().to_string()));
     }
@@ -659,6 +664,42 @@ mod tests {
         assert_eq!(summary.copied_in, 0);
         assert_eq!(summary.copied_into, None, "nothing was copied anywhere");
         assert!(!summary.cancelled);
+    }
+
+    /// A library whose path runs through a symlink — `/var` and `/tmp` are
+    /// symlinks on macOS, so "my library on the external drive" often is one.
+    /// The copy-in step canonicalized the root and put every file under the
+    /// canonical spelling, but the scan validated and stripped against the raw
+    /// stored root: the whole card was copied in and then nothing was
+    /// catalogued, the run dying with InvalidPath. The root is canonicalized
+    /// once, at open, so every later comparison uses one spelling.
+    #[cfg(unix)]
+    #[test]
+    fn importing_through_a_symlinked_library_root_still_catalogues() {
+        let real = tempfile::tempdir().unwrap();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("gallery");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let card = tempfile::tempdir().unwrap();
+        write_jpeg(&card.path().join("DCIM/a.jpg"), 40, 30);
+
+        let lib = Library::open(&link).unwrap();
+        let summary =
+            import_dir(&lib, &card.path().join("DCIM"), &ImportOptions::default(), None, None)
+                .unwrap();
+        assert_eq!(summary.copied_in, 1);
+        assert_eq!(summary.imported, 1, "the copy arrived but was never catalogued");
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+
+        // In-place import through the symlinked spelling works too.
+        let in_place =
+            import_dir(&lib, &link.join("DCIM"), &ImportOptions::default(), None, None).unwrap();
+        assert_eq!(in_place.skipped, 1, "same file, already catalogued");
+
+        let photos = lib.photos(&PhotoFilter::default()).unwrap();
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].rel_path, "DCIM/a.jpg");
     }
 
     /// A second card of the same name is a second shoot, not an overwrite.

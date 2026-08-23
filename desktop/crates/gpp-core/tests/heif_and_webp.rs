@@ -120,6 +120,106 @@ fn a_heic_is_published_as_a_jpeg_a_browser_can_open() {
     );
 }
 
+/// The cover is stored as a *library* filename, and `thumbnail:` must name a
+/// file the published tree actually holds — for a HEIC those differ, so a HEIC
+/// cover silently emitted no `thumbnail:` at all and the site fell back to the
+/// first photo.
+#[cfg(feature = "heif")]
+#[test]
+fn a_heic_cover_still_emits_a_thumbnail() {
+    use gpp_core::albums::{AlbumUpdate, NewAlbum};
+    use gpp_core::import::{import_dir, ImportOptions};
+    use gpp_core::publish::{publish_album, PublishOptions};
+
+    let lib_dir = tempfile::tempdir().unwrap();
+    let lib = gpp_core::Library::open(lib_dir.path()).unwrap();
+    let shoot = lib_dir.path().join("shoot");
+    std::fs::create_dir_all(&shoot).unwrap();
+    std::fs::copy(fixture("hevc.heic"), shoot.join("IMG_4021.HEIC")).unwrap();
+    image::DynamicImage::new_rgb8(40, 30)
+        .save_with_format(shoot.join("b.jpg"), image::ImageFormat::Jpeg)
+        .unwrap();
+
+    import_dir(&lib, &shoot, &ImportOptions::default(), None, None).unwrap();
+    lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+    let ids: Vec<i64> = lib.photos(&Default::default()).unwrap().iter().map(|p| p.id).collect();
+    lib.add_photos_to_album("a", &ids).unwrap();
+
+    let heic = lib.photo_by_rel_path("shoot/IMG_4021.HEIC").unwrap().unwrap();
+    lib.update_album(
+        "a",
+        &AlbumUpdate { cover_photo_id: Some(Some(heic.id)), ..Default::default() },
+    )
+    .unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+    let index = std::fs::read_to_string(dest.path().join("a/index.md")).unwrap();
+    assert!(
+        index.contains("thumbnail: \"IMG_4021.jpg\""),
+        "the cover must name the published file:\n{index}"
+    );
+}
+
+/// A pulled `photoOrder` names *published* files, and for a HEIC that is the
+/// `.jpg` spelling — while the local catalog holds the library name. Matching
+/// on the library filename alone treated every HEIC frame as unnamed, so the
+/// machine that authored the order watched its own pull reshuffle the album.
+#[cfg(feature = "heif")]
+#[test]
+fn a_pulled_photo_order_matches_heic_frames_by_their_published_name() {
+    use gpp_core::albums::{AlbumUpdate, NewAlbum};
+    use gpp_core::import::{import_dir, ImportOptions};
+    use gpp_core::publish::PublishOptions;
+    use gpp_core::remote;
+    use gpp_core::sync::FsTransport;
+
+    let lib_dir = tempfile::tempdir().unwrap();
+    let lib = gpp_core::Library::open(lib_dir.path()).unwrap();
+    let album_dir = lib_dir.path().join("2026/ana");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::copy(fixture("hevc.heic"), album_dir.join("IMG_4021.HEIC")).unwrap();
+    image::DynamicImage::new_rgb8(40, 30)
+        .save_with_format(album_dir.join("b.jpg"), image::ImageFormat::Jpeg)
+        .unwrap();
+
+    import_dir(&lib, &album_dir, &ImportOptions::default(), None, None).unwrap();
+    lib.create_album(&NewAlbum { path: "2026/ana".into(), ..Default::default() }).unwrap();
+    let heic = lib.photo_by_rel_path("2026/ana/IMG_4021.HEIC").unwrap().unwrap();
+    let jpg = lib.photo_by_rel_path("2026/ana/b.jpg").unwrap().unwrap();
+    lib.add_photos_to_album("2026/ana", &[heic.id, jpg.id]).unwrap();
+    // Deliberate order with the HEIC first — "b.jpg" would sort ahead of it.
+    lib.reorder_album("2026/ana", &[heic.id, jpg.id]).unwrap();
+    lib.update_album(
+        "2026/ana",
+        &AlbumUpdate { sort: Some("custom".into()), ..Default::default() },
+    )
+    .unwrap();
+
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let published = tempfile::tempdir().unwrap();
+    remote::push_album(
+        &lib, &server, "2026/ana", published.path(), &PublishOptions::default(), false,
+    )
+    .unwrap();
+
+    // Pulling back reads the published photoOrder — "IMG_4021.jpg" first.
+    remote::pull_album(&lib, &server, "2026/ana", published.path()).unwrap();
+
+    let order: Vec<String> = lib
+        .album_photos("2026/ana")
+        .unwrap()
+        .into_iter()
+        .map(|p| p.filename)
+        .collect();
+    assert_eq!(
+        order,
+        vec!["IMG_4021.HEIC".to_string(), "b.jpg".to_string()],
+        "the pull reshuffled an order it should have recognised"
+    );
+}
+
 // ------------------------------------------------------- without the feature
 //
 // OFF is a behaviour, not an absence of one, and it has to be the pre-HEIF

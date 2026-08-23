@@ -577,16 +577,33 @@ impl Library {
             .ok_or_else(|| Error::AlbumNotFound(to))
     }
 
-    /// Delete an album. Photos are untouched — an album is a view over them,
-    /// not a container of them.
+    /// Delete an album, and everything under it. Photos are untouched — an
+    /// album is a view over them, not a container of them — but the descendant
+    /// album rows go too, the way [`move_album`] carries them: a collection's
+    /// children name it as `parent_path`, so leaving them behind strands a
+    /// whole branch pointing at a folder the catalog no longer has.
     pub fn delete_album(&self, path: &str) -> Result<()> {
+        let descendant_prefix = format!("{path}/");
         let n = self.with_tx(|tx| {
             let n = tx.execute("DELETE FROM albums WHERE path = ?1", params![path])?;
-            // The subscription goes with it. Left behind it names an album the
-            // catalog no longer has, and every later sync has to work around a
-            // row describing nothing.
             if n > 0 {
+                // Descendants, by literal prefix rather than LIKE — `_` and
+                // `%` are legal in a folder name and are SQL wildcards, the
+                // same trap `move_album` documents. Memberships in
+                // `album_photos` cascade with each row; the photographs stay.
+                tx.execute(
+                    "DELETE FROM albums WHERE substr(path, 1, ?2) = ?1",
+                    params![descendant_prefix, descendant_prefix.chars().count() as i64],
+                )?;
+                // The subscriptions go with them — the deleted album's own and
+                // its descendants'. Left behind they name albums the catalog
+                // no longer has, and every later sync has to work around rows
+                // describing nothing.
                 tx.execute("DELETE FROM album_sync WHERE album_path = ?1", params![path])?;
+                tx.execute(
+                    "DELETE FROM album_sync WHERE substr(album_path, 1, ?2) = ?1",
+                    params![descendant_prefix, descendant_prefix.chars().count() as i64],
+                )?;
             }
             Ok(n)
         })?;
@@ -998,6 +1015,67 @@ mod tests {
         assert!(
             l.album_by_path("axb/theirs").unwrap().is_some(),
             "an unrelated album must not be dragged along by a wildcard match"
+        );
+    }
+
+    /// Deleting a collection has to take the branch with it, the way a move
+    /// carries one: descendant rows left behind hold a `parent_path` naming a
+    /// folder the catalog no longer has, and their sync subscriptions keep
+    /// firing for albums that no longer exist. Photographs are untouched
+    /// either way — memberships cascade, the files and their rows stay.
+    #[test]
+    fn deleting_a_collection_takes_its_descendants_and_their_subscriptions() {
+        let l = lib();
+        l.create_album(&new_album("2026/weddings/ana")).unwrap();
+        l.create_album(&new_album("2026/weddings/mia")).unwrap();
+        l.create_album(&new_album("2026/events")).unwrap();
+        let id = insert_photo(&l, "one.jpg");
+        l.add_photos_to_album("2026/weddings/ana", &[id]).unwrap();
+        l.track_album("2026/weddings", crate::sync::SyncDirection::Both).unwrap();
+        l.track_album("2026/weddings/ana", crate::sync::SyncDirection::Push).unwrap();
+        l.track_album("2026/events", crate::sync::SyncDirection::Push).unwrap();
+
+        l.delete_album("2026/weddings").unwrap();
+
+        assert!(l.album_by_path("2026/weddings").unwrap().is_none());
+        assert!(
+            l.album_by_path("2026/weddings/ana").unwrap().is_none(),
+            "a child row survived its parent's deletion"
+        );
+        assert!(l.album_by_path("2026/weddings/mia").unwrap().is_none());
+        assert!(l.album_by_path("2026/events").unwrap().is_some(), "sibling untouched");
+
+        assert!(
+            l.album_subscription("2026/weddings").unwrap().is_none(),
+            "the collection's own subscription outlived it"
+        );
+        assert!(
+            l.album_subscription("2026/weddings/ana").unwrap().is_none(),
+            "a descendant's subscription outlived its album"
+        );
+        assert!(l.album_subscription("2026/events").unwrap().is_some());
+
+        // An album is a view: the photograph's catalog row is untouched.
+        assert!(l.photo_by_rel_path("a/one.jpg").unwrap().is_some());
+    }
+
+    /// The same wildcard trap `move_album` documents: `_` is legal in a folder
+    /// name and is SQL's single-character wildcard, so a LIKE-based descendant
+    /// match would delete an unrelated neighbour.
+    #[test]
+    fn deleting_an_album_with_an_underscore_leaves_its_neighbours_alone() {
+        let l = lib();
+        l.create_album(&new_album("a_b")).unwrap();
+        l.create_album(&new_album("a_b/mine")).unwrap();
+        l.create_album(&new_album("axb")).unwrap();
+        l.create_album(&new_album("axb/theirs")).unwrap();
+
+        l.delete_album("a_b").unwrap();
+
+        assert!(l.album_by_path("a_b/mine").unwrap().is_none(), "its own child went with it");
+        assert!(
+            l.album_by_path("axb/theirs").unwrap().is_some(),
+            "an unrelated album must not be deleted by a wildcard match"
         );
     }
 

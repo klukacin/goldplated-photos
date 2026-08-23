@@ -299,11 +299,23 @@ pub fn publish_album(
                 src
             };
 
-            // Skip when destination already matches by size — cheap and
-            // correct enough, since a real change alters the byte count or the
-            // sync layer's hash catches it.
+            // Skip only when the destination already holds exactly these
+            // bytes. Size alone was the old test, with a comment claiming a
+            // same-length change would be caught by "the sync layer's hash" —
+            // it is not: the sync manifest hashes the *published* tree, so a
+            // develop that happened to produce the same byte count left the
+            // stale frame on the site and nothing anywhere disagreed. A size
+            // mismatch still short-circuits straight to the copy, so the
+            // common changed-file case pays no hashing; equal sizes cost one
+            // blake3 of each side, which is the price of knowing rather than
+            // guessing.
             if let (Ok(s), Ok(d)) = (std::fs::metadata(&src), std::fs::metadata(&dest)) {
-                if s.len() == d.len() {
+                let unchanged = s.len() == d.len()
+                    && matches!(
+                        (crate::import::hash_file(&src), crate::import::hash_file(&dest)),
+                        (Ok(a), Ok(b)) if a == b
+                    );
+                if unchanged {
                     result.photos_skipped += 1;
                     result.written.push(format!("{album_path}/{published}"));
                     continue;
@@ -472,12 +484,18 @@ pub fn render_frontmatter(album: &Album, photos: &[Photo]) -> String {
     out.push_str(&yaml_kv("style", &album.style));
 
     // Cover: explicit choice, else let the site fall back to the first photo.
-    if let Some(cover) = album
-        .cover_filename
-        .as_deref()
-        .filter(|c| photos.iter().any(|p| published_filename(p) == *c))
-    {
-        out.push_str(&yaml_kv("thumbnail", cover));
+    // `cover_filename` is the *library* name; what the tree holds — and what
+    // `thumbnail:` must name — is the published one, which for a HEIC differs
+    // (`x.heic` ships as `x.jpg`). Comparing the raw name against published
+    // candidates meant a HEIC cover never emitted `thumbnail:` at all. Either
+    // spelling is accepted, and the published one is what gets written.
+    if let Some(cover) = album.cover_filename.as_deref().and_then(|c| {
+        photos
+            .iter()
+            .find(|p| p.filename == c || published_filename(p) == c)
+            .map(published_filename)
+    }) {
+        out.push_str(&yaml_kv("thumbnail", &cover));
     }
 
     if !album.tags.is_empty() {
@@ -994,6 +1012,49 @@ mod tests {
         assert_eq!(r.bytes_copied, on_disk);
     }
 
+    /// The skip that spares an unchanged photo used to test size alone, on the
+    /// claim that "the sync layer's hash catches" a same-length change. It
+    /// does not — the sync manifest hashes the *published* tree, so published
+    /// bytes that differ from the source at the same byte count were simply
+    /// never refreshed, and the stale frame stayed on the site.
+    #[test]
+    fn a_published_file_with_the_same_length_but_different_bytes_is_rewritten() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/one.jpg"), 60, 40);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let one = lib.photo_by_rel_path("a/one.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[one.id]).unwrap();
+        publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+
+        // The published copy drifts — same length, different bytes. An edit
+        // that renders to the same byte count looks exactly like this from
+        // where the copy loop stands: src and dest agree on size and on
+        // nothing else.
+        let published = dest.path().join("a/one.jpg");
+        let mut bytes = std::fs::read(&published).unwrap();
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&published, &bytes).unwrap();
+
+        let again = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(again.photos_copied, 1, "a same-length difference must be recopied");
+        assert_eq!(again.photos_skipped, 0);
+        assert_eq!(
+            std::fs::read(&published).unwrap(),
+            std::fs::read(src.path().join("a/one.jpg")).unwrap(),
+            "the published tree still holds the stale bytes"
+        );
+
+        // A genuinely unchanged file keeps its fast path.
+        let third = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(third.photos_copied, 0);
+        assert_eq!(third.photos_skipped, 1);
+    }
+
     #[test]
     fn respects_rating_filter_and_rejects() {
         let src = tempfile::tempdir().unwrap();
@@ -1253,9 +1314,25 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
     out
 }
 
-/// Strip surrounding double quotes and undo the escaping `yaml_scalar` applies.
+/// Strip surrounding quotes and undo their escaping.
+///
+/// Two quoting styles arrive here, from two different writers. This module's
+/// own [`yaml_scalar`] double-quotes with backslash escapes. The web admin
+/// writes these files with js-yaml, which prefers *single*-quoted scalars —
+/// `'Ana: the day'`, `'it''s'` — whose one and only escape is the doubled
+/// apostrophe. A pull reads both, so both have to unquote here, or a
+/// single-quoted title comes back wearing its quotes (and `''` still doubled).
 fn unquote(value: &str) -> String {
     let trimmed = value.trim();
+
+    // Single-quoted (js-yaml's style): no backslash escapes at all, `''` → `'`.
+    if let Some(inner) = trimmed
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return inner.replace("''", "'");
+    }
+
     let Some(inner) = trimmed
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
@@ -1387,6 +1464,26 @@ mod parse_tests {
                 "round trip of {value:?}"
             );
         }
+    }
+
+    /// The web admin writes these files with js-yaml, which single-quotes:
+    /// `'Ana: the day'`, `'it''s'`. This parser only ever met its own
+    /// double-quoted output, so a single-quoted title came back wearing its
+    /// quotes — and a doubled apostrophe stayed doubled.
+    #[test]
+    fn accepts_js_yaml_single_quoted_scalars() {
+        let p = parse_frontmatter(
+            "---\ntitle: 'Ana: the day'\npassword: 'tajna lozinka'\n---\n",
+        );
+        assert_eq!(p.title.as_deref(), Some("Ana: the day"));
+        assert_eq!(p.password.as_deref(), Some("tajna lozinka"));
+
+        let doubled = parse_frontmatter("---\ntitle: 'it''s the day'\n---\n");
+        assert_eq!(doubled.title.as_deref(), Some("it's the day"));
+
+        // And the double-quoted style this module writes is unaffected.
+        let ours = parse_frontmatter("---\ntitle: \"it's 'quoted'\"\n---\n");
+        assert_eq!(ours.title.as_deref(), Some("it's 'quoted'"));
     }
 
     #[test]

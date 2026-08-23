@@ -265,42 +265,58 @@ fn pull_one(
     }
 
     // --- 1. Album settings ------------------------------------------------
+    //
+    // A failed fetch of the settings must not read as "the album has none".
+    // The update below writes `Some(None)` / `Some(false)` clear-values for
+    // every field the parse did not find, so treating a transport error as an
+    // empty frontmatter stripped password, shareToken and tags off the local
+    // album — and a Both-direction sync then pushed the stripped `index.md`
+    // back to the server. So: a fetch of an `index.md` the manifest names is
+    // allowed to fail the album, exactly as a failed photo fetch below does —
+    // the error rides out to the same per-album failure reporting
+    // (`sync_tracked_albums` catches it against this album's path). An album
+    // the manifest holds no `index.md` for simply has no settings to adopt,
+    // and the local ones are left alone.
     let index_key = format!("{album_path}/index.md");
-    let parsed = match transport.get(&index_key) {
-        Ok(bytes) => parse_frontmatter(&String::from_utf8_lossy(&bytes)),
-        Err(_) => Default::default(),
+    let parsed = if remote.contains_key(&index_key) {
+        let bytes = transport.get(&index_key)?;
+        Some(parse_frontmatter(&String::from_utf8_lossy(&bytes)))
+    } else {
+        None
     };
 
     if lib.album_by_path(album_path)?.is_none() {
         lib.create_album(&NewAlbum {
             path: album_path.to_string(),
-            title: parsed.title.clone(),
-            description: parsed.description.clone(),
-            date: parsed.date.clone(),
-            is_collection: parsed.is_collection,
+            title: parsed.as_ref().and_then(|p| p.title.clone()),
+            description: parsed.as_ref().and_then(|p| p.description.clone()),
+            date: parsed.as_ref().and_then(|p| p.date.clone()),
+            is_collection: parsed.as_ref().is_some_and(|p| p.is_collection),
         })?;
     }
-    lib.update_album(
-        album_path,
-        &AlbumUpdate {
-            title: parsed.title.clone(),
-            // Adopt the server's id: it is what the access cookie references.
-            token: parsed.token.clone(),
-            description: Some(parsed.description.clone()),
-            date: Some(parsed.date.clone()),
-            password: Some(parsed.password.clone()),
-            share_token: Some(parsed.share_token.clone()),
-            sort: parsed.sort.clone(),
-            style: parsed.style.clone(),
-            is_collection: Some(parsed.is_collection),
-            hidden: Some(parsed.hidden),
-            allow_download: Some(parsed.allow_download),
-            proofing: Some(parsed.proofing),
-            sort_order: Some(parsed.order),
-            tags: Some(parsed.tags.clone()),
-            ..Default::default()
-        },
-    )?;
+    if let Some(parsed) = &parsed {
+        lib.update_album(
+            album_path,
+            &AlbumUpdate {
+                title: parsed.title.clone(),
+                // Adopt the server's id: it is what the access cookie references.
+                token: parsed.token.clone(),
+                description: Some(parsed.description.clone()),
+                date: Some(parsed.date.clone()),
+                password: Some(parsed.password.clone()),
+                share_token: Some(parsed.share_token.clone()),
+                sort: parsed.sort.clone(),
+                style: parsed.style.clone(),
+                is_collection: Some(parsed.is_collection),
+                hidden: Some(parsed.hidden),
+                allow_download: Some(parsed.allow_download),
+                proofing: Some(parsed.proofing),
+                sort_order: Some(parsed.order),
+                tags: Some(parsed.tags.clone()),
+                ..Default::default()
+            },
+        )?;
+    }
 
     // --- 2. Files ---------------------------------------------------------
     // Photos land at their album path inside the library, so a pulled album has
@@ -419,11 +435,21 @@ fn pull_one(
         lib.add_photos_to_album(album_path, &own.iter().map(|p| p.id).collect::<Vec<_>>())?;
     }
 
-    if !parsed.photo_order.is_empty() {
+    if let Some(parsed) = parsed.as_ref().filter(|p| !p.photo_order.is_empty()) {
+        // The server's photoOrder names *published* files, and a published
+        // name is not always the library one: a HEIC ships as `.jpg`
+        // (`publish::published_filename`). Matching on the library filename
+        // alone missed every HEIC frame, so a pull reordered the album as if
+        // those photos had not been named at all. The library filename stays
+        // as a fallback for entries that predate the rename rule.
         let ordered: Vec<i64> = parsed
             .photo_order
             .iter()
-            .filter_map(|name| own.iter().find(|p| &p.filename == name).map(|p| p.id))
+            .filter_map(|name| {
+                own.iter()
+                    .find(|p| &publish::published_filename(p) == name || &p.filename == name)
+                    .map(|p| p.id)
+            })
             .collect();
         lib.reorder_album(album_path, &ordered)?;
     }

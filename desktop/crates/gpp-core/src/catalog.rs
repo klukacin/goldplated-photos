@@ -30,6 +30,15 @@ impl Library {
         let gpp = root.join(GPP_DIR);
         std::fs::create_dir_all(&gpp).map_err(|e| Error::io(&gpp, e))?;
 
+        // One spelling of the root, decided once. Import both builds
+        // destinations under a canonicalized root (`bring_inside`) and strips
+        // the stored root off scanned paths — with two spellings in play, a
+        // root reached through a symlink (`/var`, `/tmp` on macOS) copied a
+        // whole card in and then catalogued none of it, failing with
+        // InvalidPath. The rel_paths in the catalog are unaffected: they are
+        // relative, and both spellings name the same files.
+        let root = root.canonicalize().unwrap_or(root);
+
         let conn = Connection::open(gpp.join("catalog.db"))?;
         Self::configure(&conn)?;
         migrate(&conn)?;

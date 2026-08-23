@@ -580,6 +580,13 @@ pub fn apply(
 /// overwrites it. Every caller scopes its plan to one album today, which
 /// already excludes a climbing path — this makes the guarantee belong to the
 /// transfer rather than to the callers who happen to precede it.
+///
+/// Dot-segments are refused outright, the same rule [`accepts_remote_path`]
+/// holds a remote manifest to: `.meta/` is the server's own, `.htaccess` is
+/// live web-server configuration, and the local root here is the published
+/// tree the deploy rsyncs to the site. `apply`'s Pull arm writes server bytes
+/// to exactly this path, so the rule has to live in the resolution, not in the
+/// callers.
 fn local_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
     if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\0') {
         return None;
@@ -587,8 +594,9 @@ fn local_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> 
     let mut out = root.to_path_buf();
     for segment in rel.split('/') {
         match segment {
-            "" | "." => continue,
-            ".." => return None,
+            "" => continue,
+            // Covers "." and ".." along with every dot-name.
+            s if s.starts_with('.') => return None,
             s => out.push(s),
         }
     }
@@ -613,9 +621,11 @@ fn local_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> 
 /// proofing submissions live there — and an `.htaccess` beside an album's
 /// photos is configuration the web server obeys. [`crate::publish::manifest_of`]
 /// and [`FsTransport::walk`] both skip dot-names, so nothing this machine
-/// publishes or pushes can be one; the published tree is what the deploy
-/// rsyncs to the live site, and once a dot-file is in it neither manifest ever
-/// mentions it again, so nothing here could reconcile or remove it.
+/// publishes or pushes can be one, and [`local_under`] refuses them too so
+/// `apply`'s Pull arm cannot write one either; the published tree is what the
+/// deploy rsyncs to the live site, and once a dot-file is in it neither
+/// manifest ever mentions it again, so nothing here could reconcile or remove
+/// it.
 pub(crate) fn accepts_remote_path(rel: &str) -> bool {
     if rel.contains('\0') || rel.contains('\\') {
         return false;
@@ -976,6 +986,43 @@ mod tests {
             b"not part of any gallery",
             "a file outside the published tree was overwritten"
         );
+    }
+
+    /// `apply`'s Pull arm writes server bytes wherever [`local_under`] points,
+    /// and the local root is the published tree the deploy rsyncs to the live
+    /// site. Dot-names are refused there by the same rule
+    /// [`accepts_remote_path`] applies to a remote manifest — `.meta/` is the
+    /// server's own, `.htaccess` is live configuration, and once one is in the
+    /// tree no manifest ever mentions it again.
+    #[test]
+    fn apply_refuses_to_write_a_dot_named_file_into_the_local_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let published = dir.path().join("published");
+        std::fs::create_dir_all(&published).unwrap();
+
+        let lib = Library::open_in_memory(&published).unwrap();
+        let transport = fake_transport();
+        transport.put("2026/ana/.htaccess", b"Options +ExecCGI\n").unwrap();
+        transport.put("2026/ana/.meta/proofing/x.json", b"{}").unwrap();
+
+        let plan = SyncPlan {
+            changes: vec![
+                PlannedChange { path: "2026/ana/.htaccess".into(), action: Action::Pull },
+                PlannedChange {
+                    path: "2026/ana/.meta/proofing/x.json".into(),
+                    action: Action::Pull,
+                },
+            ],
+        };
+        let out = apply(&lib, &transport, &plan, &published, false).unwrap();
+
+        assert_eq!(out.pulled, 0);
+        assert_eq!(out.failed.len(), 2, "both dot-paths reported, not written: {:?}", out.failed);
+        assert!(
+            !published.join("2026/ana/.htaccess").exists(),
+            "web-server configuration reached the tree the deploy rsyncs"
+        );
+        assert!(!published.join("2026/ana/.meta").exists());
     }
 
     /// The rule the download half of a pull applies to a server's manifest.
