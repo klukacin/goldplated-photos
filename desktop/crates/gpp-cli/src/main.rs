@@ -739,6 +739,14 @@ fn cmd_pull(args: &[String]) -> Result<()> {
             println!("  {c}");
         }
     }
+    // An honest server never offers one of these, so a line here is worth
+    // reading even though the album itself arrived.
+    if !outcome.rejected.is_empty() {
+        println!("refused (the server named files this machine will not write):");
+        for c in &outcome.rejected {
+            println!("  {c}");
+        }
+    }
     Ok(())
 }
 

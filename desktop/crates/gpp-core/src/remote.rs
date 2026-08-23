@@ -59,6 +59,11 @@ pub struct PullOutcome {
     /// guessing — the file under the library root is the negative, and there is
     /// no second copy of it anywhere.
     pub kept_originals: Vec<String>,
+    /// Paths the server offered that this machine would not write — see
+    /// [`sync::accepts_remote_path`]. Reported rather than fatal, and rather
+    /// than silent: a well-behaved server never names one, so a name here is
+    /// worth a photographer's attention even though the album still arrived.
+    pub rejected: Vec<String>,
     /// Every album this operation touched, shallowest first: the folders above
     /// the path, the path itself, and everything under it.
     pub albums: Vec<String>,
@@ -264,6 +269,14 @@ fn pull_one(
         if !is_direct_child(album_path, &change.path) {
             continue;
         }
+        // The only place a server's own string reaches this machine's disk
+        // without `sync::apply` in front of it. Checked before anything is
+        // fetched, because the two writes below go to two different roots and
+        // the last segment is also taken as a filename.
+        if !sync::accepts_remote_path(&change.path) {
+            outcome.rejected.push(change.path.clone());
+            continue;
+        }
         let filename = change.path.rsplit('/').next().unwrap_or_default();
         let is_metadata = filename == "index.md" || filename == "body.md";
 
@@ -430,11 +443,13 @@ pub fn pull_path(
         total.photos_imported += one.photos_imported;
         total.skipped_unchanged += one.skipped_unchanged;
         total.conflicts.extend(one.conflicts);
-        // The negatives this pull declined to overwrite. Dropping them here
-        // silenced the report everywhere it is actually read — the sync panel
-        // and the CLI both go through the path form — so a server that
-        // disagrees about a frame looked like a clean pull.
+        // Both of these are warnings, and this is the form the UI calls, so
+        // dropping them here is the same as never producing them: a kept
+        // original said the server disagrees about a negative there is only one
+        // copy of, and a rejected path said the server asked for something no
+        // honest one asks for. Neither reached a screen.
         total.kept_originals.extend(one.kept_originals);
+        total.rejected.extend(one.rejected);
         total.albums.push(album);
     }
 
