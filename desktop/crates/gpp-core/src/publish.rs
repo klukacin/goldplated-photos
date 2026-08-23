@@ -720,6 +720,35 @@ mod tests {
         assert_eq!(names.len(), 2, "photoOrder lists each published file once: {names:?}");
     }
 
+    /// A crop handle dragged flat against the edge of one frame.
+    ///
+    /// It rounded to a rectangle with no pixels in it, the JPEG encoder refused
+    /// that, and the error came back out of `publish_album` — so the whole
+    /// wedding stopped publishing over one photo's crop, with an "image error"
+    /// naming no file.
+    #[test]
+    fn a_crop_with_no_area_does_not_take_the_album_down() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/one.jpg"), 40, 40);
+        write_jpeg(&src.path().join("a/two.jpg"), 40, 40);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let one = lib.photo_by_rel_path("a/one.jpg").unwrap().unwrap();
+        let two = lib.photo_by_rel_path("a/two.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[one.id, two.id]).unwrap();
+
+        let mut stack = lib.edits(one.id).unwrap();
+        stack.set(crate::develop::EditOp::Crop { x: 1.0, y: 0.0, w: 0.3, h: 1.0 });
+        lib.set_edits(one.id, &stack).unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 2, "both frames reached the gallery");
+        assert!(dest.path().join("a/two.jpg").exists());
+    }
+
     #[test]
     fn respects_rating_filter_and_rejects() {
         let src = tempfile::tempdir().unwrap();

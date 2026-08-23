@@ -564,6 +564,9 @@ fn cmd_sync(args: &[String]) -> Result<()> {
             for c in &outcome.conflicts {
                 println!("  conflict: {c}");
             }
+            for (path, why) in &outcome.failed {
+                println!("  failed: {path} — {why}");
+            }
         }
         None => {
             let transport = transport_for(&lib, args)?;
@@ -789,6 +792,15 @@ fn cmd_push(args: &[String]) -> Result<()> {
         for c in &outcome.conflicts {
             println!("  {c}");
         }
+    }
+    // One file failing does not stop the transfer, so it has to be said out
+    // loud here — otherwise the gallery is a photo short and nothing said so.
+    if !outcome.failed.is_empty() {
+        println!("{} file(s) did NOT reach the server:", outcome.failed.len());
+        for (path, why) in &outcome.failed {
+            println!("  {path}: {why}");
+        }
+        println!("re-run to try them again");
     }
     Ok(())
 }
