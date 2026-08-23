@@ -6,7 +6,16 @@
  * - Social sharing defaults
  * - Author information
  * - Feature flags
+ *
+ * Feature flags live in src/site-features.mjs (plain ESM, so the admin
+ * server can read the same file) and are re-exported here typed. They are
+ * resolved from environment variables at server start; see that module for
+ * the FEATURE_* names and the prerender caveat.
  */
+import { features } from './site-features.mjs';
+
+/** The resolved feature set — shape inferred from the shared module. */
+export type SiteFeatures = typeof features;
 
 export interface SiteConfig {
   // Site Identity
@@ -33,11 +42,7 @@ export interface SiteConfig {
   };
 
   // Feature Flags
-  features: {
-    enablePhotoSharing: boolean;
-    enableVideoThumbnails: boolean;
-    slideshowIntervalMs: number;
-  };
+  features: SiteFeatures;
 }
 
 export const siteConfig: SiteConfig = {
@@ -64,12 +69,8 @@ export const siteConfig: SiteConfig = {
     position: 'bottom-right'         // Bottom-right corner
   },
 
-  // Feature Flags
-  features: {
-    enablePhotoSharing: true,      // Enable ?photo= parameter for individual photo sharing
-    enableVideoThumbnails: false,  // Requires ffmpeg on server (not implemented yet)
-    slideshowIntervalMs: 5000      // Auto-advance interval for slideshow mode
-  }
+  // Feature Flags — resolved once at server start from FEATURE_* env vars
+  features
 };
 
 /**

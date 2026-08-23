@@ -177,7 +177,9 @@ if (!hasAccess) {
           })()}
         </p>
       )}
-      {album.data.tags && album.data.tags.length > 0 && (
+      {/* Pills only when FEATURE_TAGS is on — the pages they link to are not
+          generated when it is off (see tags/[tag].astro). */}
+      {siteConfig.features.tags && album.data.tags && album.data.tags.length > 0 && (
         <div class="tags">
           {album.data.tags.map(tag => (
             <a class="tag" href={`/photos/tags/${encodeURIComponent(tag.trim())}`}>{tag}</a>
@@ -325,7 +327,7 @@ if (!hasAccess) {
               albumToken={album.data.shareToken || ''}
               isProtected={hasPasswordProtection}
               hasAccess={hasAccess}
-              proofing={album.data.proofing}
+              proofing={album.data.proofing && siteConfig.features.proofing}
             />
           </div>
         )}

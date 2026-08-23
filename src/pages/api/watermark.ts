@@ -14,6 +14,11 @@ export const prerender = false;
  * Returns: Watermarked JPEG image for download
  */
 export const GET: APIRoute = async ({ request, cookies }) => {
+  // FEATURE_WATERMARK off ⇒ the route does not exist. The Instagram share
+  // button that calls it is hidden under the same flag in PhotoGrid.astro.
+  if (!siteConfig.features.watermark) {
+    return new Response('Not found', { status: 404 });
+  }
   const url = new URL(request.url);
   const photoPath = url.searchParams.get('path');
 

@@ -13,6 +13,13 @@ import SEO from '../../components/SEO.astro';
 import Footer from '../../components/Footer.astro';
 import { siteConfig } from '../../config';
 
+// FEATURE_SEARCH off ⇒ this route does not exist (the search box on /photos
+// is hidden under the same flag, though that page is prerendered — see the
+// comment there).
+if (!siteConfig.features.search) {
+  return new Response('Not found', { status: 404 });
+}
+
 const MIN_QUERY_LENGTH = 2;
 const MAX_PHOTO_RESULTS = 200;
 

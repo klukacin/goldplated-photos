@@ -16,17 +16,27 @@
  * Pure and dependency-free: the album loader, the thumbnail endpoint and the
  * PhotoGrid client bundle all import it, and `tests/image-formats.test.ts`
  * covers it.
+ *
+ * The lists themselves live in src/site-features.mjs — the shared module the
+ * admin server also reads — so the FEATURE_HEIC flag moves gallery discovery
+ * and admin upload filters together, and neither keeps a copy.
  */
-
-/** Every image format the gallery discovers in an album directory. */
-export const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
+import {
+  IMAGE_EXTENSIONS,
+  BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+  HEIC_EXTENSIONS,
+} from '../site-features.mjs';
 
 /**
- * The subset every browser decodes. WebP belongs here — Chrome, Firefox,
- * Safari and Edge have all shipped it for years, and the thumbnail endpoint
- * already serves it by content negotiation.
+ * Every image format the gallery discovers in an album directory. With
+ * FEATURE_HEIC=0 this list has no `.heic`/`.heif` in it.
+ *
+ * BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS is the subset every browser decodes.
+ * WebP belongs there — Chrome, Firefox, Safari and Edge have all shipped it
+ * for years, and the thumbnail endpoint already serves it by content
+ * negotiation. No flag can widen it.
  */
-export const BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+export { IMAGE_EXTENSIONS, BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS };
 
 /**
  * Lowercased extension (with the dot) of a filename, path or URL.
@@ -69,6 +79,17 @@ export function needsBrowserTranscode(filenameOrUrl: string): boolean {
  */
 export function browserSafeImageUrl(originalUrl: string, transcodedUrl: string): string {
   return needsBrowserTranscode(originalUrl) ? transcodedUrl : originalUrl;
+}
+
+/**
+ * True for a file whose format the site knows of but the current feature set
+ * has switched off — today that means HEIC/HEIF under FEATURE_HEIC=0. Media
+ * routes (originals, thumbnails) answer 404 for these instead of serving a
+ * file the rest of the site pretends does not exist.
+ */
+export function isDisabledImageFormat(filenameOrUrl: string): boolean {
+  const ext = imageExtension(filenameOrUrl);
+  return HEIC_EXTENSIONS.includes(ext) && !IMAGE_EXTENSIONS.includes(ext);
 }
 
 /**

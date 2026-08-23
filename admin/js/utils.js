@@ -1,10 +1,17 @@
 // API Base URL
 const API_BASE = '';
 
-// Admin configuration (loaded from /api/config at startup; safe defaults)
+// Admin configuration (loaded from /api/config at startup; safe defaults).
+// The extension list is computed in src/site-features.mjs and served by the
+// admin server — this file is a classic <script>, so /api/config is its only
+// way to read the shared module. The default below is a fail-safe for the
+// moment before (or if) that fetch completes, and deliberately the narrow
+// universal set: falling back to "browser can paint it" is harmless, falling
+// back to "browser can paint HEIC" is a broken preview.
 const adminConfig = {
   previewUrl: 'http://localhost:4321',
-  siteUrl: null
+  siteUrl: null,
+  browserDisplayableImageExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.webp']
 };
 
 async function loadAdminConfig() {
@@ -236,17 +243,15 @@ function getPreviewThumbnailUrl(albumPath, filename, size = 'large') {
 // admin preview therefore goes through the dev server's thumbnail endpoint,
 // which converts to JPEG/WebP, and never falls back to a raw .heic.
 //
-// Kept in step with src/lib/image-formats.ts (unit-tested there) — this file
-// is a classic <script>, so it cannot import the TypeScript module.
-const BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
-
+// The list itself comes from src/site-features.mjs via /api/config (see
+// adminConfig above), so it cannot drift from the gallery's.
 function isBrowserDisplayableImage(filenameOrUrl) {
   if (!filenameOrUrl) return false;
   const base = filenameOrUrl.split(/[?#]/)[0];
   const name = base.slice(base.lastIndexOf('/') + 1);
   const dot = name.lastIndexOf('.');
   if (dot <= 0) return false;
-  return BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS.includes(name.slice(dot).toLowerCase());
+  return adminConfig.browserDisplayableImageExtensions.includes(name.slice(dot).toLowerCase());
 }
 
 // The original when the browser can render it, the transcode when it cannot.

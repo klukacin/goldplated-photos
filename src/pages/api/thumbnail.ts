@@ -5,7 +5,7 @@ import path from 'path';
 import { lookup } from 'mrmime';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
 import { imageJobSemaphore } from '../../lib/semaphore';
-import { chooseThumbnailFormat, needsBrowserTranscode } from '../../lib/image-formats';
+import { chooseThumbnailFormat, needsBrowserTranscode, isDisabledImageFormat } from '../../lib/image-formats';
 
 export const prerender = false;
 
@@ -39,6 +39,12 @@ export const GET: APIRoute = async ({ request, cookies }) => {
   // dotfiles. Without this, the original-file fallback below could serve
   // index.md verbatim.
   if (photoPath.endsWith('.md') || photoPath.split('/').some(s => s.startsWith('.'))) {
+    return new Response('Not found', { status: 404 });
+  }
+
+  // A format the feature flags have disabled (FEATURE_HEIC=0) is invisible —
+  // no thumbnails for files the rest of the site pretends do not exist.
+  if (isDisabledImageFormat(photoPath)) {
     return new Response('Not found', { status: 404 });
   }
 
