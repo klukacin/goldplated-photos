@@ -518,6 +518,35 @@ fn local_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> 
     out.starts_with(root).then_some(out)
 }
 
+/// Whether this machine is willing to write the file a remote manifest names.
+///
+/// Two rules, and the local side already applies both — it is only what a
+/// *server* names that has never been held to them.
+///
+/// A path has to name a file, and name it the same way twice: no empty
+/// segment, no `.` or `..`, nothing absolute, no NUL, and no backslash, which
+/// is a separator on Windows where `a\..\..\x` climbs straight out of the
+/// album. [`apply`] gets that from [`local_under`], but the download half of a
+/// pull does not go through `apply`: it writes to the library and to the
+/// published tree itself, and takes the last segment as a filename.
+///
+/// And no segment may begin with a dot. `.meta/` is the site's own — the
+/// proofing submissions live there — and an `.htaccess` beside an album's
+/// photos is configuration the web server obeys. [`crate::publish::manifest_of`]
+/// and [`FsTransport::walk`] both skip dot-names, so nothing this machine
+/// publishes or pushes can be one; the published tree is what the deploy
+/// rsyncs to the live site, and once a dot-file is in it neither manifest ever
+/// mentions it again, so nothing here could reconcile or remove it.
+pub(crate) fn accepts_remote_path(rel: &str) -> bool {
+    if rel.contains('\0') || rel.contains('\\') {
+        return false;
+    }
+    !rel.is_empty()
+        && rel
+            .split('/')
+            .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
+}
+
 /// One change, in isolation. Never returns `Err`: a single file failing is
 /// reported and the rest of the transfer continues.
 fn apply_one(
@@ -868,6 +897,41 @@ mod tests {
             b"not part of any gallery",
             "a file outside the published tree was overwritten"
         );
+    }
+
+    /// The rule the download half of a pull applies to a server's manifest.
+    ///
+    /// Stated here as well as exercised through `remote::pull_one`, because two
+    /// of the names below cannot be demonstrated end to end on a Unix host: a
+    /// backslash is an ordinary character in a Linux filename and a separator
+    /// on Windows, so `a\..\..\x` is contained here and climbs out of the
+    /// library there.
+    #[test]
+    fn a_remote_manifest_path_has_to_name_a_file_and_not_a_dot_file() {
+        for ok in ["2026/ana/a1.jpg", "index.md", "2026/ana-i-ivan/index.md"] {
+            assert!(accepts_remote_path(ok), "{ok:?} is an ordinary album file");
+        }
+        for refused in [
+            "",
+            "/etc/passwd",
+            "2026/../../escaped.jpg",
+            "2026/ana/..",
+            "2026/ana/.",
+            "2026/ana/",
+            "2026//ana/a.jpg",
+            "2026/ana/a\0.jpg",
+            // Windows separators, which `PathBuf::join` follows there.
+            "2026/ana/..\\..\\..\\startup.exe",
+            "C:\\Windows\\system32\\x.dll",
+            // The site's own: proofing submissions and web-server config.
+            "2026/ana/.htaccess",
+            "2026/ana/.meta/proofing/x.json",
+        ] {
+            assert!(
+                !accepts_remote_path(refused),
+                "{refused:?} must not be written on any platform"
+            );
+        }
     }
 
     /// A file gone from both sides has to stop being remembered. Keeping the

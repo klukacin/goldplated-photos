@@ -510,3 +510,33 @@ fn a_pull_never_overwrites_the_library_original() {
         "the pull wrote over the photographer's original — it is not recoverable"
     );
 }
+
+/// Keeping the original is only half of it: the photographer has to be told,
+/// because the two versions now differ and only they can say which is the
+/// photograph. `Session::pull_album` — what the app and the C ABI both call —
+/// goes through `pull_path`, which folded every other field of the outcome
+/// together and dropped this one, so the warning was produced and then thrown
+/// away one frame short of a screen.
+#[test]
+fn a_kept_original_is_reported_by_the_path_form_the_ui_calls() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/ana-ivan", &["a1.jpg"]);
+    remote::push_album(&a.lib, &server, "2026/ana-ivan", a.published_root(), &opts, false).unwrap();
+
+    server
+        .put("2026/ana-ivan/a1.jpg", b"developed on another machine")
+        .unwrap();
+
+    let outcome =
+        remote::pull_path(&a.lib, &server, "2026/ana-ivan", a.published_root()).unwrap();
+
+    assert_eq!(
+        outcome.kept_originals,
+        vec!["2026/ana-ivan/a1.jpg".to_string()],
+        "the pull kept an original and said nothing about it"
+    );
+}

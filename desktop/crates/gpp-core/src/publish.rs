@@ -415,13 +415,33 @@ fn yaml_kv(key: &str, value: &str) -> String {
 
 /// Always double-quote and escape. Verbose, but immune to a title that happens
 /// to be `yes`, `1.0`, `null`, or contains a colon.
+///
+/// Control characters are escaped rather than passed through or dropped. A
+/// double-quoted YAML scalar may not hold one raw, and js-yaml — what Astro
+/// parses these files with — stops at the first with "expected valid JSON
+/// character". That is not one broken album: an unparseable content collection
+/// fails the whole `npm run build`, so one byte here takes the site down. And
+/// the app does not choose these strings — a title or a tag comes back from a
+/// pulled `index.md`, a `photoOrder` entry is a filename off a card, and on
+/// Unix a filename may hold any byte but `/` and NUL.
 fn yaml_scalar(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Build a manifest of the published tree: relative path → content hash.
@@ -509,6 +529,59 @@ mod tests {
         assert_eq!(yaml_scalar("back\\slash"), "\"back\\\\slash\"");
         // A title that would otherwise parse as a boolean stays a string.
         assert_eq!(yaml_scalar("yes"), "\"yes\"");
+    }
+
+    /// A double-quoted YAML scalar may not carry a raw control character, and
+    /// js-yaml — what Astro reads these files with — stops at the first one
+    /// with "expected valid JSON character". That is not one broken album: a
+    /// content collection that fails to parse fails the whole `npm run build`,
+    /// so a single byte here takes the entire site down.
+    ///
+    /// The app does not choose these strings. A title, a description or a tag
+    /// arrives from a pulled `index.md`, and a `photoOrder` entry is a filename
+    /// off a card — on Unix a filename may hold any byte but `/` and NUL.
+    #[test]
+    fn a_control_character_cannot_reach_the_frontmatter_raw() {
+        for (name, value) in [
+            ("a NUL", "Ana\u{0}Ivan"),
+            ("a bell", "Ana\u{7}Ivan"),
+            ("an escape", "Ana\u{1b}[31mIvan"),
+            ("a vertical tab", "Ana\u{b}Ivan"),
+            ("a carriage return", "Ana\rIvan"),
+            ("DEL", "Ana\u{7f}Ivan"),
+        ] {
+            let rendered = yaml_scalar(value);
+            assert!(
+                !rendered
+                    .chars()
+                    .any(|c| (c as u32) < 0x20 || c == '\u{7f}'),
+                "{name} reached the frontmatter raw: {rendered:?}"
+            );
+        }
+    }
+
+    /// Escaping is only half a boundary; the other half is reading it back, or
+    /// a pull → publish → pull loop rewrites the photographer's own text a
+    /// little further every time round.
+    #[test]
+    fn every_escape_this_module_writes_is_one_it_can_read_back() {
+        for value in [
+            "Ana\u{0}Ivan",
+            "Ana\u{7}Ivan",
+            "Ana\rIvan",
+            "Ana\tIvan",
+            "Ana\nIvan",
+            "Ana\u{7f}Ivan",
+            r"C:\new\photos",
+            "say \"hi\"",
+        ] {
+            let rendered = format!("---\n{}---\n", yaml_kv("title", value));
+            assert_eq!(
+                parse_frontmatter(&rendered).title.as_deref(),
+                Some(value),
+                "round trip of {value:?}"
+            );
+        }
     }
 
     #[test]
@@ -971,11 +1044,29 @@ fn unquote(value: &str) -> String {
         }
         match chars.next() {
             Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            // `\xNN`, which is what a control character was written as. Only a
+            // pair of hex digits is one: anything else is text that happened to
+            // start `\x` and is handed back unchanged, the way it went out.
+            Some('x') => match take_hex_pair(&mut chars) {
+                Some(c) => out.push(c),
+                None => out.push('x'),
+            },
             Some(escaped) => out.push(escaped),
             None => out.push('\\'),
         }
     }
     out
+}
+
+/// Two hex digits from the front of `chars`, consumed only if both are there.
+fn take_hex_pair(chars: &mut std::str::Chars<'_>) -> Option<char> {
+    let mut peek = chars.clone();
+    let hi = peek.next()?.to_digit(16)?;
+    let lo = peek.next()?.to_digit(16)?;
+    *chars = peek;
+    char::from_u32(hi * 16 + lo)
 }
 
 #[cfg(test)]
