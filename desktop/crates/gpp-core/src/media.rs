@@ -46,9 +46,19 @@ const LQIP_SIZE: u32 = 20;
 /// [`RAW_EXTENSIONS`], where the catalog records the file and its metadata but
 /// publish deliberately leaves it behind — a RAW is a negative, not something
 /// to hand a client.
+// Two spellings of the list rather than one with holes in it, because the
+// `heif` feature decides membership: an extension in this list is a promise
+// [`decode`] can keep, and a build without the HEVC decoder cannot keep it for
+// HEIF. Off, a `.heic` is simply not seen — not catalogued, not flagged — which
+// is exactly what every build did before HEIF support existed, and better than
+// cataloguing a file whose every decode would fail.
+#[cfg(feature = "heif")]
 pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "heic", "heif",
 ];
+/// The same import filter, in a build without the HEVC decoder — see above.
+#[cfg(not(feature = "heif"))]
+pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "tif", "tiff"];
 
 /// Camera RAW extensions. Catalogued and previewed, never published.
 pub const RAW_EXTENSIONS: &[&str] = &[
@@ -61,13 +71,23 @@ pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv", "m4v
 
 /// HEIF-family extensions, which the `image` crate cannot open — see
 /// [`decode`].
+#[cfg(feature = "heif")]
 const HEIF_EXTENSIONS: &[&str] = &["heic", "heif"];
 
-fn is_heif(path: &Path) -> bool {
+/// Whether this file takes the HEVC decode path. Compiled to `false` without
+/// the `heif` feature, so callers — [`decode`], [`read_dimensions`], and
+/// `publish::published_filename`'s rename-to-`.jpg` — need no cfg of their
+/// own: everything HEIF-shaped simply stops happening.
+#[cfg(feature = "heif")]
+pub(crate) fn is_heif(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| HEIF_EXTENSIONS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+#[cfg(not(feature = "heif"))]
+pub(crate) fn is_heif(_path: &Path) -> bool {
+    false
 }
 
 /// Decode a still image, whatever container it arrived in.
@@ -76,19 +96,23 @@ fn is_heif(path: &Path) -> bool {
 /// iPhone shoots by default and what half the guests at a wedding will send.
 /// That gap is filled by a pure-Rust HEVC decoder rather than libheif: libheif
 /// is LGPL, which the licence policy does not allow, and linking C would cost
-/// the portability contract that keeps an iPad build possible.
+/// the portability contract that keeps an iPad build possible. The decoder is
+/// behind the `heif` feature (on by default); without it, no HEIF file gets
+/// this far — [`classify`] never catalogues one.
 ///
 /// The price is speed — around 9 MP/s on one core, so roughly two and a half
 /// seconds for a 24 MP frame against a few hundred milliseconds for JPEG.
 /// Import runs across every core, so a card of them is minutes rather than
 /// hours, but it is why a HEIC import is visibly slower than a JPEG one.
 pub fn decode(path: &Path) -> Result<DynamicImage> {
+    #[cfg(feature = "heif")]
     if is_heif(path) {
         return decode_heif(path);
     }
     Ok(image::open(path)?)
 }
 
+#[cfg(feature = "heif")]
 fn decode_heif(path: &Path) -> Result<DynamicImage> {
     let decoded = heif_oxide::decode_file(path)
         .map_err(|e| Error::other(format!("{}: {e:?}", path.display())))?;
@@ -105,6 +129,7 @@ fn decode_heif(path: &Path) -> Result<DynamicImage> {
 /// shortcut here, so it costs a full decode; a caller with EXIF dimensions
 /// already in hand should not call this at all.
 pub fn read_dimensions(path: &Path) -> Result<(u32, u32)> {
+    #[cfg(feature = "heif")]
     if is_heif(path) {
         let img = decode_heif(path)?;
         return Ok((img.width(), img.height()));
@@ -414,9 +439,21 @@ pub fn resize_to_fit(img: &DynamicImage, max_edge: u32) -> DynamicImage {
     let scale = max_edge as f64 / w.max(h) as f64;
     let nw = ((w as f64 * scale).round() as u32).max(1);
     let nh = ((h as f64 * scale).round() as u32).max(1);
-    // Lanczos3 for quality; fast_image_resize accelerates this with SIMD when
-    // the feature set allows, falling back cleanly otherwise.
-    img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+
+    // Lanczos3 either way. `fast_image_resize` does the convolution with SIMD,
+    // which matters because import pays this three times per photograph — on a
+    // 24 MP frame the image crate's resampler took ~0.4–0.5 s per size and fir
+    // ~25 ms (measured, release build), so a thousand-frame wedding card keeps
+    // or loses whole minutes here. A pixel layout fir has no kernel for falls
+    // back to the image crate: slower, same picture.
+    let mut dst = DynamicImage::new(nw, nh, img.color());
+    let opts = fast_image_resize::ResizeOptions::new().resize_alg(
+        fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3),
+    );
+    match fast_image_resize::Resizer::new().resize(img, &mut dst, &opts) {
+        Ok(()) => dst,
+        Err(_) => img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3),
+    }
 }
 
 /// Content-addressed thumbnail location: `<thumbs>/<hash[0:2]>/<hash>_<size>.jpg`.
