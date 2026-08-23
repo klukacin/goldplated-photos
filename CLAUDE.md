@@ -641,6 +641,8 @@ An adjustment is a row in `edits`, never a write to the original. What identifie
 
 Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
 
+**Where order matters, and where it cannot.** `apply` runs two passes: geometry in stack order, then tone in stack order, purely per pixel. So a tone op's position relative to a geometry op is irrelevant — measured, not assumed (`tests/geometry_order.rs`). Within tone, order matters, as in any developer: exposure-then-contrast is not contrast-then-exposure. Within geometry it matters too — a crop before a rotate frames a different picture than one after, and rotate does not commute with a single flip. Because the rotate op keeps its place in the stack, `rotate_by` reverses its direction when an odd number of flips sits over it; without that, pressing "rotate right" on an already-flipped frame turned the photograph the other way.
+
 **Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), and copying a photo *into* the library on import. `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
 
 ### Publish and sync are different things

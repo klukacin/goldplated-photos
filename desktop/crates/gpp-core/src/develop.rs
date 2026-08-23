@@ -183,13 +183,36 @@ impl EditStack {
     /// because [`set`](Self::set) upserts by kind and the second one would only
     /// replace the first. Wrapping back to zero removes the op, so a photo
     /// turned all the way round is untouched again and keeps its render key.
+    /// A mirror between the rotate and the viewer reverses which way the frame
+    /// appears to turn, because `flip ∘ rotate(θ)` is `rotate(-θ) ∘ flip`. The
+    /// rotate op keeps its place in the stack, so pressing "right" after a flip
+    /// was already applied over it has to record the opposite turn to move the
+    /// photograph the way the button says. Two flips are a 180° turn, not a
+    /// mirror, so only an odd count reverses.
     pub fn rotate_by(&mut self, quarter_turns: i32) {
+        // With no turn recorded yet the op is pushed to the end of the stack,
+        // so it runs after every flip already there and nothing reverses it.
+        let mirrors_after = match self.ops.iter().position(|op| op.kind() == "rotate") {
+            None => 0,
+            Some(at) => self
+                .ops
+                .iter()
+                .skip(at + 1)
+                .filter(|op| matches!(op, EditOp::FlipHorizontal | EditOp::FlipVertical))
+                .count(),
+        };
+        let delta = if mirrors_after % 2 == 1 {
+            -quarter_turns
+        } else {
+            quarter_turns
+        };
+
         let current = match self.get("rotate") {
             Some(EditOp::Rotate { quarter_turns: turns }) => i32::from(*turns),
             _ => 0,
         };
         self.set(EditOp::Rotate {
-            quarter_turns: (current + quarter_turns).rem_euclid(4) as u8,
+            quarter_turns: (current + delta).rem_euclid(4) as u8,
         });
     }
 
