@@ -617,17 +617,39 @@ $('dev-flip-v').addEventListener('click', () => flip('flip-vertical', 'Flipped t
 /// Say where the frame currently stands. The buttons are relative, so nothing
 /// about them can show that this photo is already lying on its side.
 function renderGeometry(stack) {
-  const rotated = stack.ops.find((o) => opKind(o) === 'rotate');
-  const flippedH = stack.ops.some((o) => opKind(o) === 'flip-horizontal');
-  const flippedV = stack.ops.some((o) => opKind(o) === 'flip-vertical');
+  // Read the whole framing rather than looking for particular ops. The core
+  // stores which way up the photograph is as one mirror plus a number of
+  // quarter turns — the eight ways a rectangle can be set down — because turns
+  // and mirrors do not commute and editing the ops where they lay made the
+  // buttons move the picture the wrong way. So a top-to-bottom flip is kept as
+  // a left-to-right one and a half turn, and asking "is there a flip-vertical
+  // op" would answer no about a photograph that is plainly upside down.
+  let mirrored = false;
+  let turns = 0;
+  for (const op of stack.ops) {
+    switch (opKind(op)) {
+      case 'rotate':
+        turns = (turns + op.quarter_turns) % 4;
+        break;
+      case 'flip-horizontal':
+        mirrored = !mirrored;
+        turns = (4 - turns) % 4;
+        break;
+      case 'flip-vertical':
+        mirrored = !mirrored;
+        turns = (6 - turns) % 4;
+        break;
+    }
+  }
 
-  $('dev-flip-h').classList.toggle('on', flippedH);
-  $('dev-flip-v').classList.toggle('on', flippedV);
+  // Both buttons light on a mirrored frame: either one will take the mirror
+  // off again, and neither owns an axis of its own any more.
+  $('dev-flip-h').classList.toggle('on', mirrored);
+  $('dev-flip-v').classList.toggle('on', mirrored);
 
   const bits = [];
-  if (rotated) bits.push(`${rotated.quarter_turns * 90}°`);
-  if (flippedH) bits.push('mirrored');
-  if (flippedV) bits.push('upside down');
+  if (turns) bits.push(`${turns * 90}°`);
+  if (mirrored) bits.push('mirrored');
   $('dev-geometry-state').textContent = bits.join(' · ');
 }
 

@@ -130,6 +130,53 @@ impl EditOp {
     }
 }
 
+/// Which way up the photograph is: a left-to-right mirror, then a number of
+/// quarter turns clockwise.
+///
+/// Those eight states are every way a rectangle can be set down, so any run of
+/// rotate and flip presses adds up to one of them. That matters because turns
+/// and mirrors do not commute, and the ops therefore cannot be edited where
+/// they happen to lie in the stack — pressing "rotate right" on a frame that
+/// had been flipped turned the photograph left, and pressing a flip a second
+/// time to undo it mirrored the wrong axis. The only way a button can be
+/// trusted is to compose it onto the *outside* of the framing already there and
+/// write the whole thing back, which is what the methods here are for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Framing {
+    mirrored: bool,
+    turns: i32,
+}
+
+impl Framing {
+    const UPRIGHT: Self = Self { mirrored: false, turns: 0 };
+
+    /// Turn the already-framed picture, i.e. `rotate ∘ self`.
+    fn then_turn(self, quarter_turns: i32) -> Self {
+        Self {
+            turns: (self.turns + quarter_turns).rem_euclid(4),
+            ..self
+        }
+    }
+
+    /// Mirror the already-framed picture left to right.
+    ///
+    /// `flip ∘ rotate(θ)` is `rotate(-θ) ∘ flip`, so pushing a mirror to the
+    /// inside reverses the turn it passes.
+    fn then_mirror_h(self) -> Self {
+        Self {
+            mirrored: !self.mirrored,
+            turns: (-self.turns).rem_euclid(4),
+        }
+    }
+
+    /// Mirror it top to bottom. A vertical mirror is a horizontal one and a
+    /// half turn, which is why only one mirror needs storing.
+    fn then_mirror_v(self) -> Self {
+        let m = self.then_mirror_h();
+        m.then_turn(2)
+    }
+}
+
 /// Everything done to one photo, in order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EditStack {
@@ -176,56 +223,109 @@ impl EditStack {
         }
     }
 
-    /// Turn a further quarter on top of whatever turn is already recorded.
-    ///
-    /// Rotate buttons are relative — two clicks of "right" mean 180°. Sending
-    /// an absolute `Rotate { quarter_turns: 1 }` each time would go nowhere,
-    /// because [`set`](Self::set) upserts by kind and the second one would only
-    /// replace the first. Wrapping back to zero removes the op, so a photo
-    /// turned all the way round is untouched again and keeps its render key.
-    /// A mirror between the rotate and the viewer reverses which way the frame
-    /// appears to turn, because `flip ∘ rotate(θ)` is `rotate(-θ) ∘ flip`. The
-    /// rotate op keeps its place in the stack, so pressing "right" after a flip
-    /// was already applied over it has to record the opposite turn to move the
-    /// photograph the way the button says. Two flips are a 180° turn, not a
-    /// mirror, so only an odd count reverses.
-    pub fn rotate_by(&mut self, quarter_turns: i32) {
-        // With no turn recorded yet the op is pushed to the end of the stack,
-        // so it runs after every flip already there and nothing reverses it.
-        let mirrors_after = match self.ops.iter().position(|op| op.kind() == "rotate") {
-            None => 0,
-            Some(at) => self
-                .ops
-                .iter()
-                .skip(at + 1)
-                .filter(|op| matches!(op, EditOp::FlipHorizontal | EditOp::FlipVertical))
-                .count(),
-        };
-        let delta = if mirrors_after % 2 == 1 {
-            -quarter_turns
-        } else {
-            quarter_turns
-        };
-
-        let current = match self.get("rotate") {
-            Some(EditOp::Rotate { quarter_turns: turns }) => i32::from(*turns),
-            _ => 0,
-        };
-        self.set(EditOp::Rotate {
-            quarter_turns: (current + delta).rem_euclid(4) as u8,
-        });
+    /// Read the turns and mirrors in the stack as one transform.
+    fn framing(&self) -> Framing {
+        let mut f = Framing::UPRIGHT;
+        for op in &self.ops {
+            f = match op {
+                EditOp::Rotate { quarter_turns } => f.then_turn(i32::from(*quarter_turns)),
+                EditOp::FlipHorizontal => f.then_mirror_h(),
+                EditOp::FlipVertical => f.then_mirror_v(),
+                _ => f,
+            };
+        }
+        f
     }
 
-    /// Switch an op that carries no value on, or off again.
+    /// Write a framing back, replacing every turn and mirror in the stack.
+    ///
+    /// The crop is kept at the end. Its rectangle is fractions of the frame
+    /// directly beneath it, so it only means what the photographer drew if
+    /// nothing re-orients that frame afterwards.
+    fn set_framing(&mut self, f: Framing) {
+        let crop = self
+            .ops
+            .iter()
+            .position(|op| op.kind() == "crop")
+            .map(|at| self.ops.remove(at));
+        self.ops.retain(|op| {
+            !matches!(
+                op,
+                EditOp::Rotate { .. } | EditOp::FlipHorizontal | EditOp::FlipVertical
+            )
+        });
+        if f.mirrored {
+            self.ops.push(EditOp::FlipHorizontal);
+        }
+        if f.turns.rem_euclid(4) != 0 {
+            self.ops.push(EditOp::Rotate {
+                quarter_turns: f.turns.rem_euclid(4) as u8,
+            });
+        }
+        if let Some(crop) = crop {
+            self.ops.push(crop);
+        }
+    }
+
+    /// Move the crop rectangle the same way the frame beneath it just moved, so
+    /// it goes on framing the same part of the photograph.
+    ///
+    /// Without this, straightening a shot after framing a face re-reads the same
+    /// four fractions against a frame whose axes have swapped, and the face is
+    /// simply gone — with nothing on screen to explain it.
+    fn carry_crop(&mut self, turn: i32, mirror_h: bool, mirror_v: bool) {
+        let Some(EditOp::Crop { x, y, w, h }) =
+            self.ops.iter_mut().find(|op| op.kind() == "crop")
+        else {
+            return;
+        };
+        if mirror_h {
+            *x = 1.0 - (*x + *w);
+        }
+        if mirror_v {
+            *y = 1.0 - (*y + *h);
+        }
+        // A quarter turn clockwise sends the top-left corner to the top-right
+        // and swaps the sides.
+        for _ in 0..turn.rem_euclid(4) {
+            let (nx, ny, nw, nh) = (1.0 - (*y + *h), *x, *h, *w);
+            (*x, *y, *w, *h) = (nx, ny, nw, nh);
+        }
+    }
+
+    /// Turn a further quarter on top of whatever turn is already recorded.
+    ///
+    /// Rotate buttons are relative — two clicks of "right" mean 180°.
+    pub fn rotate_by(&mut self, quarter_turns: i32) {
+        let f = self.framing().then_turn(quarter_turns);
+        self.set_framing(f);
+        self.carry_crop(quarter_turns, false, false);
+    }
+
+    /// Switch a mirror on, or off again.
     ///
     /// The flips are the only adjustments with nothing to set to zero, so
     /// `set` alone could never undo one: it drops the existing op and pushes an
     /// identical one straight back.
     pub fn toggle(&mut self, op: EditOp) {
-        if self.get(op.kind()).is_some() {
-            self.remove(op.kind());
-        } else {
-            self.set(op);
+        match op {
+            EditOp::FlipHorizontal => {
+                let f = self.framing().then_mirror_h();
+                self.set_framing(f);
+                self.carry_crop(0, true, false);
+            }
+            EditOp::FlipVertical => {
+                let f = self.framing().then_mirror_v();
+                self.set_framing(f);
+                self.carry_crop(0, false, true);
+            }
+            other => {
+                if self.get(other.kind()).is_some() {
+                    self.remove(other.kind());
+                } else {
+                    self.set(other);
+                }
+            }
         }
     }
 
@@ -714,36 +814,44 @@ mod tests {
         assert!(s.is_empty());
     }
 
-    /// The stack is the order the operations run in, so replacing one has to
-    /// leave it where it stands. Appending instead slid a second "rotate right"
-    /// past an existing crop, and the rectangle the photographer had drawn
-    /// landed on a different part of the frame.
+    /// A crop drawn on a turned frame must move with the photograph when it is
+    /// turned again.
+    ///
+    /// The rectangle is fractions of the frame directly beneath it, so leaving
+    /// it where it lay re-reads the same four numbers against swapped axes and
+    /// silently reframes the picture — a face framed and then straightened
+    /// simply disappears.
     #[test]
-    fn adjusting_an_op_again_leaves_it_where_it_stands_in_the_stack() {
-        let mut s = EditStack::new();
-        s.rotate_by(1);
-        s.set(EditOp::Crop { x: 0.0, y: 0.0, w: 1.0, h: 0.5 });
-        s.rotate_by(1);
-
-        assert_eq!(
-            s.ops,
-            vec![
-                EditOp::Rotate { quarter_turns: 2 },
-                EditOp::Crop { x: 0.0, y: 0.0, w: 1.0, h: 0.5 },
-            ],
-            "the turn must stay ahead of the crop that was drawn on it"
-        );
-
-        // And the pixels follow. Top row white, bottom row black: turned a
-        // half, the top of the frame is the old bottom, and keeping the top
-        // half of *that* is black.
+    fn a_crop_moves_with_the_frame_it_was_drawn_on() {
+        // Top row white, bottom row black, so which half survived is visible.
         let mut img = RgbImage::new(4, 2);
         for (_x, y, p) in img.enumerate_pixels_mut() {
             *p = if y == 0 { Rgb([255, 255, 255]) } else { Rgb([0, 0, 0]) };
         }
-        let out = apply(&DynamicImage::ImageRgb8(img), &s);
-        assert_eq!((out.width(), out.height()), (4, 1));
-        assert_eq!(px(&out, 0, 0), [0, 0, 0], "the crop did not move with the turn");
+        let base = DynamicImage::ImageRgb8(img);
+
+        let mut s = EditStack::new();
+        s.rotate_by(1);
+        s.set(EditOp::Crop { x: 0.0, y: 0.0, w: 1.0, h: 0.5 });
+        let framed = apply(&base, &s);
+
+        s.rotate_by(1);
+        let turned = apply(&base, &s);
+
+        let mut quarter = EditStack::new();
+        quarter.rotate_by(1);
+        let expected = apply(&framed, &quarter);
+
+        assert_eq!(
+            (turned.width(), turned.height()),
+            (expected.width(), expected.height()),
+            "the crop did not move with the turn"
+        );
+        assert_eq!(
+            turned.to_rgb8().as_raw(),
+            expected.to_rgb8().as_raw(),
+            "the crop landed on a different part of the frame"
+        );
     }
 
     /// A flip has no value to return to zero, so the same button has to take it
@@ -757,10 +865,20 @@ mod tests {
         s.toggle(EditOp::FlipHorizontal);
         assert!(s.is_empty(), "pressed again, it is gone");
 
-        // The two axes are independent adjustments.
+        // The two axes are not independent: mirroring both ways is a half
+        // turn, and that is what gets stored, so the photograph can never end
+        // up in a state the eight orientations cannot name.
         s.toggle(EditOp::FlipHorizontal);
         s.toggle(EditOp::FlipVertical);
-        assert_eq!(s.ops.len(), 2);
+
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(4, 2, |x, y| {
+            Rgb([(x * 60) as u8, (y * 120) as u8, 0])
+        }));
+        assert_eq!(
+            apply(&img, &s).to_rgb8().as_raw(),
+            apply(&img, &stack_of(&[EditOp::Rotate { quarter_turns: 2 }])).to_rgb8().as_raw(),
+            "both mirrors together must be exactly a half turn"
+        );
     }
 
     #[test]

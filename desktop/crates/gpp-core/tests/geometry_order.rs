@@ -76,22 +76,19 @@ fn a_rotate_always_turns_the_frame_on_screen() {
     }
 }
 
-/// Two flips are a 180° turn, not a mirror, so they must not reverse anything.
+/// Two flips are a half turn, so two of them plus two right turns is a full
+/// circle and the photograph is back exactly as it was shot — and, because an
+/// untouched photo must keep its original render key and its existing
+/// thumbnails, the stack has to be empty rather than merely equivalent.
 #[test]
-fn two_flips_do_not_reverse_a_turn() {
-    let mut both = EditStack::default();
-    both.toggle(EditOp::FlipHorizontal);
-    both.toggle(EditOp::FlipVertical);
-    both.rotate_by(1);
-    both.rotate_by(1);
-
-    match both.get("rotate") {
-        Some(EditOp::Rotate { quarter_turns }) => assert_eq!(
-            *quarter_turns, 2,
-            "two right turns under two flips must still be a half turn"
-        ),
-        other => panic!("expected a rotate op, got {other:?}"),
+fn a_full_circle_leaves_no_trace() {
+    let base = frame();
+    let mut stack = EditStack::default();
+    for button in ["flip-h", "flip-v", "rotate-right", "rotate-right"] {
+        press(&mut stack, button);
     }
+    assert!(same(&apply(&base, &stack), &base), "the photograph moved");
+    assert!(stack.is_empty(), "left {:?} behind, so the render key changed", stack.ops);
 }
 
 /// Tone is a per-pixel function and runs in its own pass, so where a tone op
@@ -118,4 +115,63 @@ fn geometry_and_tone_do_not_interfere() {
     };
 
     assert!(same(&apply(&base, &geometry_first), &apply(&base, &tone_first)));
+}
+
+/// Every button, pressed after every reachable framing, must move the
+/// photograph exactly the way its icon says — with a crop drawn on it and
+/// without.
+///
+/// Turns and mirrors do not commute, so this cannot be assumed from the code
+/// reading sensibly. Two defects lived here: pressing "rotate right" on a
+/// flipped frame turned the photograph left, and pressing a flip a second time
+/// to undo it mirrored the wrong axis once a turn sat between them. Both were
+/// three presses away in the shipping panel.
+#[test]
+fn every_button_moves_the_photograph_the_way_its_icon_says() {
+    let base = frame();
+    let buttons = ["rotate-right", "rotate-left", "flip-h", "flip-v"];
+
+    // Every framing reachable in three presses, which covers all eight ways a
+    // rectangle can be set down, by more than one route to each.
+    let mut histories: Vec<Vec<&str>> = vec![vec![]];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for h in &histories {
+            for b in buttons {
+                let mut longer = h.clone();
+                longer.push(b);
+                next.push(longer);
+            }
+        }
+        histories.extend(next);
+    }
+
+    for history in &histories {
+        for cropped in [false, true] {
+            for last in buttons {
+                let mut stack = EditStack::default();
+                for button in history {
+                    press(&mut stack, button);
+                }
+                if cropped {
+                    // Off-centre and not square: a centred rectangle is
+                    // symmetric enough to survive a wrong transform and report
+                    // a pass it did not earn.
+                    stack.set(EditOp::Crop { x: 0.125, y: 0.25, w: 0.5, h: 0.5 });
+                }
+                let on_screen = apply(&base, &stack);
+
+                press(&mut stack, last);
+                let got = apply(&base, &stack);
+
+                let mut only_the_press = EditStack::default();
+                press(&mut only_the_press, last);
+                assert!(
+                    same(&got, &apply(&on_screen, &only_the_press)),
+                    "after {history:?}{}, pressing {last} did not do what it says",
+                    if cropped { " + crop" } else { "" }
+                );
+            }
+        }
+    }
 }
