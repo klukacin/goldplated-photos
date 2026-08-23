@@ -356,7 +356,7 @@ Photos are discovered by scanning the album directory for image files (see `getP
 - Public assets (`public/home/hero`, `public/home/cards`, the landing background) are served **raw**, with no conversion anywhere, so the admin refuses a HEIC/HEIF upload there and does not list one it finds.
 - WebP needs none of this; browsers decode it natively.
 
-The rule lives in one place, `src/lib/image-formats.ts` (unit-tested in `tests/image-formats.test.ts`), and `IMAGE_EXTENSIONS` is re-exported from there so adding a format cannot quietly skip the displayability question. `admin/server.js` and `admin/js/utils.js` keep hand-copies — plain JS cannot import the TS module — with comments saying so.
+The rule lives in one place, `src/lib/image-formats.ts` (unit-tested in `tests/image-formats.test.ts`), and `IMAGE_EXTENSIONS` is re-exported from there so adding a format cannot quietly skip the displayability question. `admin/server.js` imports the lists from `src/site-features.mjs`, and `admin/js/utils.js` receives them at runtime from `GET /api/config` (its literal list is only a fail-safe default).
 
 **EXIF Orientation:** Sharp's `.rotate()` is applied during thumbnail generation to auto-rotate images based on EXIF orientation metadata.
 - **IMPORTANT:** Always use thumbnails for display (not original images) to ensure correct orientation
@@ -417,7 +417,7 @@ An album can have both — the share link then skips the password form.
 **Unlock flow:**
 1. User submits password via form POST to `/api/unlock`
 2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min per real client IP — X-Forwarded-For aware behind the proxy)
-3. On success: unlocks the album + cascades to password-less descendants, sets signed cookie, redirects
+3. On success: stores only the unlocked album's token in the signed cookie and redirects — descendants are granted by chain inheritance in `resolveChainAccess`, not by extra cookie entries
 
 **Access inheritance:**
 - A locked ancestor blocks descendants until unlocked; an unlocked album grants its descendants
@@ -968,7 +968,7 @@ const renderedCards = await Promise.all(
 
 **EXIF not visible in fullscreen:** Overlay should be inside PhotoSwipe container (handled automatically)
 
-**Sort not persisting:** Check localStorage for `photoGallery_sortOption` key
+**Sort not persisting:** Check localStorage for the `photo-sort-preference` key (album sort uses `photoGallery_albumSort`)
 
 **/home page not rendering:** Ensure `export const prerender = true` is set in frontmatter
 
@@ -990,7 +990,7 @@ const renderedCards = await Promise.all(
 
 **Admin changes not showing in gallery:** Ensure dev server is running (`npm run dev`). Hard refresh browser (Cmd+Shift+R).
 
-**Deploy failing:** Check SSH key access to server. Verify `REMOTE_USER`, `REMOTE_HOST`, `REMOTE_ROOT` in `scripts/deploy.sh`. Ensure PM2 and Node.js are installed on server.
+**Deploy failing:** Check SSH key access to server. Verify `DEPLOY_REMOTE_USER`, `DEPLOY_REMOTE_HOST`, `DEPLOY_REMOTE_ROOT` in `.env` (not in `scripts/deploy.sh` — the script only reads them). Ensure PM2 and Node.js are installed on server.
 
 **403 Forbidden after deploy:** File permissions may be wrong (rsync can set 700). Fix with:
 ```bash
