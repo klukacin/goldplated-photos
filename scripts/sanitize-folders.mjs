@@ -178,12 +178,11 @@ function main() {
       console.log(`📁 ${dir.name}`);
     }
 
+    // processDirectory renames the directory itself (after its children),
+    // so the top-level dir must not be renamed again here — on case-sensitive
+    // filesystems the second attempt would see the stale old path and report
+    // a bogus conflict.
     processDirectory(dirPath);
-
-    // Rename top-level directory if needed (after processing children)
-    if (needsSanitization(dir.name)) {
-      renameToLowercase(dirPath, dir.name);
-    }
   }
 
   // Summary

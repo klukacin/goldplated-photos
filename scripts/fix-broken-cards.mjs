@@ -7,7 +7,7 @@
  *
  * Usage:
  *   npm run fixbrokencards         - Fix all broken thumbnails
- *   npm run fixbrokencards --dry   - Preview fixes without applying
+ *   npm run fixbrokencards -- --dry   - Preview fixes without applying
  */
 
 import fs from 'fs/promises';
