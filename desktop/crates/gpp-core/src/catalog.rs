@@ -66,6 +66,11 @@ impl Library {
         Ok(())
     }
 
+    /// Absolute path of the library root — the folder the photographer chose.
+    ///
+    /// Every `rel_path` in the catalog is relative to this, and nothing in the
+    /// core ever addresses a photo outside it: that is the whole reason
+    /// importing a folder from elsewhere copies it in first.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -123,12 +128,24 @@ impl Library {
 
     // ---------------------------------------------------------------- photos
 
+    /// Every photo in the catalog, unfiltered — including the ones no album
+    /// holds and the ones whose files have since vanished from disk. It counts
+    /// what the index believes, which is why it can disagree with the folder
+    /// until [`prune_missing`](Self::prune_missing) or another import runs.
     pub fn photo_count(&self) -> Result<i64> {
         self.with_conn(|c| {
             Ok(c.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?)
         })
     }
 
+    /// Fetch one photo by rowid, failing with [`Error::PhotoNotFound`] if the
+    /// row is gone.
+    ///
+    /// An id can only have come out of this catalog, so its absence means the
+    /// row was deleted underneath the caller — a stale selection in a grid, a
+    /// prune between the click and the call. That is a failure worth reporting,
+    /// which is why this errors where
+    /// [`photo_by_rel_path`](Self::photo_by_rel_path) returns `None`.
     pub fn photo_by_id(&self, id: i64) -> Result<Photo> {
         self.with_conn(|c| {
             c.query_row(
@@ -141,6 +158,14 @@ impl Library {
         })
     }
 
+    /// Look a photo up by its library-relative path. `Ok(None)` is an answer,
+    /// not a failure: this is how callers ask whether the library knows a file
+    /// at all.
+    ///
+    /// The path must be exactly as stored — '/'-separated, relative to the root,
+    /// no normalisation is done here — so a Windows caller holding a `\`-path has
+    /// to convert before asking or it will be told, wrongly, that the photograph
+    /// is not in the library.
     pub fn photo_by_rel_path(&self, rel_path: &str) -> Result<Option<Photo>> {
         self.with_conn(|c| {
             Ok(c.query_row(
@@ -261,6 +286,12 @@ impl Library {
         Ok(())
     }
 
+    /// Set the pick/reject flag. Refuses an unknown photo rather than doing
+    /// nothing quietly.
+    ///
+    /// Marking a frame [`Flag::Reject`] touches nothing on disk — culling and
+    /// deleting stay separate acts — but it is not free of consequence either:
+    /// the next publish leaves that photograph out of the gallery by default.
     pub fn set_flag(&self, photo_id: i64, flag: Flag) -> Result<()> {
         let changed = self.with_conn(|c| {
             Ok(c.execute(
@@ -274,6 +305,12 @@ impl Library {
         Ok(())
     }
 
+    /// Set or clear the colour label; `None` clears it.
+    ///
+    /// The string is stored as given — no vocabulary is enforced, so a label
+    /// from another tool round-trips intact — which also means `"Red"` and
+    /// `"red"` are two different labels and the filter will not match across
+    /// them.
     pub fn set_color_label(&self, photo_id: i64, label: Option<&str>) -> Result<()> {
         let changed = self.with_conn(|c| {
             Ok(c.execute(
@@ -300,6 +337,13 @@ impl Library {
         })
     }
 
+    /// Flag a whole selection in one transaction.
+    ///
+    /// Returns how many rows actually changed, which is the only signal that an
+    /// id was stale: unlike [`set_flag`](Self::set_flag), the bulk calls do not
+    /// fail on a photo that is no longer there. A caller rejecting 400 frames
+    /// wants the 399 that exist applied, not the lot refused — but it should
+    /// compare the count against `photo_ids.len()` before reporting success.
     pub fn set_flag_bulk(&self, photo_ids: &[i64], flag: Flag) -> Result<usize> {
         self.with_tx(|tx| {
             let mut stmt = tx.prepare("UPDATE photos SET flag = ?1 WHERE id = ?2")?;
@@ -364,6 +408,12 @@ impl Library {
 
     // -------------------------------------------------------------- settings
 
+    /// Read one setting, or `None` if it was never written.
+    ///
+    /// Settings live in the catalog, so they belong to the *library* and not to
+    /// the machine: carry the drive to another computer and the publish
+    /// destination and remote come with it. Keys are dotted by convention —
+    /// `publish.dest`, `remote.dir`, `remote.token` — and are not validated.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.with_conn(|c| {
             Ok(c.query_row(
@@ -375,6 +425,12 @@ impl Library {
         })
     }
 
+    /// Write a setting, replacing any previous value for the key.
+    ///
+    /// Stored in plain text in `.gpp/catalog.db`, which matters for one key in
+    /// particular: `remote.token` is the sync server's bearer credential, and a
+    /// library on a shared drive is a library whose token anyone with the drive
+    /// can read. There is no delete — write an empty string, or don't write it.
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
