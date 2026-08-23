@@ -258,7 +258,12 @@ const albums = {
         container.appendChild(card);
       });
     } catch (error) {
-      container.innerHTML = `<p class="error-message">Failed to load submissions: ${error.message}</p>`;
+      // error.message can echo server-supplied strings (e.g. filenames) — no innerHTML
+      container.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'error-message';
+      p.textContent = `Failed to load submissions: ${error.message}`;
+      container.appendChild(p);
     }
   },
 
@@ -296,33 +301,64 @@ const albums = {
         item.className = 'video-item';
         item.dataset.filename = video.filename;
 
-        // Video with actual player
-        const videoUrl = `/albums/${albumPath}/${video.filename}`;
-        item.innerHTML = `
-          <div class="video-preview" data-video-url="${videoUrl}">
-            <video class="video-player-preview" preload="metadata" muted>
-              <source src="${videoUrl}" type="video/${video.filename.split('.').pop().toLowerCase() === 'mov' ? 'quicktime' : 'mp4'}">
-            </video>
-            <div class="video-play-overlay">
-              <svg width="48" height="48" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M8 5v14l11-7z"/>
-              </svg>
-            </div>
-            <div class="video-filename">${video.filename}</div>
-          </div>
-          <div class="video-info">
-            <span class="video-size">${this.formatFileSize(video.size)}</span>
-          </div>
-          <div class="video-actions">
-            <button class="btn btn-sm btn-danger delete-video" title="Delete video">Delete</button>
-          </div>
+        // Video with actual player. Filenames come off disk and can contain
+        // <>"' — never interpolate them into innerHTML; build the card with
+        // createElement/textContent (same pattern as the photo grid) and
+        // encode the URL components.
+        const videoUrl = `/albums/${albumPath.split('/').map(encodeURIComponent).join('/')}/${encodeURIComponent(video.filename)}`;
+        const videoType = `video/${video.filename.split('.').pop().toLowerCase() === 'mov' ? 'quicktime' : 'mp4'}`;
+
+        const buildFilenameLabel = () => {
+          const label = document.createElement('div');
+          label.className = 'video-filename';
+          label.textContent = video.filename;
+          return label;
+        };
+
+        const preview = document.createElement('div');
+        preview.className = 'video-preview';
+        preview.dataset.videoUrl = videoUrl;
+
+        const videoEl = document.createElement('video');
+        videoEl.className = 'video-player-preview';
+        videoEl.preload = 'metadata';
+        videoEl.muted = true;
+
+        const sourceEl = document.createElement('source');
+        sourceEl.src = videoUrl;
+        sourceEl.type = videoType;
+        videoEl.appendChild(sourceEl);
+        preview.appendChild(videoEl);
+
+        const overlay = document.createElement('div');
+        overlay.className = 'video-play-overlay';
+        overlay.innerHTML = `
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M8 5v14l11-7z"/>
+          </svg>
         `;
+        preview.appendChild(overlay);
+        preview.appendChild(buildFilenameLabel());
+        item.appendChild(preview);
+
+        const info = document.createElement('div');
+        info.className = 'video-info';
+        const sizeEl = document.createElement('span');
+        sizeEl.className = 'video-size';
+        sizeEl.textContent = this.formatFileSize(video.size);
+        info.appendChild(sizeEl);
+        item.appendChild(info);
+
+        const actionsEl = document.createElement('div');
+        actionsEl.className = 'video-actions';
+        const deleteVideoBtn = document.createElement('button');
+        deleteVideoBtn.className = 'btn btn-sm btn-danger delete-video';
+        deleteVideoBtn.title = 'Delete video';
+        deleteVideoBtn.textContent = 'Delete';
+        actionsEl.appendChild(deleteVideoBtn);
+        item.appendChild(actionsEl);
 
         // Click to play/pause the video
-        const preview = item.querySelector('.video-preview');
-        const videoEl = item.querySelector('.video-player-preview');
-        const overlay = item.querySelector('.video-play-overlay');
-
         preview.addEventListener('click', () => {
           if (videoEl.paused) {
             // Pause all other videos first
@@ -352,7 +388,6 @@ const albums = {
         });
 
         // Handle video error (unsupported codec)
-        const sourceEl = videoEl.querySelector('source');
         let hasError = false;
         let errorTimeout = null;
 
@@ -360,18 +395,27 @@ const albums = {
           if (hasError) return;
           hasError = true;
           if (errorTimeout) clearTimeout(errorTimeout);
-          preview.innerHTML = `
-            <div class="video-error">
-              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
-              </svg>
-              <p>Format not supported</p>
-              <a href="${videoUrl}" download="${video.filename}" class="btn btn-sm">Download</a>
-            </div>
-            <div class="video-filename">${video.filename}</div>
+          preview.innerHTML = '';
+
+          const errorEl = document.createElement('div');
+          errorEl.className = 'video-error';
+          errorEl.innerHTML = `
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <p>Format not supported</p>
           `;
+          const downloadLink = document.createElement('a');
+          downloadLink.className = 'btn btn-sm';
+          downloadLink.href = videoUrl;
+          downloadLink.setAttribute('download', video.filename);
+          downloadLink.textContent = 'Download';
+          errorEl.appendChild(downloadLink);
+
+          preview.appendChild(errorEl);
+          preview.appendChild(buildFilenameLabel());
         };
 
         // Listen on BOTH video AND source elements
@@ -410,7 +454,12 @@ const albums = {
         grid.appendChild(item);
       });
     } catch (error) {
-      grid.innerHTML = `<p class="error-message">Failed to load videos: ${error.message}</p>`;
+      // error.message can echo server-supplied strings (e.g. filenames) — no innerHTML
+      grid.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'error-message';
+      p.textContent = `Failed to load videos: ${error.message}`;
+      grid.appendChild(p);
     }
   },
 

@@ -11,7 +11,11 @@ const API_BASE = '';
 const adminConfig = {
   previewUrl: 'http://localhost:4321',
   siteUrl: null,
-  browserDisplayableImageExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+  browserDisplayableImageExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.webp'],
+  // What the album upload endpoint accepts. Unlike the displayable list above
+  // this one may include HEIC/HEIF (the gallery shows those via /api/thumbnail),
+  // so the fail-safe is the full set — the server re-validates every upload.
+  imageExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif']
 };
 
 async function loadAdminConfig() {
@@ -234,6 +238,18 @@ function isBrowserDisplayableImage(filenameOrUrl) {
   const dot = name.lastIndexOf('.');
   if (dot <= 0) return false;
   return adminConfig.browserDisplayableImageExtensions.includes(name.slice(dot).toLowerCase());
+}
+
+// Whether a filename is an acceptable album *upload* (by extension). Wider
+// than isBrowserDisplayableImage: HEIC/HEIF may be uploaded because the
+// gallery only ever displays album photos through /api/thumbnail, which
+// converts them. Used as the fallback when drag & drop gives an empty MIME
+// type (Chrome/Firefox do this for HEIC). The server re-validates regardless.
+function isAllowedImageFilename(filename) {
+  if (!filename) return false;
+  const dot = filename.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return adminConfig.imageExtensions.includes(filename.slice(dot).toLowerCase());
 }
 
 // The original when the browser can render it, the transcode when it cannot.
