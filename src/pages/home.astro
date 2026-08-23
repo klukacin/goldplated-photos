@@ -33,6 +33,9 @@ let heroImages: string[] = [];
 
 if (existsSync(heroDir)) {
   heroImages = readdirSync(heroDir)
+    // Skip hidden files (e.g., macOS resource forks like ._DSC01.jpg) —
+    // same rule as getPhotosForAlbum() in src/lib/albums.ts
+    .filter(f => !f.startsWith('.'))
     .filter(f => imageExtensions.some(ext => f.toLowerCase().endsWith(ext)))
     .map(f => `/home/hero/${f}`);
 }

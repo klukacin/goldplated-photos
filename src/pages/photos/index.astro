@@ -133,7 +133,10 @@ if (publicAlbumsWithCovers.length > 0 && publicAlbumsWithCovers[0].coverPhotoUrl
     {lockedCount > 0 && (
       <div id="locked-grid" data-view="locked" style="display: none;">
         {/* Prerendered public page: the viewer has NO access to these albums */}
-        <AlbumGrid albums={lockedAlbumsWithCovers} isParentProtected={true} hasParentAccess={false} />
+        {/* showShareModal={false}: the public grid above already emits the
+            single share modal/toast (the script hoists it to <body>) —
+            a second copy would duplicate its ids */}
+        <AlbumGrid albums={lockedAlbumsWithCovers} isParentProtected={true} hasParentAccess={false} showShareModal={false} />
       </div>
     )}
 
@@ -461,8 +464,9 @@ if (publicAlbumsWithCovers.length > 0 && publicAlbumsWithCovers[0].coverPhotoUrl
           const titleB = b.dataset.title || '';
           const dateA = parseInt(a.dataset.date || '0', 10);
           const dateB = parseInt(b.dataset.date || '0', 10);
-          const orderA = parseInt(a.dataset.order || '999', 10);
-          const orderB = parseInt(b.dataset.order || '999', 10);
+          // Missing order sorts last — same rule as the server (Infinity)
+          const orderA = a.dataset.order ? parseInt(a.dataset.order, 10) : Infinity;
+          const orderB = b.dataset.order ? parseInt(b.dataset.order, 10) : Infinity;
 
           switch (sortBy) {
             case 'name-asc':

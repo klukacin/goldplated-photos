@@ -74,11 +74,30 @@ if (hasAccess) {
     });
   }
 
-  // Fetch cover photos for sub-albums
+  // Fetch cover photos for sub-albums.
+  // SECURITY: a grant stops at the nearest lock — a sub-album with its own
+  // password/shareToken stays locked even inside an accessible collection.
+  // Emitting its cover here would leak the filename and render a broken 401
+  // thumbnail, so resolve the visitor's access to the CHILD (cookie + any
+  // presented share token, same rules as the media routes) and null the cover
+  // when it is denied — AlbumGrid then shows its lock placeholder.
   subAlbumsWithCovers = await Promise.all(
     subAlbums.map(async (subAlbum) => {
       const subAlbumPath = subAlbum.id.replace('/index.md', '');
-      const coverPhotoUrl = await getAlbumCoverPhoto(subAlbumPath, subAlbum.data.thumbnail);
+      const hasOwnLock = !!subAlbum.data.password || !!subAlbum.data.shareToken;
+      let coverPhotoUrl: string | null = null;
+      if (!hasOwnLock) {
+        coverPhotoUrl = await getAlbumCoverPhoto(subAlbumPath, subAlbum.data.thumbnail);
+      } else {
+        const subAccess = await resolveAlbumAccess(
+          subAlbumPath,
+          getAccessCookieValue(cookies),
+          providedToken
+        );
+        if (subAccess.hasAccess) {
+          coverPhotoUrl = await getAlbumCoverPhoto(subAlbumPath, subAlbum.data.thumbnail);
+        }
+      }
       return { album: subAlbum, coverPhotoUrl };
     })
   );
@@ -109,6 +128,10 @@ if (!hasAccess) {
 } else {
   // User has access - determine appropriate OG image
 
+  // A crawler fetching the page via a secret link has no cookie, so the
+  // og:image thumbnail URL must carry the same share token or it 401s.
+  const ogTokenSuffix = providedToken ? `&token=${encodeURIComponent(providedToken)}` : '';
+
   // Check for individual photo sharing via ?photo= parameter
   if (photoParam && siteConfig.features.enablePhotoSharing) {
     const sharedMedia = allMedia.find(m => m.filename === photoParam);
@@ -120,13 +143,13 @@ if (!hasAccess) {
         const albumCover = await getAlbumCoverPhoto(path!, album.data.thumbnail);
         if (albumCover) {
           const coverPath = albumCover.replace('/albums/', '');
-          ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+          ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large${ogTokenSuffix}`;
         }
       } else {
         // Photo - use that specific photo as OG image
         ogTitle = `Photo from ${album.data.title}`;
         ogDescription = sharedMedia.filename;
-        ogImage = `/api/thumbnail?path=${encodeURIComponent(`${path}/${sharedMedia.filename}`)}&size=large`;
+        ogImage = `/api/thumbnail?path=${encodeURIComponent(`${path}/${sharedMedia.filename}`)}&size=large${ogTokenSuffix}`;
       }
     }
   } else if (isCollection && subAlbumsWithCovers.length > 0) {
@@ -134,14 +157,14 @@ if (!hasAccess) {
     const firstCover = subAlbumsWithCovers[0].coverPhotoUrl;
     if (firstCover) {
       const coverPath = firstCover.replace('/albums/', '');
-      ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+      ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large${ogTokenSuffix}`;
     }
   } else {
     // Regular album: use album's cover photo
     const albumCover = await getAlbumCoverPhoto(path!, album.data.thumbnail);
     if (albumCover) {
       const coverPath = albumCover.replace('/albums/', '');
-      ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large`;
+      ogImage = `/api/thumbnail?path=${encodeURIComponent(coverPath)}&size=large${ogTokenSuffix}`;
     }
   }
 }
@@ -1149,18 +1172,27 @@ if (!hasAccess) {
         }
       });
 
-      // Restore saved filter or default to 'photos'
+      // Restore saved filter; with no saved preference, default to 'photos' —
+      // unless the album has no photos at all (video-only albums would render
+      // blank behind the default filter), in which case default to 'videos'.
       const savedFilter = localStorage.getItem('photo-media-filter');
-      // Only restore 'videos' filter; otherwise default to 'photos'
-      if (savedFilter === 'videos') {
-        const savedOption = filter.querySelector(`[data-filter="videos"]`) as HTMLElement;
+      if (savedFilter === 'videos' || savedFilter === 'photos') {
+        const savedOption = filter.querySelector(`[data-filter="${savedFilter}"]`) as HTMLElement;
         if (savedOption) {
           savedOption.click();
         }
       } else {
-        // Apply photos filter on page load (hide videos by default)
-        filterItems('photos');
-        localStorage.setItem('photo-media-filter', 'photos');
+        const photoItemCount = gallery
+          ? gallery.querySelectorAll('.photo-item:not([data-is-video="true"])').length
+          : 0;
+        const defaultFilter = photoItemCount === 0 ? 'videos' : 'photos';
+        // Apply the default without persisting it as a preference
+        options.forEach(opt => {
+          const active = (opt as HTMLElement).dataset.filter === defaultFilter;
+          opt.classList.toggle('active', active);
+          opt.setAttribute('aria-checked', active.toString());
+        });
+        filterItems(defaultFilter);
       }
     }
 
@@ -1178,8 +1210,11 @@ if (!hasAccess) {
         );
 
         if (photoIndex >= 0) {
-          // Find the lightbox trigger and simulate a click
-          const photoLink = photoItems[photoIndex].querySelector('a[data-pswp-src]');
+          // Find the lightbox trigger and simulate a click — PhotoSwipe's
+          // delegated click handler on the gallery opens the lightbox at the
+          // clicked anchor (also covers slideshow albums, whose auto-open
+          // skips itself when ?photo= is present)
+          const photoLink = photoItems[photoIndex].querySelector('a.photo-link');
           if (photoLink) {
             (photoLink as HTMLElement).click();
           }
@@ -1215,8 +1250,9 @@ if (!hasAccess) {
           const titleB = b.dataset.title || '';
           const dateA = parseInt(a.dataset.date || '0', 10);
           const dateB = parseInt(b.dataset.date || '0', 10);
-          const orderA = parseInt(a.dataset.order || '999', 10);
-          const orderB = parseInt(b.dataset.order || '999', 10);
+          // Missing order sorts last — same rule as the server (Infinity)
+          const orderA = a.dataset.order ? parseInt(a.dataset.order, 10) : Infinity;
+          const orderB = b.dataset.order ? parseInt(b.dataset.order, 10) : Infinity;
 
           switch (sortBy) {
             case 'name-asc':
