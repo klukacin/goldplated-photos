@@ -177,7 +177,9 @@ if (!hasAccess) {
           })()}
         </p>
       )}
-      {album.data.tags && album.data.tags.length > 0 && (
+      {/* Pills only when FEATURE_TAGS is on — the pages they link to are not
+          generated when it is off (see tags/[tag].astro). */}
+      {siteConfig.features.tags && album.data.tags && album.data.tags.length > 0 && (
         <div class="tags">
           {album.data.tags.map(tag => (
             <a class="tag" href={`/photos/tags/${encodeURIComponent(tag.trim())}`}>{tag}</a>
@@ -325,7 +327,7 @@ if (!hasAccess) {
               albumToken={album.data.shareToken || ''}
               isProtected={hasPasswordProtection}
               hasAccess={hasAccess}
-              proofing={album.data.proofing}
+              proofing={album.data.proofing && siteConfig.features.proofing}
             />
           </div>
         )}
@@ -962,6 +964,12 @@ if (!hasAccess) {
 <script>
   // SECURITY: Access control is now handled server-side (SSR)
   // This script only handles UI features: sorting, display style, media filter, download
+  import {
+    comparePhotoEntries,
+    sortOptionForAlbumSort,
+    type SortablePhotoEntry
+  } from '../../lib/photo-sort';
+
   document.addEventListener('DOMContentLoaded', () => {
     const albumContent = document.getElementById('album-content');
     const albumPath = albumContent?.dataset.albumPath;
@@ -978,19 +986,9 @@ if (!hasAccess) {
       const photoGallery = document.getElementById('photo-gallery');
 
       if (sortSelect && photoGallery) {
-        // Map schema sort values to frontend sort values
-        const sortMapping: Record<string, string> = {
-          'date-desc': 'date-newest',
-          'date-asc': 'date-oldest',
-          'exif-desc': 'exif-newest',
-          'exif-asc': 'exif-oldest',
-          'name': 'name-asc',
-          'custom': 'custom'
-        };
-
         // Get album's default sort from data attribute
         const albumSort = sortSelect.dataset.albumSort || 'date-desc';
-        const defaultSort = sortMapping[albumSort] || 'date-oldest';
+        const defaultSort = sortOptionForAlbumSort(albumSort);
 
         // Load saved sort preference or use album's default
         const savedSort = localStorage.getItem('photo-sort-preference');
@@ -1017,54 +1015,22 @@ if (!hasAccess) {
             return;
           }
 
-          photoItems.sort((a, b) => {
-            const filenameA = a.getAttribute('data-photo-filename') || '';
-            const filenameB = b.getAttribute('data-photo-filename') || '';
-
-            switch (sortBy) {
-              case 'custom': {
-                // Server renders photos in album order (photoOrder applied
-                // server-side) — restore it via the original render index
-                const indexA = parseInt(a.getAttribute('data-index') || '0');
-                const indexB = parseInt(b.getAttribute('data-index') || '0');
-                return indexA - indexB;
-              }
-
-              case 'name-asc':
-                return filenameA.localeCompare(filenameB);
-
-              case 'name-desc':
-                return filenameB.localeCompare(filenameA);
-
-              case 'date-newest':
-              case 'date-oldest': {
-                const dateA = parseInt(a.getAttribute('data-photo-mtime') || '0');
-                const dateB = parseInt(b.getAttribute('data-photo-mtime') || '0');
-                return sortBy === 'date-newest' ? dateB - dateA : dateA - dateB;
-              }
-
-              case 'exif-newest':
-              case 'exif-oldest': {
-                const exifA = parseInt(a.getAttribute('data-photo-exif-date') || '0');
-                const exifB = parseInt(b.getAttribute('data-photo-exif-date') || '0');
-                // Photos without EXIF date (0) should sort to the end
-                if (exifA === 0 && exifB === 0) return 0;
-                if (exifA === 0) return 1;  // a has no EXIF, sort to end
-                if (exifB === 0) return -1; // b has no EXIF, sort to end
-                return sortBy === 'exif-newest' ? exifB - exifA : exifA - exifB;
-              }
-
-              case 'size-largest':
-              case 'size-smallest': {
-                const sizeA = parseInt(a.getAttribute('data-photo-size') || '0');
-                const sizeB = parseInt(b.getAttribute('data-photo-size') || '0');
-                return sortBy === 'size-largest' ? sizeB - sizeA : sizeA - sizeB;
-              }
-
-              default:
-                return 0;
-            }
+          // The comparison rules live in lib/photo-sort.ts (unit-tested);
+          // this side only reads each item's facts off its data attributes.
+          const entryOf = (el: Element): SortablePhotoEntry => ({
+            filename: el.getAttribute('data-photo-filename') || '',
+            // Server renders photos in album order (photoOrder applied
+            // server-side) — 'custom' restores it via this render index
+            index: parseInt(el.getAttribute('data-index') || '0'),
+            mtimeMs: parseInt(el.getAttribute('data-photo-mtime') || '0'),
+            exifDateMs: parseInt(el.getAttribute('data-photo-exif-date') || '0'),
+            size: parseInt(el.getAttribute('data-photo-size') || '0')
           });
+          const entries = new Map(photoItems.map(el => [el, entryOf(el)]));
+
+          photoItems.sort((a, b) =>
+            comparePhotoEntries(sortBy, entries.get(a)!, entries.get(b)!)
+          );
 
           // Reorder DOM elements
           photoItems.forEach(item => photoGallery.appendChild(item));

@@ -7,9 +7,6 @@
  * ever sees them.
  */
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   IMAGE_EXTENSIONS,
   BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
@@ -127,32 +124,17 @@ describe('browserSafeImageUrl', () => {
   });
 });
 
-describe('the admin panel\'s hand-copied lists', () => {
-  // admin/server.js is plain Node ESM and admin/js/utils.js is a classic
-  // <script>; neither can import the TypeScript module, so both keep a copy.
-  // A copy that drifts is a copy that lies — the admin would start accepting a
-  // hero slide the home page cannot render, and nothing else would notice.
-  const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-  function copiedList(relPath: string, name: string): string[] {
-    const source = fs.readFileSync(path.join(PROJECT_ROOT, relPath), 'utf-8');
-    const match = source.match(new RegExp(`const ${name} = (\\[[^\\]]*\\]);`));
-    if (!match) throw new Error(`${name} not found in ${relPath}`);
-    return JSON.parse(match[1].replace(/'/g, '"'));
-  }
-
-  it('admin/server.js agrees on which formats a browser can paint', () => {
-    expect(copiedList('admin/server.js', 'BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS'))
-      .toEqual(BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS);
-  });
-
-  it('admin/server.js agrees on which formats an album accepts', () => {
-    expect(copiedList('admin/server.js', 'IMAGE_EXTENSIONS')).toEqual(IMAGE_EXTENSIONS);
-  });
-
-  it('admin/js/utils.js agrees on which formats a browser can paint', () => {
-    expect(copiedList('admin/js/utils.js', 'BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS'))
-      .toEqual(BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS);
+describe('one source of truth for the lists', () => {
+  // These used to be hand-copies in admin/server.js and admin/js/utils.js,
+  // kept honest by a regex drift test. Now everything reads
+  // src/site-features.mjs — the admin server by import, the admin browser
+  // code through /api/config (covered in tests/admin-feature-flags.test.ts) —
+  // so all that is left to check is that this module re-exports the shared
+  // arrays rather than growing a copy of its own.
+  it('re-exports the shared module\'s arrays, identically', async () => {
+    const shared = await import('../src/site-features.mjs');
+    expect(IMAGE_EXTENSIONS).toBe(shared.IMAGE_EXTENSIONS);
+    expect(BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS).toBe(shared.BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS);
   });
 });
 
