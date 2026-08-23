@@ -209,6 +209,123 @@ fn a_develop_adjustment_is_recorded_and_can_be_reset() {
 }
 
 #[test]
+fn turns_and_flips_compose_rather_than_replace_each_other() {
+    let (c, dir) = ForeignCaller::with_library();
+    write_jpeg(&dir.path().join("one.jpg"), 80, 60);
+    c.ok("import", "{}");
+    let id = c.ok("photos", "{}")[0]["id"].as_i64().unwrap();
+    let ops = || c.ok("photo_edits", &json!({ "id": id }).to_string())["ops"].clone();
+
+    // `rotate_photos` is relative — how much further to turn, not where to end
+    // up — because a selection can hold photos at different angles and the
+    // button has to mean the same thing to each of them.
+    let turned = c.ok("rotate_photos", &json!({"ids": [id], "quarter_turns": 1}).to_string());
+    assert_eq!(turned, json!(1));
+    assert_eq!(ops(), json!([{"op": "rotate", "quarter_turns": 1}]));
+    c.ok("rotate_photos", &json!({"ids": [id], "quarter_turns": 1}).to_string());
+    assert_eq!(ops(), json!([{"op": "rotate", "quarter_turns": 2}]));
+
+    // Negative turns the other way, and back at upright the op is gone rather
+    // than stored as a no-op — which is what keeps the photo on its original
+    // render key and its existing thumbnails.
+    c.ok("rotate_photos", &json!({"ids": [id], "quarter_turns": -2}).to_string());
+    assert_eq!(ops(), json!([]));
+
+    // A flip has no zero to set, so it is a toggle: `set_photo_edit` would drop
+    // the existing mirror and push an identical one straight back, and the
+    // second press would do nothing visible.
+    let flip = json!({"ids": [id], "op": {"op": "flip-horizontal"}}).to_string();
+    assert_eq!(c.ok("toggle_photo_edit", &flip), json!(1));
+    assert_eq!(ops(), json!([{"op": "flip-horizontal"}]));
+    c.ok("toggle_photo_edit", &flip);
+    assert_eq!(ops(), json!([]));
+
+    // Orientation is stored canonically — one horizontal mirror, then turns —
+    // so the reply is not always the op that was sent. A client that looked for
+    // its own `flip-vertical` in the stack would never find one.
+    c.ok(
+        "toggle_photo_edit",
+        &json!({"ids": [id], "op": {"op": "flip-vertical"}}).to_string(),
+    );
+    assert_eq!(
+        ops(),
+        json!([{"op": "flip-horizontal"}, {"op": "rotate", "quarter_turns": 2}])
+    );
+}
+
+/// The gap this closes: a foreign client could start a 2000-frame card and had
+/// nothing to stop it with.
+#[test]
+fn an_import_can_be_stopped_from_another_thread() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // Enough frames that the run is unmistakably still going when the first
+    // cancel lands; a real card is thousands.
+    const FRAMES: usize = 400;
+
+    let (c, dir) = ForeignCaller::with_library();
+    for i in 0..FRAMES {
+        write_jpeg(&dir.path().join(format!("{i:04}.jpg")), 64, 48);
+    }
+
+    struct Shared(*mut GppSession);
+    unsafe impl Send for Shared {}
+    unsafe impl Sync for Shared {}
+    let shared = Shared(c.0);
+
+    let running = AtomicBool::new(true);
+    let answered_mid_import = AtomicUsize::new(0);
+
+    let reply = std::thread::scope(|scope| {
+        let importer = {
+            let (shared, running) = (&shared, &running);
+            scope.spawn(move || {
+                let reply = raw_call(shared.0, Some(b"import"), Some(b"{}"));
+                running.store(false, Ordering::SeqCst);
+                reply
+            })
+        };
+
+        // Raise the flag until the import notices it. Repeating is not
+        // belt-and-braces: `import` clears a leftover cancel before it reads
+        // its first file, so a single early call is swallowed by the very run
+        // it was meant to stop.
+        while running.load(Ordering::SeqCst) {
+            let reply = raw_call(shared.0, Some(b"cancel_import"), Some(b"{}"));
+            assert_eq!(reply["ok"], json!(null), "cancel_import failed: {reply}");
+            if running.load(Ordering::SeqCst) {
+                answered_mid_import.fetch_add(1, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        importer.join().expect("the import thread must not panic")
+    });
+
+    assert!(
+        answered_mid_import.load(Ordering::SeqCst) > 0,
+        "the whole point is that it answers while the import is still blocking"
+    );
+
+    let summary = &reply["ok"];
+    assert_eq!(
+        summary["cancelled"],
+        json!(true),
+        "a partial run that does not say so would be announced as a finished one: {reply}"
+    );
+    let imported = summary["imported"].as_u64().expect("a count is expected");
+    assert!(
+        imported < FRAMES as u64,
+        "the run should have stopped short, not imported all {FRAMES}"
+    );
+
+    // What already landed stays landed, and running it again finishes the job.
+    assert_eq!(c.ok("photos", "{}").as_array().unwrap().len() as u64, imported);
+    let second = c.ok("import", "{}");
+    assert_eq!(second["cancelled"], json!(false));
+    assert_eq!(c.ok("photos", "{}").as_array().unwrap().len(), FRAMES);
+}
+
+#[test]
 fn publishing_writes_the_gallery_tree() {
     let (c, dir) = ForeignCaller::with_library();
     let dest = tempfile::tempdir().unwrap();
@@ -412,6 +529,96 @@ fn a_failure_inside_the_core_comes_back_as_an_error_envelope() {
     );
     // Publishing with nowhere to publish to is refused before anything moves.
     assert_eq!(error_kind(&c.call("publish", "{}")), "other");
+}
+
+/// The three newest arms, given the arguments a caller gets wrong: a pointer
+/// that is not there, bytes that are not text, a key that is not the key, and a
+/// value that is not the type. Each must come back as a named error — and never
+/// as `"kind":"panic"`, which would mean an unwind had reached the boundary and
+/// left the session's lock poisoned behind it.
+#[test]
+fn the_newest_methods_refuse_hostile_arguments_without_panicking() {
+    let (c, dir) = ForeignCaller::with_library();
+    write_jpeg(&dir.path().join("one.jpg"), 60, 40);
+    c.ok("import", "{}");
+    let id = c.ok("photos", "{}")[0]["id"].as_i64().unwrap();
+
+    let refused = |method: &str, args: &str, expected: &str| {
+        let reply = c.call(method, args);
+        let kind = error_kind(&reply);
+        assert_ne!(kind, "panic", "{method} panicked on {args}: {reply}");
+        assert_eq!(kind, expected, "{method} on {args} gave {reply}");
+    };
+
+    // rotate_photos: a camelCase key is the misspelling most likely to be
+    // typed, and this door is snake_case throughout — see the README's Naming
+    // section. Silently ignoring it would leave the photo unturned with nothing
+    // said.
+    refused(
+        "rotate_photos",
+        &json!({"ids": [id], "quarterTurns": 1}).to_string(),
+        "bad-arguments",
+    );
+    refused(
+        "rotate_photos",
+        &json!({"ids": [id], "quarter_turns": "right"}).to_string(),
+        "bad-arguments",
+    );
+    refused("rotate_photos", &json!({"ids": [id]}).to_string(), "bad-arguments");
+    refused(
+        "rotate_photos",
+        &json!({"ids": "all", "quarter_turns": 1}).to_string(),
+        "bad-arguments",
+    );
+
+    // toggle_photo_edit: an op tag the core does not know, and a well-formed
+    // op with the wrong shape.
+    refused(
+        "toggle_photo_edit",
+        &json!({"ids": [id], "op": {"op": "levitate"}}).to_string(),
+        "bad-arguments",
+    );
+    refused(
+        "toggle_photo_edit",
+        &json!({"ids": [id], "op": {"op": "exposure", "ev": "lots"}}).to_string(),
+        "bad-arguments",
+    );
+    refused(
+        "toggle_photo_edit",
+        &json!({"ids": [id], "op": {"op": "flip-horizontal"}, "kind": "flip"}).to_string(),
+        "bad-arguments",
+    );
+    // A real photo id that is not in the catalog is a different mistake, and
+    // gets its own tag rather than the parser's.
+    refused(
+        "toggle_photo_edit",
+        &json!({"ids": [9999], "op": {"op": "flip-horizontal"}}).to_string(),
+        "photo-not-found",
+    );
+
+    // cancel_import takes nothing, which is exactly why a stray key has to be
+    // refused: there is no argument it could plausibly have meant.
+    refused("cancel_import", r#"{"force":true}"#, "bad-arguments");
+    refused("cancel_import", "[1,2]", "bad-arguments");
+
+    // And the pointers, for all three.
+    for method in ["rotate_photos", "toggle_photo_edit", "cancel_import"] {
+        let null_session = raw_call(ptr::null_mut(), Some(method.as_bytes()), Some(b"{}"));
+        assert_eq!(error_kind(&null_session), "null-pointer");
+
+        // A lone 0xFF byte cannot begin a UTF-8 sequence.
+        let mangled = raw_call(c.0, Some(method.as_bytes()), Some(&[0xff, b'x']));
+        assert_eq!(error_kind(&mangled), "invalid-utf8");
+    }
+
+    // A NULL args pointer means `{}`, so the one method that takes no arguments
+    // is callable the way C would rather call it.
+    assert_eq!(raw_call(c.0, Some(b"cancel_import"), None)["ok"], json!(null));
+
+    // None of that disturbed the session, and the cancel raised by the calls
+    // above is cleared by the next import rather than stopping it.
+    assert_eq!(c.ok("is_open", "{}"), json!(true));
+    assert_eq!(c.ok("import", "{}")["cancelled"], json!(false));
 }
 
 #[test]

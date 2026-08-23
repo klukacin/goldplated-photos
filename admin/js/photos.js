@@ -145,13 +145,20 @@ const photos = {
 
       const img = document.createElement('img');
       // Use small thumbnail for faster loading in admin
-      img.src = `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(this.currentAlbumPath + '/' + photo.filename)}&size=small`;
+      img.src = getPreviewThumbnailUrl(this.currentAlbumPath, photo.filename, 'small');
       img.alt = photo.filename;
       img.loading = 'lazy';
       img.draggable = false;
-      // Fallback to original if thumbnail fails
+      // Fall back to the original if the dev server is down — but only when the
+      // browser can actually paint it. Falling back to a .heic swaps one broken
+      // image for another and hides the real cause (no dev server on :4321).
       img.onerror = () => {
-        img.src = getAlbumImageUrl(this.currentAlbumPath, photo.filename);
+        if (isBrowserDisplayableImage(photo.filename)) {
+          img.src = getAlbumImageUrl(this.currentAlbumPath, photo.filename);
+        } else {
+          item.classList.add('no-preview');
+          img.remove();
+        }
       };
       item.appendChild(img);
 
@@ -346,7 +353,14 @@ const photos = {
     title.textContent = photo.filename;
     meta.textContent = albums.formatFileSize(photo.size);
     exifEl.textContent = '';
-    img.src = getAlbumImageUrl(this.currentAlbumPath, photo.filename);
+    // The original for JPEG/PNG/GIF/WebP — the dev server's 1920px transcode
+    // for HEIC/HEIF, which Chrome and Firefox cannot decode. Straight to the
+    // file here meant a blank preview modal for every iPhone upload unless the
+    // photographer happened to be on Safari.
+    img.src = browserSafeImageUrl(
+      getAlbumImageUrl(this.currentAlbumPath, photo.filename),
+      getPreviewThumbnailUrl(this.currentAlbumPath, photo.filename, 'large')
+    );
     modal.show('photo-preview-modal');
 
     try {

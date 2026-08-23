@@ -66,6 +66,11 @@ impl Library {
         Ok(())
     }
 
+    /// Absolute path of the library root — the folder the photographer chose.
+    ///
+    /// Every `rel_path` in the catalog is relative to this, and nothing in the
+    /// core ever addresses a photo outside it: that is the whole reason
+    /// importing a folder from elsewhere copies it in first.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -123,12 +128,24 @@ impl Library {
 
     // ---------------------------------------------------------------- photos
 
+    /// Every photo in the catalog, unfiltered — including the ones no album
+    /// holds and the ones whose files have since vanished from disk. It counts
+    /// what the index believes, which is why it can disagree with the folder
+    /// until [`prune_missing`](Self::prune_missing) or another import runs.
     pub fn photo_count(&self) -> Result<i64> {
         self.with_conn(|c| {
             Ok(c.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))?)
         })
     }
 
+    /// Fetch one photo by rowid, failing with [`Error::PhotoNotFound`] if the
+    /// row is gone.
+    ///
+    /// An id can only have come out of this catalog, so its absence means the
+    /// row was deleted underneath the caller — a stale selection in a grid, a
+    /// prune between the click and the call. That is a failure worth reporting,
+    /// which is why this errors where
+    /// [`photo_by_rel_path`](Self::photo_by_rel_path) returns `None`.
     pub fn photo_by_id(&self, id: i64) -> Result<Photo> {
         self.with_conn(|c| {
             c.query_row(
@@ -141,6 +158,14 @@ impl Library {
         })
     }
 
+    /// Look a photo up by its library-relative path. `Ok(None)` is an answer,
+    /// not a failure: this is how callers ask whether the library knows a file
+    /// at all.
+    ///
+    /// The path must be exactly as stored — '/'-separated, relative to the root,
+    /// no normalisation is done here — so a Windows caller holding a `\`-path has
+    /// to convert before asking or it will be told, wrongly, that the photograph
+    /// is not in the library.
     pub fn photo_by_rel_path(&self, rel_path: &str) -> Result<Option<Photo>> {
         self.with_conn(|c| {
             Ok(c.query_row(
@@ -188,10 +213,10 @@ impl Library {
             args.push(Box::new(model.clone()));
         }
         if let Some(text) = &filter.text {
-            let like = format!("%{}%", text.to_lowercase());
+            let like = format!("%{}%", like_literal(&text.to_lowercase()));
             wheres.push(
-                "(LOWER(p.filename) LIKE ? OR LOWER(IFNULL(p.camera_make,'') || ' ' \
-                 || IFNULL(p.camera_model,'')) LIKE ?)"
+                "(LOWER(p.filename) LIKE ? ESCAPE '\\' OR LOWER(IFNULL(p.camera_make,'') || ' ' \
+                 || IFNULL(p.camera_model,'')) LIKE ? ESCAPE '\\')"
                     .into(),
             );
             args.push(Box::new(like.clone()));
@@ -261,6 +286,12 @@ impl Library {
         Ok(())
     }
 
+    /// Set the pick/reject flag. Refuses an unknown photo rather than doing
+    /// nothing quietly.
+    ///
+    /// Marking a frame [`Flag::Reject`] touches nothing on disk — culling and
+    /// deleting stay separate acts — but it is not free of consequence either:
+    /// the next publish leaves that photograph out of the gallery by default.
     pub fn set_flag(&self, photo_id: i64, flag: Flag) -> Result<()> {
         let changed = self.with_conn(|c| {
             Ok(c.execute(
@@ -274,6 +305,12 @@ impl Library {
         Ok(())
     }
 
+    /// Set or clear the colour label; `None` clears it.
+    ///
+    /// The string is stored as given — no vocabulary is enforced, so a label
+    /// from another tool round-trips intact — which also means `"Red"` and
+    /// `"red"` are two different labels and the filter will not match across
+    /// them.
     pub fn set_color_label(&self, photo_id: i64, label: Option<&str>) -> Result<()> {
         let changed = self.with_conn(|c| {
             Ok(c.execute(
@@ -300,6 +337,13 @@ impl Library {
         })
     }
 
+    /// Flag a whole selection in one transaction.
+    ///
+    /// Returns how many rows actually changed, which is the only signal that an
+    /// id was stale: unlike [`set_flag`](Self::set_flag), the bulk calls do not
+    /// fail on a photo that is no longer there. A caller rejecting 400 frames
+    /// wants the 399 that exist applied, not the lot refused — but it should
+    /// compare the count against `photo_ids.len()` before reporting success.
     pub fn set_flag_bulk(&self, photo_ids: &[i64], flag: Flag) -> Result<usize> {
         self.with_tx(|tx| {
             let mut stmt = tx.prepare("UPDATE photos SET flag = ?1 WHERE id = ?2")?;
@@ -364,6 +408,12 @@ impl Library {
 
     // -------------------------------------------------------------- settings
 
+    /// Read one setting, or `None` if it was never written.
+    ///
+    /// Settings live in the catalog, so they belong to the *library* and not to
+    /// the machine: carry the drive to another computer and the publish
+    /// destination and remote come with it. Keys are dotted by convention —
+    /// `publish.dest`, `remote.dir`, `remote.token` — and are not validated.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.with_conn(|c| {
             Ok(c.query_row(
@@ -375,6 +425,12 @@ impl Library {
         })
     }
 
+    /// Write a setting, replacing any previous value for the key.
+    ///
+    /// Stored in plain text in `.gpp/catalog.db`, which matters for one key in
+    /// particular: `remote.token` is the sync server's bearer credential, and a
+    /// library on a shared drive is a library whose token anyone with the drive
+    /// can read. There is no delete — write an empty string, or don't write it.
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
@@ -387,13 +443,38 @@ impl Library {
     }
 }
 
+/// Quote the LIKE wildcards out of a free-text search term.
+///
+/// `_` matches any single character and `%` any run of them, and `_` is in the
+/// filename of nearly every frame a Nikon writes. Pasted into the pattern as
+/// typed, a search for the `DSC_0042` off one card also returns the Fuji's
+/// `DSCF0042` — a different photograph, sitting at the top of a list the
+/// photographer is using to find one frame. Callers must pair this with an
+/// `ESCAPE '\'` clause.
+fn like_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 // -------------------------------------------------------------------- schema
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);",
-    )?;
-    let current: Option<i64> = conn
+    // One transaction for the whole thing. SQLite makes DDL transactional, so a
+    // catalog either arrives at the new schema or stays exactly where it was.
+    // Run step by step in autocommit — which is what this did — a laptop closed
+    // between creating a table and writing the version number down reopened,
+    // saw the old version, and tried to create that table again. The open
+    // failed, and it failed the same way every time after: the photographer's
+    // whole library, gone behind "table album_sync already exists".
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);")?;
+    let current: Option<i64> = tx
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
             r.get(0)
         })
@@ -402,37 +483,55 @@ fn migrate(conn: &Connection) -> Result<()> {
     match current {
         None => {
             // Fresh catalog: create at the current version directly.
-            conn.execute_batch(SCHEMA_V1)?;
-            conn.execute_batch(SCHEMA_V2)?;
-            conn.execute_batch(SCHEMA_V3)?;
-            conn.execute(
+            tx.execute_batch(SCHEMA_V1)?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch(SCHEMA_V3)?;
+            tx.execute(
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
             )?;
         }
+        Some(v) if v > SCHEMA_VERSION => {
+            // A newer build has already been at this catalog. Two machines
+            // share a library over a network share or a carried drive, and one
+            // of them is a version behind — that one used to open this happily,
+            // select the columns it knows about, and write rows the newer
+            // schema's constraints were never applied to. Nothing complains
+            // until the up-to-date machine reads it back. Say which build is
+            // needed instead; the catalog is safe as long as nobody writes to
+            // it with the wrong one.
+            return Err(Error::Other(format!(
+                "this library's catalog is schema v{v}, and this build understands \
+                 v{SCHEMA_VERSION} — open it with a newer version of the app"
+            )));
+        }
         Some(v) => {
             // Stepped: a catalog two versions behind runs both migrations.
             if v < 2 {
-                conn.execute_batch(SCHEMA_V2)?;
+                tx.execute_batch(SCHEMA_V2)?;
             }
             if v < 3 {
-                conn.execute_batch(SCHEMA_V3)?;
+                tx.execute_batch(SCHEMA_V3)?;
             }
             if v < SCHEMA_VERSION {
-                conn.execute(
+                tx.execute(
                     "UPDATE schema_version SET version = ?1",
                     params![SCHEMA_VERSION],
                 )?;
             }
         }
     }
-    // Further migrations step forward from here. The catalog is a rebuildable
-    // index, so a failed migration is recoverable by re-importing.
+    tx.commit()?;
+    // Further migrations step forward from here. Every statement in them has to
+    // stay idempotent — `IF NOT EXISTS` throughout — so that a catalog already
+    // wedged by the old non-atomic version is carried across rather than left
+    // permanently unopenable. The catalog is a rebuildable index, but only by a
+    // program that can open it first.
     Ok(())
 }
 
 const SCHEMA_V1: &str = r#"
-CREATE TABLE photos (
+CREATE TABLE IF NOT EXISTS photos (
   id            INTEGER PRIMARY KEY,
   rel_path      TEXT    NOT NULL UNIQUE,
   filename      TEXT    NOT NULL,
@@ -457,13 +556,13 @@ CREATE TABLE photos (
   blur_lqip     TEXT,
   imported_at   TEXT    NOT NULL
 );
-CREATE INDEX idx_photos_hash     ON photos(content_hash);
-CREATE INDEX idx_photos_rating   ON photos(rating);
-CREATE INDEX idx_photos_captured ON photos(captured_at);
-CREATE INDEX idx_photos_camera   ON photos(camera_model);
-CREATE INDEX idx_photos_kind     ON photos(kind);
+CREATE INDEX IF NOT EXISTS idx_photos_hash     ON photos(content_hash);
+CREATE INDEX IF NOT EXISTS idx_photos_rating   ON photos(rating);
+CREATE INDEX IF NOT EXISTS idx_photos_captured ON photos(captured_at);
+CREATE INDEX IF NOT EXISTS idx_photos_camera   ON photos(camera_model);
+CREATE INDEX IF NOT EXISTS idx_photos_kind     ON photos(kind);
 
-CREATE TABLE albums (
+CREATE TABLE IF NOT EXISTS albums (
   id             INTEGER PRIMARY KEY,
   path           TEXT    NOT NULL UNIQUE,
   parent_path    TEXT,
@@ -483,39 +582,39 @@ CREATE TABLE albums (
   sort_order     INTEGER,
   body           TEXT
 );
-CREATE INDEX idx_albums_parent ON albums(parent_path);
+CREATE INDEX IF NOT EXISTS idx_albums_parent ON albums(parent_path);
 
-CREATE TABLE album_photos (
+CREATE TABLE IF NOT EXISTS album_photos (
   album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
   photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
   position INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(album_id, photo_id)
 );
-CREATE INDEX idx_album_photos_photo ON album_photos(photo_id);
+CREATE INDEX IF NOT EXISTS idx_album_photos_photo ON album_photos(photo_id);
 
-CREATE TABLE tags (
+CREATE TABLE IF NOT EXISTS tags (
   id   INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
-CREATE TABLE photo_tags (
+CREATE TABLE IF NOT EXISTS photo_tags (
   photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
   tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
   PRIMARY KEY(photo_id, tag_id)
 );
-CREATE TABLE album_tags (
+CREATE TABLE IF NOT EXISTS album_tags (
   album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
   tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
   PRIMARY KEY(album_id, tag_id)
 );
 
 -- Reserved for the develop phase: an ordered, non-destructive operation list.
-CREATE TABLE edits (
+CREATE TABLE IF NOT EXISTS edits (
   photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
   version    INTEGER NOT NULL DEFAULT 1,
   stack_json TEXT    NOT NULL
 );
 
-CREATE TABLE sync_state (
+CREATE TABLE IF NOT EXISTS sync_state (
   entity_kind    TEXT NOT NULL,
   entity_key     TEXT NOT NULL,
   local_hash     TEXT,
@@ -525,7 +624,7 @@ CREATE TABLE sync_state (
   PRIMARY KEY(entity_kind, entity_key)
 );
 
-CREATE TABLE settings (
+CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
@@ -537,7 +636,7 @@ CREATE TABLE settings (
 /// is invisible to sync: never pushed, never pulled, never deleted. That is
 /// what lets one machine hold three albums out of two hundred safely.
 const SCHEMA_V2: &str = r#"
-CREATE TABLE album_sync (
+CREATE TABLE IF NOT EXISTS album_sync (
   album_path     TEXT PRIMARY KEY,
   direction      TEXT NOT NULL DEFAULT 'both',   -- push | pull | both
   last_synced_at TEXT
@@ -550,7 +649,7 @@ const SCHEMA_V3: &str = r#"
 -- Publishing prunes a file only if it appears here: that is how a photo removed
 -- from an album disappears from the gallery, while anything another tool put in
 -- the same folder is left strictly alone.
-CREATE TABLE published_files (
+CREATE TABLE IF NOT EXISTS published_files (
   album_path TEXT NOT NULL,
   filename   TEXT NOT NULL,
   PRIMARY KEY (album_path, filename)
@@ -683,6 +782,63 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// A catalog caught half-way through a migration must still open.
+    ///
+    /// The steps used to run in autocommit, so a laptop closed between creating
+    /// a table and writing the new version number down left a catalog claiming
+    /// to be older than it is. Every open after that tried to create a table
+    /// that was already there and failed — the same way, for ever. The library
+    /// is a rebuildable index, but only by a program that can open it.
+    #[test]
+    fn a_half_applied_migration_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let lib = Library::open(dir.path()).unwrap();
+            drop(lib);
+            // Wind the books back to where the crash left them: v2's table on
+            // disk, v3's not, and the version still saying 1.
+            let conn = Connection::open(dir.path().join(GPP_DIR).join("catalog.db")).unwrap();
+            conn.execute("UPDATE schema_version SET version = 1", []).unwrap();
+            conn.execute("DROP TABLE published_files", []).unwrap();
+        }
+
+        let lib = Library::open(dir.path()).expect("the library can no longer be opened");
+        // …and it comes back at the current schema, not stuck one behind.
+        lib.record_published_files("a", &Default::default()).unwrap();
+        assert!(lib.album_subscriptions().unwrap().is_empty());
+    }
+
+    /// A catalog written by a newer build must be refused, not run against.
+    ///
+    /// Two machines share a library over a network share or a carried drive,
+    /// and one of them is a version behind. The older build used to open the
+    /// newer catalog and work happily: it selects the columns it knows, writes
+    /// rows the new schema's constraints were never applied to, and the damage
+    /// only shows up later, on the machine that is up to date.
+    #[test]
+    fn a_catalog_from_a_newer_build_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Library::open(dir.path()).unwrap());
+        {
+            let conn = Connection::open(dir.path().join(GPP_DIR).join("catalog.db")).unwrap();
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        }
+
+        let Err(err) = Library::open(dir.path()) else {
+            panic!("an older build must not open a newer catalog");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("v{}", SCHEMA_VERSION + 1))
+                && msg.contains(&format!("v{SCHEMA_VERSION}")),
+            "the refusal has to name both versions, or nobody knows which build to reach for: {msg}"
+        );
+    }
+
     #[test]
     fn resolve_rejects_traversal() {
         let lib = Library::open_in_memory("/tmp/lib").unwrap();
@@ -705,6 +861,54 @@ mod tests {
             ..Default::default()
         });
         assert!(listed.is_ok(), "{:?}", listed.err());
+    }
+
+    fn insert_photo(lib: &Library, rel_path: &str) {
+        let filename = rel_path.rsplit('/').next().unwrap();
+        lib.with_conn(|c| {
+            c.execute(
+                "INSERT INTO photos(rel_path, filename, content_hash, file_size, \
+                 mtime_ms, imported_at) VALUES(?1, ?2, 'h', 0, 0, '')",
+                params![rel_path, filename],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn search(lib: &Library, text: &str) -> Vec<String> {
+        lib.photos(&PhotoFilter {
+            text: Some(text.to_string()),
+            sort: PhotoSort::NameAsc,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|p| p.filename)
+        .collect()
+    }
+
+    /// `_` matches any single character in SQL LIKE, and it is in the filename
+    /// of nearly every frame a Nikon writes. Pasted straight into the pattern,
+    /// searching for the `DSC_0042` off one card also turned up the Fuji's
+    /// `DSCF0042` — a different photograph, from a different camera, at the top
+    /// of a list the photographer is using to find one frame.
+    #[test]
+    fn a_wildcard_in_a_filename_is_searched_for_literally() {
+        let lib = Library::open_in_memory("/tmp/lib").unwrap();
+        for name in ["DSC_0042.jpg", "DSCF0042.jpg", "DSC-0042.jpg"] {
+            insert_photo(&lib, name);
+        }
+        assert_eq!(search(&lib, "DSC_0042"), vec!["DSC_0042.jpg"]);
+
+        // `%` stands for any run of characters, so a bare one used to select
+        // the whole library instead of the files actually named with it.
+        insert_photo(&lib, "100% crop.jpg");
+        assert_eq!(search(&lib, "%"), vec!["100% crop.jpg"]);
+
+        // And the escape character itself is a legal byte in a Unix filename.
+        insert_photo(&lib, "back\\slash.jpg");
+        assert_eq!(search(&lib, "back\\slash"), vec!["back\\slash.jpg"]);
     }
 
     #[test]

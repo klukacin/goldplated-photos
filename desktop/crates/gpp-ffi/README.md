@@ -163,6 +163,9 @@ let link = try gpp.call("generate_share_link", ["path": "2026/weddings/ana-ivan"
 `push_album`, `sync_all_tracked` can each run for minutes. The session is
 `Send + Sync`, so run those on a background queue and keep reading from the main
 one; the only rule is that no call may be in flight when the session is freed.
+An import started that way can be abandoned from the main queue with
+`cancel_import`, which takes no lock and so does not wait for the very call it
+is trying to end.
 
 Kotlin over JNA is the same shape: `Pointer gpp_session_new()`,
 `Pointer gpp_call(...)`, then `getString(0)` and `gpp_string_free`. Do not let
@@ -226,7 +229,18 @@ omitted; a call with no arguments accepts `NULL`, `""` or `"{}"`.
 | Method | Arguments | Returns |
 |---|---|---|
 | `import` | `dir` *(optional; defaults to the library root)* | `ImportSummary` |
+| `cancel_import` | — | `null` |
 | `prune` | — | `int` — catalog rows dropped because the file is gone |
+
+`import` blocks for as long as the card takes. `cancel_import` is the one call
+worth making while another is still running: it raises a flag the import reads
+between files and never touches the library, so it answers immediately from a
+second thread. The run then returns its partial `ImportSummary` with
+`cancelled: true` — every other count in it is a partial tally, and a caller
+that ignores the flag will announce a finished import that never finished. What
+had already landed stays landed, and importing the same folder again finishes
+the job. Calling it when nothing is running is harmless: the next `import`
+clears the flag before it reads a file.
 
 ### Photos
 
@@ -252,8 +266,24 @@ An op is `{"op": "<kind>", ...}` — `exposure` (`ev`, in stops), `contrast`,
 |---|---|---|
 | `photo_edits` | `id` | `EditStack` — never absent; an untouched photo has an empty `ops` |
 | `set_photo_edit` | `ids`, `op` | `int` — photos changed |
+| `rotate_photos` | `ids`, `quarter_turns` (signed; positive is clockwise) | `int` |
+| `toggle_photo_edit` | `ids`, `op` | `int` |
 | `clear_photo_edit` | `ids`, `kind` (e.g. `"exposure"`) | `int` |
 | `reset_photo_edits` | `ids` | `int` |
+
+Two of those exist because a button is not a slider. `rotate_photos` is
+*relative* — a selection can hold photos at different angles, and "rotate right"
+has to mean the same thing to each of them, which setting a `rotate` op would
+not. `toggle_photo_edit` is for the flips, the only adjustments with no zero to
+set: `set_photo_edit` drops the existing mirror and pushes an identical one
+straight back, so it could never undo one.
+
+Both write through the canonical framing — one horizontal mirror followed by
+quarter turns, the eight ways a rectangle can be set down — so what comes back
+from `photo_edits` is not always the op you sent. A `flip-vertical` toggle is
+stored as `flip-horizontal` plus a half turn, and `flip-vertical` is never
+written. Read orientation by folding the whole op list, never by looking for a
+particular op.
 
 ### Albums
 
@@ -299,7 +329,7 @@ An op is `{"op": "<kind>", ...}` — `exposure` (`ev`, in stops), `contrast`,
 
 Deletions on the server are withheld unless `allow_deletes` is passed. What was
 withheld comes back in `withheld_deletes` so you can name the files, ask, and
-run again — see `ARCHITECTURE.md` §6.3.
+run again — see `dev-docs/sync.md`.
 
 The Rust-side list is `gpp_ffi::METHODS`, and a test asserts that every name in
 it dispatches.
@@ -312,7 +342,9 @@ it dispatches.
 Tauri shell streams it to the UI. There is no honest way to hand a Rust closure
 to C, and bolting a function-pointer-plus-userdata channel onto this crate would
 be a second, unrelated door. Through this one an import is synchronous and
-silent: run it off the main thread and show an indeterminate spinner. If a real
+silent: run it off the main thread and show an indeterminate spinner. Silent is
+not the same as unstoppable, though — `cancel_import` crosses in the other
+direction, so the spinner can still have a Cancel next to it. If a real
 client needs a progress bar badly enough, the right shape is a separate
 `gpp_call_with_progress` taking `void (*)(const char *json, void *user)` — not a
 callback smuggled through the JSON.

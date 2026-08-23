@@ -8,6 +8,12 @@ import { fileURLToPath } from 'url';
 import { dirname, join, extname, basename, resolve, sep } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync, rmSync } from 'fs';
 import crypto from 'crypto';
+import {
+  resolveFeatures,
+  imageExtensionsFor,
+  BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+  VIDEO_EXTENSIONS
+} from '../src/site-features.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,6 +27,11 @@ const PUBLIC_DIR = join(PROJECT_ROOT, 'public');
 try {
   process.loadEnvFile(join(PROJECT_ROOT, '.env'));
 } catch { /* no .env — fine */ }
+
+// Feature flags, resolved here rather than taken from the module's singleton:
+// imports run before loadEnvFile above, so the singleton would miss FEATURE_*
+// values that live in .env instead of the shell environment.
+const features = resolveFeatures(process.env);
 
 const app = express();
 // 4444 unless told otherwise. Overridable so a test can take a free port
@@ -114,9 +125,18 @@ function sanitizePath(inputPath) {
   return inputPath.split('/').map(segment => segment.toLowerCase()).join('/');
 }
 
-// Helper: Get file extensions
-const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
-const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
+// File extension lists, from the same shared module the gallery reads
+// (src/site-features.mjs) — so the FEATURE_HEIC flag moves the admin's upload
+// filter and the gallery's discovery together, and nothing is hand-copied.
+//
+// Album photos may be any of IMAGE_EXTENSIONS: the gallery only ever shows
+// them through /api/thumbnail, which converts to JPEG or WebP. Public assets —
+// hero slides, home cards, the landing background — are served raw out of
+// public/, with no conversion anywhere in the chain, so HEIC/HEIF there is a
+// hero slider that renders on the photographer's Safari and nowhere else.
+// Chrome and Firefox cannot decode HEIC at all — which is why
+// BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS is a constant no flag can widen.
+const IMAGE_EXTENSIONS = imageExtensionsFor(features);
 
 // Multer setup for file uploads
 const storage = multer.diskStorage({
@@ -162,13 +182,14 @@ const storage = multer.diskStorage({
 const MAX_IMAGE_SIZE = 100 * 1024 * 1024;  // 100 MB per image
 const MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB per video
 
-function extFilter(allowedExtensions) {
+function extFilter(allowedExtensions, reason) {
   return (req, file, cb) => {
     const ext = extname(file.originalname || '').toLowerCase();
     if (allowedExtensions.includes(ext)) {
       cb(null, true);
     } else {
-      cb(new HttpError(400, `File type not allowed: ${file.originalname}`));
+      const because = reason ? ` — ${reason}` : '';
+      cb(new HttpError(400, `File type not allowed: ${file.originalname}${because}`));
     }
   };
 }
@@ -183,10 +204,26 @@ const uploadVideos = multer({
   limits: { fileSize: MAX_VIDEO_SIZE, files: 20 },
   fileFilter: extFilter(VIDEO_EXTENSIONS)
 });
+// Uploads that land in public/ and are served to browsers verbatim. Nothing
+// converts these, so HEIC/HEIF has to be turned away at the door rather than
+// becoming a permanently broken image on the home page.
+const uploadPublicAssets = multer({
+  storage,
+  limits: { fileSize: MAX_IMAGE_SIZE, files: 1 },
+  fileFilter: extFilter(
+    BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+    'site images are served to browsers as-is, and HEIC/HEIF only render in Safari. Convert to JPEG, PNG or WebP first'
+  )
+});
 
 // Helper: Check if file is an image
 function isImage(filename) {
   return IMAGE_EXTENSIONS.includes(extname(filename).toLowerCase());
+}
+
+// Helper: Check if a file can go straight into an <img> (see the constant above)
+function isBrowserDisplayableImage(filename) {
+  return BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS.includes(extname(filename).toLowerCase());
 }
 
 // Helper: Check if file is a video
@@ -761,8 +798,11 @@ app.get('/api/assets/hero', (req, res, next) => {
       return res.json([]);
     }
 
+    // Only formats a browser paints — a .heic dropped into public/home/hero by
+    // hand is invisible to home.astro's slider too, so listing it here would
+    // just offer the photographer a slide that never shows.
     const images = readdirSync(heroDir)
-      .filter(f => isImage(f))
+      .filter(f => isBrowserDisplayableImage(f))
       .map(f => ({
         filename: f,
         url: `/home/hero/${f}`
@@ -778,7 +818,7 @@ app.get('/api/assets/hero', (req, res, next) => {
 app.post('/api/assets/hero', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'home/hero');
   next();
-}, uploadImages.single('image'), (req, res, next) => {
+}, uploadPublicAssets.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     res.json({ success: true, filename: req.file.filename });
@@ -809,8 +849,9 @@ app.get('/api/assets/cards', (req, res, next) => {
       return res.json([]);
     }
 
+    // Same rule as hero images: card images are served raw from public/.
     const images = readdirSync(cardsDir)
-      .filter(f => isImage(f))
+      .filter(f => isBrowserDisplayableImage(f))
       .map(f => ({
         filename: f,
         url: `/home/cards/${f}`
@@ -826,7 +867,7 @@ app.get('/api/assets/cards', (req, res, next) => {
 app.post('/api/assets/cards', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'home/cards');
   next();
-}, uploadImages.single('image'), (req, res, next) => {
+}, uploadPublicAssets.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     const filename = req.file.filename;
@@ -855,7 +896,7 @@ app.delete('/api/assets/cards/:name', (req, res, next) => {
 app.post('/api/assets/landing', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'images');
   next();
-}, uploadImages.single('image'), (req, res, next) => {
+}, uploadPublicAssets.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     // Rename to landing-bg.jpg (this endpoint always replaces the background)
@@ -1328,11 +1369,18 @@ app.get('/api/share-token', (req, res) => {
   res.json({ shareToken: generateShareToken() });
 });
 
-// GET /api/config - Admin-relevant configuration for the frontend
+// GET /api/config - Admin-relevant configuration for the frontend.
+// The extension lists ride along because admin/js/* are classic <script>s
+// that cannot import src/site-features.mjs — this endpoint is how the shared
+// module's computed values reach the browser side of the admin.
 app.get('/api/config', (req, res) => {
   res.json({
     previewUrl: process.env.ADMIN_PREVIEW_URL || 'http://localhost:4321',
-    siteUrl: process.env.SITE_URL || null
+    siteUrl: process.env.SITE_URL || null,
+    features,
+    imageExtensions: IMAGE_EXTENSIONS,
+    browserDisplayableImageExtensions: BROWSER_DISPLAYABLE_IMAGE_EXTENSIONS,
+    videoExtensions: VIDEO_EXTENSIONS
   });
 });
 

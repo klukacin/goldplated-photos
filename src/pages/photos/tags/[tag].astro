@@ -12,6 +12,12 @@ import Footer from '../../../components/Footer.astro';
 import { siteConfig } from '../../../config';
 
 export async function getStaticPaths() {
+  // FEATURE_TAGS off ⇒ no tag pages are generated. These pages are
+  // prerendered, so the flag is read at build time: turning tags off (or back
+  // on) takes effect on the next `astro build`, not the next server restart.
+  // The tag pills that link here are hidden under the same flag.
+  if (!siteConfig.features.tags) return [];
+
   const albums = await getAllAlbums();
   const paths = new Map(albums.map(a => [a.id.replace('/index.md', ''), a]));
   const tags = new Set<string>();

@@ -8,6 +8,17 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# HEIF/HEIC support is a feature because the pure-Rust HEVC decoder is the
+# single heaviest thing this crate links, and a build that will never see an
+# iPhone file (a CI smoke build, a size-constrained port) should be able to
+# leave it out. Off, `.heic`/`.heif` simply stop being photo extensions: the
+# scan does not catalogue them — exactly the behaviour before HEIF support
+# existed — rather than cataloguing files nothing can decode. See
+# `media::IMAGE_EXTENSIONS` and `publish::published_filename`.
+[features]
+default = ["heif"]
+heif = ["dep:heif-oxide"]
+
 # NOTE: this crate must stay free of GUI and platform-specific process calls —
 # it compiles for macOS, iOS, Windows and Linux unchanged.
 [dependencies]
@@ -16,6 +27,7 @@ blake3.workspace = true
 image.workspace = true
 fast_image_resize.workspace = true
 kamadak-exif.workspace = true
+heif-oxide = { version = "0.1", optional = true }
 rayon.workspace = true
 walkdir.workspace = true
 serde.workspace = true
@@ -43,3 +55,8 @@ ureq = { version = "3", default-features = false, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# cargo-machete matches on package names, but kamadak-exif's library is
+# imported as plain `exif` (media.rs), so it reads as unused when it is not.
+[package.metadata.cargo-machete]
+ignored = ["kamadak-exif"]

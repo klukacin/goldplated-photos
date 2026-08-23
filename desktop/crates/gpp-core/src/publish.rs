@@ -13,6 +13,28 @@
 //! gallery's content schema (`src/content/config.ts`). [`FRONTMATTER_FIELDS`]
 //! and its test exist so a drift fails here rather than producing an album the
 //! site refuses to render.
+//!
+//! # What publishing may and may not touch
+//!
+//! The destination is a folder other tools also write: the web admin panel puts
+//! files there, and the server puts proofing submissions under `.meta/`. So a
+//! publish adds and overwrites freely, but it only ever *removes* a file it has
+//! a record of putting there itself ([`Library::published_files`]). Nothing
+//! else in the folder is even looked at.
+//!
+//! Two more rules that the whole module bends around:
+//!
+//! - **What ships is the developed frame.** With no adjustments that is the
+//!   camera's own file, copied byte for byte. With adjustments it is a render at
+//!   [`crate::develop::DELIVERY_JPEG_QUALITY`], so moving one slider cannot
+//!   quietly cost the client detail.
+//! - **A filename is a URL.** Two photos wanting one published name are
+//!   reported as a collision and one of them ships nothing — never renamed,
+//!   because the photographer may already have sent that gallery out.
+//!
+//! One bad frame never fails an album. A missing original, an undecodable file,
+//! a develop that blew up: each is named in the [`PublishResult`] and the other
+//! four hundred photographs still reach the client.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +95,13 @@ pub const FRONTMATTER_FIELDS: &[&str] = &[
     "proofing",
 ];
 
+/// What to select out of an album, and whether to move pixels at all.
+///
+/// The default is the safe one for a delivery: every album member except the
+/// rejects, photos included. Note that these decide what is *published*, and
+/// a photo they exclude is also a photo the next publish prunes off the site —
+/// raising `min_rating` after a gallery has gone out withdraws frames the
+/// client has already seen.
 #[derive(Debug, Clone)]
 pub struct PublishOptions {
     /// Only publish photos rated at least this high. `None` publishes all
@@ -98,6 +127,8 @@ impl Default for PublishOptions {
 /// What a publish produced (or would produce, for a dry run).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PublishResult {
+    /// The album this describes — carried so a batch publish can report each
+    /// album's outcome separately instead of merging them into one total.
     pub album_path: String,
     /// Relative paths written, under the destination root. One entry per file
     /// that exists on disk afterwards — never the same path twice.
@@ -105,7 +136,14 @@ pub struct PublishResult {
     /// Photo files put in place, counted per destination. Two catalog photos
     /// racing for one name produce one copy, so this counts one.
     pub photos_copied: usize,
+    /// Photos already in place with a matching byte count, so nothing was
+    /// rewritten. They are still in [`written`](Self::written) and still on the
+    /// site — "skipped" is about work avoided, not about a photo left out.
     pub photos_skipped: usize,
+    /// Bytes the copies actually wrote — the *developed* frames, which on a
+    /// delivered album are mostly crops. Deliberately not the catalog's
+    /// `file_size`, which is the original's and was reporting a figure that had
+    /// never been written anywhere.
     pub bytes_copied: u64,
     /// Catalogued photos whose original file is gone from disk. Reported, not
     /// fatal: one unplugged drive must not abort an album. Any copy already in
@@ -131,6 +169,35 @@ pub struct PublishCollision {
     /// The album's photos that map to it, in album order. The first is the one
     /// that was published; every later one was left out.
     pub sources: Vec<String>,
+}
+
+/// The name a photograph takes in the published tree.
+///
+/// Almost always its own, but a HEIF frame is published as JPEG and so changes
+/// extension. Two reasons, and both bite:
+///
+/// Chrome and Firefox cannot display HEIC — only Safari can — so a HEIC in the
+/// gallery is a broken image for most of the people it exists for, and a client
+/// who downloads one gets something their photo viewer refuses. And the moment
+/// a frame carries an adjustment the published bytes *are* a JPEG, because that
+/// is what the renderer emits; shipping those under a `.HEIC` name is a lie
+/// about the file.
+///
+/// Converting either way keeps the name stable across a develop, which matters
+/// because the published filename is the URL. A client who has the link should
+/// not lose it because the photographer moved a slider.
+///
+/// All of this rides on `media::is_heif`, which is `false` in a build without
+/// the `heif` feature — such a build cannot transcode, so it must not promise a
+/// `.jpg` it has no way to produce. (It also cannot *catalogue* a HEIF, so the
+/// case only arises on a catalog written by a heif-enabled build; the file is
+/// then copied under its own name, as any other photo is.)
+pub fn published_filename(photo: &Photo) -> String {
+    if !crate::media::is_heif(std::path::Path::new(&photo.filename)) {
+        return photo.filename.clone();
+    }
+    let stem = photo.filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&photo.filename);
+    format!("{stem}.jpg")
 }
 
 /// Publish one album into `dest_root` (the gallery's `src/content/albums`).
@@ -192,13 +259,45 @@ pub fn publish_album(
             // What ships is the developed photo. With no adjustments this is the
             // original file itself — no copy, no render, nothing cached.
             let original = lib.resolve(&photo.rel_path)?;
-            let src = crate::develop::ensure_rendered(
+            let src = match crate::develop::ensure_rendered(
                 &original,
                 &lib.thumb_dir(),
                 photo,
                 &lib.edits(photo.id)?,
-            )?;
-            let dest = album_dir.join(&photo.filename);
+            ) {
+                Ok(src) => src,
+                // Rendering means opening the original, so the two losses the
+                // unedited path already survives — a drive unplugged, a file
+                // gone unreadable — arrive here as an error instead the moment
+                // a photo carries an adjustment. One bad frame in a developed
+                // wedding must not stop the other four hundred from reaching
+                // the client; the album says which one it was.
+                Err(e) => {
+                    if original.exists() {
+                        tracing::warn!(photo = %photo.rel_path, error = %e, "develop failed");
+                        result.unrenderable.push(photo.rel_path.clone());
+                    } else {
+                        result.missing.push(photo.rel_path.clone());
+                    }
+                    continue;
+                }
+            };
+            let published = published_filename(photo);
+            let dest = album_dir.join(&published);
+
+            // A HEIF frame with no adjustments would otherwise be *copied*,
+            // which under its new `.jpg` name would be HEIC bytes wearing the
+            // wrong extension — the same lie in the other direction. Transcode
+            // it instead, at the quality a developed frame is delivered at.
+            let src = if published != photo.filename && src == original {
+                let img = crate::media::load_oriented(&original, photo.orientation)?;
+                let jpeg = crate::media::encode_jpeg(&img, crate::develop::DELIVERY_JPEG_QUALITY)?;
+                let transcoded = lib.thumb_dir().join(format!("{}.jpg", photo.content_hash));
+                crate::media::write_atomic(&transcoded, &jpeg)?;
+                transcoded
+            } else {
+                src
+            };
 
             // Skip when destination already matches by size — cheap and
             // correct enough, since a real change alters the byte count or the
@@ -206,7 +305,7 @@ pub fn publish_album(
             if let (Ok(s), Ok(d)) = (std::fs::metadata(&src), std::fs::metadata(&dest)) {
                 if s.len() == d.len() {
                     result.photos_skipped += 1;
-                    result.written.push(format!("{album_path}/{}", photo.filename));
+                    result.written.push(format!("{album_path}/{published}"));
                     continue;
                 }
             }
@@ -216,10 +315,13 @@ pub fn publish_album(
                 continue;
             }
 
-            std::fs::copy(&src, &dest).map_err(|e| Error::io(&src, e))?;
-            result.bytes_copied += photo.file_size.max(0) as u64;
+            // Count what the copy actually wrote. The catalog's `file_size` is
+            // the *original's*, and what ships is the developed frame — on a
+            // delivered album, mostly a crop — so charging the original's bytes
+            // reported a figure that was never written anywhere.
+            result.bytes_copied += std::fs::copy(&src, &dest).map_err(|e| Error::io(&src, e))?;
             result.photos_copied += 1;
-            result.written.push(format!("{album_path}/{}", photo.filename));
+            result.written.push(format!("{album_path}/{published}"));
         }
 
         prune_published(lib, album_path, &album_dir, &photos, &mut result)?;
@@ -241,7 +343,7 @@ fn prune_published(
     photos: &[Photo],
     result: &mut PublishResult,
 ) -> Result<()> {
-    let current: BTreeSet<String> = photos.iter().map(|p| p.filename.clone()).collect();
+    let current: BTreeSet<String> = photos.iter().map(published_filename).collect();
 
     for stale in lib.published_files(album_path)?.difference(&current) {
         // A photo whose original vanished keeps its published copy: that is a
@@ -313,13 +415,13 @@ fn split_filename_collisions(
     let mut losers: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for photo in selected {
-        match claimed.get(&photo.filename) {
+        match claimed.get(&published_filename(&photo)) {
             Some(_) => losers
-                .entry(photo.filename.clone())
+                .entry(published_filename(&photo))
                 .or_default()
                 .push(photo.rel_path),
             None => {
-                claimed.insert(photo.filename.clone(), kept.len());
+                claimed.insert(published_filename(&photo), kept.len());
                 kept.push(photo);
             }
         }
@@ -363,7 +465,7 @@ pub fn render_frontmatter(album: &Album, photos: &[Photo]) -> String {
     if album.sort == "custom" && !photos.is_empty() {
         out.push_str("photoOrder:\n");
         for p in photos {
-            out.push_str(&format!("  - {}\n", yaml_scalar(&p.filename)));
+            out.push_str(&format!("  - {}\n", yaml_scalar(&published_filename(p))));
         }
     }
 
@@ -373,7 +475,7 @@ pub fn render_frontmatter(album: &Album, photos: &[Photo]) -> String {
     if let Some(cover) = album
         .cover_filename
         .as_deref()
-        .filter(|c| photos.iter().any(|p| p.filename == *c))
+        .filter(|c| photos.iter().any(|p| published_filename(p) == *c))
     {
         out.push_str(&yaml_kv("thumbnail", cover));
     }
@@ -415,13 +517,33 @@ fn yaml_kv(key: &str, value: &str) -> String {
 
 /// Always double-quote and escape. Verbose, but immune to a title that happens
 /// to be `yes`, `1.0`, `null`, or contains a colon.
+///
+/// Control characters are escaped rather than passed through or dropped. A
+/// double-quoted YAML scalar may not hold one raw, and js-yaml — what Astro
+/// parses these files with — stops at the first with "expected valid JSON
+/// character". That is not one broken album: an unparseable content collection
+/// fails the whole `npm run build`, so one byte here takes the site down. And
+/// the app does not choose these strings — a title or a tag comes back from a
+/// pulled `index.md`, a `photoOrder` entry is a filename off a card, and on
+/// Unix a filename may hold any byte but `/` and NUL.
 fn yaml_scalar(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Build a manifest of the published tree: relative path → content hash.
@@ -509,6 +631,59 @@ mod tests {
         assert_eq!(yaml_scalar("back\\slash"), "\"back\\\\slash\"");
         // A title that would otherwise parse as a boolean stays a string.
         assert_eq!(yaml_scalar("yes"), "\"yes\"");
+    }
+
+    /// A double-quoted YAML scalar may not carry a raw control character, and
+    /// js-yaml — what Astro reads these files with — stops at the first one
+    /// with "expected valid JSON character". That is not one broken album: a
+    /// content collection that fails to parse fails the whole `npm run build`,
+    /// so a single byte here takes the entire site down.
+    ///
+    /// The app does not choose these strings. A title, a description or a tag
+    /// arrives from a pulled `index.md`, and a `photoOrder` entry is a filename
+    /// off a card — on Unix a filename may hold any byte but `/` and NUL.
+    #[test]
+    fn a_control_character_cannot_reach_the_frontmatter_raw() {
+        for (name, value) in [
+            ("a NUL", "Ana\u{0}Ivan"),
+            ("a bell", "Ana\u{7}Ivan"),
+            ("an escape", "Ana\u{1b}[31mIvan"),
+            ("a vertical tab", "Ana\u{b}Ivan"),
+            ("a carriage return", "Ana\rIvan"),
+            ("DEL", "Ana\u{7f}Ivan"),
+        ] {
+            let rendered = yaml_scalar(value);
+            assert!(
+                !rendered
+                    .chars()
+                    .any(|c| (c as u32) < 0x20 || c == '\u{7f}'),
+                "{name} reached the frontmatter raw: {rendered:?}"
+            );
+        }
+    }
+
+    /// Escaping is only half a boundary; the other half is reading it back, or
+    /// a pull → publish → pull loop rewrites the photographer's own text a
+    /// little further every time round.
+    #[test]
+    fn every_escape_this_module_writes_is_one_it_can_read_back() {
+        for value in [
+            "Ana\u{0}Ivan",
+            "Ana\u{7}Ivan",
+            "Ana\rIvan",
+            "Ana\tIvan",
+            "Ana\nIvan",
+            "Ana\u{7f}Ivan",
+            r"C:\new\photos",
+            "say \"hi\"",
+        ] {
+            let rendered = format!("---\n{}---\n", yaml_kv("title", value));
+            assert_eq!(
+                parse_frontmatter(&rendered).title.as_deref(),
+                Some(value),
+                "round trip of {value:?}"
+            );
+        }
     }
 
     #[test]
@@ -720,6 +895,105 @@ mod tests {
         assert_eq!(names.len(), 2, "photoOrder lists each published file once: {names:?}");
     }
 
+    /// The same two losses the unedited path already survives — an original
+    /// gone from disk, an original nothing can decode — reached the caller as
+    /// an error the moment the photo carried an adjustment, because rendering
+    /// it means opening it. So the wedding published fine right up until the
+    /// photographer put a crop on the one frame whose drive had gone, and then
+    /// stopped publishing at all, with an i/o error naming a path in `.gpp`.
+    #[test]
+    fn an_edited_photo_that_cannot_be_rendered_does_not_take_the_album_down() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        for name in ["good.jpg", "gone.jpg", "corrupt.jpg"] {
+            write_jpeg(&src.path().join("a").join(name), 40, 40);
+        }
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let ids: Vec<i64> = lib.photos(&Default::default()).unwrap().iter().map(|p| p.id).collect();
+        lib.add_photos_to_album("a", &ids).unwrap();
+
+        // Every frame is developed — this is a delivered album.
+        for id in &ids {
+            let mut stack = lib.edits(*id).unwrap();
+            stack.set(crate::develop::EditOp::Exposure { ev: 0.2 });
+            lib.set_edits(*id, &stack).unwrap();
+        }
+
+        // Then the card goes bad: one original vanishes, one is left unreadable.
+        std::fs::remove_file(src.path().join("a/gone.jpg")).unwrap();
+        std::fs::write(src.path().join("a/corrupt.jpg"), b"\xff\xd8\xff\xe0 not a jpeg").unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 1, "the frames that survived still ship");
+        assert!(dest.path().join("a/good.jpg").exists());
+        assert_eq!(r.missing, vec!["a/gone.jpg".to_string()]);
+        assert_eq!(r.unrenderable, vec!["a/corrupt.jpg".to_string()]);
+    }
+
+    /// A crop handle dragged flat against the edge of one frame.
+    ///
+    /// It rounded to a rectangle with no pixels in it, the JPEG encoder refused
+    /// that, and the error came back out of `publish_album` — so the whole
+    /// wedding stopped publishing over one photo's crop, with an "image error"
+    /// naming no file.
+    #[test]
+    fn a_crop_with_no_area_does_not_take_the_album_down() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/one.jpg"), 40, 40);
+        write_jpeg(&src.path().join("a/two.jpg"), 40, 40);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let one = lib.photo_by_rel_path("a/one.jpg").unwrap().unwrap();
+        let two = lib.photo_by_rel_path("a/two.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[one.id, two.id]).unwrap();
+
+        let mut stack = lib.edits(one.id).unwrap();
+        stack.set(crate::develop::EditOp::Crop { x: 1.0, y: 0.0, w: 0.3, h: 1.0 });
+        lib.set_edits(one.id, &stack).unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 2, "both frames reached the gallery");
+        assert!(dest.path().join("a/two.jpg").exists());
+    }
+
+    /// `bytes_copied` is the number the photographer watches to know how much
+    /// of a wedding is still going onto the disk, and what ships is the
+    /// developed frame, not the original. Counting the original's size instead
+    /// reported a figure that was never written anywhere — badly wrong the
+    /// moment a crop is involved, which on a delivered album is most of them.
+    #[test]
+    fn bytes_copied_counts_the_file_that_was_written() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/one.jpg"), 400, 300);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let one = lib.photo_by_rel_path("a/one.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[one.id]).unwrap();
+
+        let mut stack = lib.edits(one.id).unwrap();
+        stack.set(crate::develop::EditOp::Crop { x: 0.0, y: 0.0, w: 0.25, h: 0.25 });
+        lib.set_edits(one.id, &stack).unwrap();
+
+        let r = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(r.photos_copied, 1);
+
+        let on_disk = std::fs::metadata(dest.path().join("a/one.jpg")).unwrap().len();
+        assert_ne!(
+            on_disk, one.file_size as u64,
+            "the crop has to change the byte count or this test proves nothing"
+        );
+        assert_eq!(r.bytes_copied, on_disk);
+    }
+
     #[test]
     fn respects_rating_filter_and_rejects() {
         let src = tempfile::tempdir().unwrap();
@@ -855,23 +1129,54 @@ mod tests {
 /// wrote. This parses the YAML subset we emit — quoted scalars, bare booleans
 /// and numbers, and `- item` lists — rather than pulling in a full YAML crate
 /// for a format we control on both ends.
+///
+/// Two things follow from that, and both matter when a pull turns one of these
+/// into an [`AlbumUpdate`](crate::albums::AlbumUpdate):
+///
+/// - **This is a document a server wrote**, possibly by another photographer's
+///   machine or another tool entirely. Every string in it is untrusted input,
+///   not something this app chose.
+/// - **`None` and `false` mean "the key was not there"**, which is not the same
+///   as "the album does not have it". A key the parser does not recognise is
+///   dropped, and a field left at its default here must not be written back as
+///   a deliberate clear, or a pull quietly strips settings off the album.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedFrontmatter {
     pub title: Option<String>,
     pub description: Option<String>,
     pub date: Option<String>,
+    /// The gallery's internal album id, and the one field that must survive a
+    /// round trip unchanged: it is what the site's access cookie names this
+    /// album by, so a pull that loses it logs out every client currently
+    /// holding an unlock.
     pub token: Option<String>,
+    /// Plain text, as the site stores it. A pull therefore carries the client's
+    /// password back into this machine's catalog.
     pub password: Option<String>,
+    /// The share-link secret. Same caveat as [`password`](Self::password), and
+    /// worth more: it is the entire protection on a link-shared album.
     pub share_token: Option<String>,
     pub sort: Option<String>,
     pub style: Option<String>,
+    /// The cover photo's *filename*, not an id — this side of the wire has no
+    /// idea what the other machine's catalog calls it.
     pub thumbnail: Option<String>,
+    /// Filenames in published order, meaningful only when `sort` is `custom`.
+    ///
+    /// May name only some of the album: the gallery puts what it does not name
+    /// after what it does, which is why applying one has to renumber the rest
+    /// rather than leave them where they were.
     pub photo_order: Vec<String>,
     pub tags: Vec<String>,
+    /// The four flags are written only when true, so an absent key is a
+    /// genuine `false` here rather than a gap — the one place in this struct
+    /// where a default and an absence really are the same thing.
     pub is_collection: bool,
     pub hidden: bool,
     pub allow_download: bool,
     pub proofing: bool,
+    /// The album's rank among its siblings — the gallery's `order`, which this
+    /// crate stores as `sort_order`.
     pub order: Option<i64>,
 }
 
@@ -971,11 +1276,29 @@ fn unquote(value: &str) -> String {
         }
         match chars.next() {
             Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            // `\xNN`, which is what a control character was written as. Only a
+            // pair of hex digits is one: anything else is text that happened to
+            // start `\x` and is handed back unchanged, the way it went out.
+            Some('x') => match take_hex_pair(&mut chars) {
+                Some(c) => out.push(c),
+                None => out.push('x'),
+            },
             Some(escaped) => out.push(escaped),
             None => out.push('\\'),
         }
     }
     out
+}
+
+/// Two hex digits from the front of `chars`, consumed only if both are there.
+fn take_hex_pair(chars: &mut std::str::Chars<'_>) -> Option<char> {
+    let mut peek = chars.clone();
+    let hi = peek.next()?.to_digit(16)?;
+    let lo = peek.next()?.to_digit(16)?;
+    *chars = peek;
+    char::from_u32(hi * 16 + lo)
 }
 
 #[cfg(test)]

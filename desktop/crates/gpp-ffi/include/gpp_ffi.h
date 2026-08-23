@@ -61,6 +61,11 @@
  * several threads. gpp_session_free is the exception — no call may be in flight
  * when it runs.
  *
+ * That promise is what makes a long call stoppable. "cancel_import" raises a
+ * flag the running import reads between files and never touches the library
+ * itself, so send it from another thread while "import" is still blocking; a
+ * client with only one thread has no way to abandon a 2000-frame card.
+ *
  * A Rust panic never unwinds into C; it comes back as {"error":...,
  * "kind":"panic"}. Treat that as fatal to the session (its internal lock is
  * poisoned): free it and open the library again.

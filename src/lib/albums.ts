@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { marked } from 'marked';
 import { getAlbumMediaMeta } from './media-cache';
+import { IMAGE_EXTENSIONS } from './image-formats';
 
 export type Album = CollectionEntry<'albums'>;
 
@@ -22,10 +23,15 @@ export interface Photo {
   camera?: string | null;
 }
 
-// Supported file extensions
-export const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
-export const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
-export const ARCHIVE_EXTENSIONS = ['.zip', '.rar', '.7z'];
+// Supported file extensions. The image list lives in image-formats.ts next to
+// the rule about which of them a browser can actually paint — the two have to
+// move together, or adding a format quietly adds broken images. The video
+// list comes from the same shared module the admin server reads.
+import { VIDEO_EXTENSIONS } from '../site-features.mjs';
+export { IMAGE_EXTENSIONS } from './image-formats';
+export { VIDEO_EXTENSIONS };
+
+const ARCHIVE_EXTENSIONS = ['.zip', '.rar', '.7z'];
 
 export interface ArchiveFile {
   filename: string;
@@ -254,15 +260,3 @@ export async function getAncestors(albumPath: string): Promise<Album[]> {
   return ancestors;
 }
 
-/**
- * Get all descendants (recursive, all levels)
- */
-export async function getAllDescendants(parentPath: string): Promise<Album[]> {
-  const albums = await getAllAlbums();
-  const pathPrefix = parentPath ? parentPath + '/' : '';
-
-  return albums.filter(album => {
-    const albumId = album.id.replace('/index.md', '');
-    return albumId.startsWith(pathPrefix) && albumId !== parentPath;
-  });
-}

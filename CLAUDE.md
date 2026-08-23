@@ -14,6 +14,14 @@
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for full contribution guidelines.
 
+## Developer documentation
+
+The long-form developer documentation lives in [`dev-docs/`](dev-docs/README.md):
+architecture, core internals, sync design, security invariants, feature flags,
+extension recipes, and testing (including the traps that have already cost real
+time). This file stays the operational quick-reference; when the two disagree,
+fix whichever is wrong rather than trusting either blindly.
+
 ---
 
 ## Platform Compatibility
@@ -341,6 +349,15 @@ Photos are discovered by scanning the album directory for image files (see `getP
 - **To regenerate:** Delete `.meta/thumbnails` directory (ignored by git)
 - PhotoGrid component automatically requests thumbnails via `getThumbnailUrl()` helper
 
+**HEIC/HEIF and WebP:** Sharp reads both (libvips is built with libheif), so albums accept whatever an iPhone shoots — but **Chrome and Firefox cannot display HEIC at all**, and neither can the Facebook or X crawlers. Only Safari can, which is how a broken gallery ships unnoticed from a Mac. So:
+
+- Every HEIC that reaches an `<img src>`, a CSS background or an `og:image` goes through `/api/thumbnail`, which always *writes* JPEG or WebP — the source format never gets a vote in content negotiation. The lightbox's Original-quality toggle (`O`) is included: it stays on the 1920px transcode for HEIC and labels the readout "Original (converted)".
+- Downloads are exempt. `/albums/*` and the ZIP endpoint serve the untouched original — a file is a file.
+- Public assets (`public/home/hero`, `public/home/cards`, the landing background) are served **raw**, with no conversion anywhere, so the admin refuses a HEIC/HEIF upload there and does not list one it finds.
+- WebP needs none of this; browsers decode it natively.
+
+The rule lives in one place, `src/lib/image-formats.ts` (unit-tested in `tests/image-formats.test.ts`), and `IMAGE_EXTENSIONS` is re-exported from there so adding a format cannot quietly skip the displayability question. `admin/server.js` and `admin/js/utils.js` keep hand-copies — plain JS cannot import the TS module — with comments saying so.
+
 **EXIF Orientation:** Sharp's `.rotate()` is applied during thumbnail generation to auto-rotate images based on EXIF orientation metadata.
 - **IMPORTANT:** Always use thumbnails for display (not original images) to ensure correct orientation
 - Original images may display rotated wrong because browsers don't consistently respect EXIF orientation
@@ -604,7 +621,7 @@ Changes made in admin are saved directly to `src/content/` and `public/`, then a
 
 A native photo workflow — import, cull, develop, publish, sync — sitting in front of the same gallery the admin panel edits. Written in Rust so it can run where a browser cannot: macOS today, iPadOS and Windows on the same code.
 
-`desktop/ARCHITECTURE.md` is the long form. This is what you need before touching it.
+Developer documentation lives in `dev-docs/` — [core.md](dev-docs/core.md) is the long form for this workspace. This is what you need before touching it.
 
 ### The shape
 
@@ -641,6 +658,12 @@ An adjustment is a row in `edits`, never a write to the original. What identifie
 
 Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
 
+**Where order matters, and where it cannot.** `apply` runs two passes: geometry in stack order, then tone in stack order, purely per pixel. So a tone op's position relative to a geometry op is irrelevant — measured, not assumed (`tests/geometry_order.rs`). Within tone, order matters, as in any developer: exposure-then-contrast is not contrast-then-exposure. Within geometry it matters too, and that is why the turns and mirrors are **not** edited where they lie in the stack.
+
+**Orientation is stored canonically**, as one left-to-right mirror followed by quarter turns — the eight ways a rectangle can be set down. A button composes onto the *outside* of that framing and the whole thing is written back, so a top-to-bottom flip is stored as a mirror plus a half turn, and `flip-vertical` is never written. Editing the ops in place instead gave two defects that were three presses away in the panel: "rotate right" on a flipped frame turned the photograph left, and pressing a flip again to undo it mirrored the wrong axis once a turn sat between them. Anything reading orientation must fold the whole op list (as `renderGeometry` does), never look for a particular op. The crop is held last and its rectangle is carried along by each press, so a frame drawn on the picture keeps framing the same part of it. A stack written before all this — the crop appended wherever it fell, ahead of the turns — is normalised on the next press, rectangle carried through the framing that used to follow it; without that, moving the crop to the end reads the same four fractions against a frame that has since turned and the bride is out of the picture.
+
+**HEIC and WebP are first-class.** An iPhone shoots HEIC by default and guests send it, so the core decodes HEIF with a pure-Rust HEVC decoder (`heif-oxide`) rather than libheif — libheif is LGPL, which the licence policy forbids, and linking C would cost the portability contract. It costs speed: ~9 MP/s on one core, so ~2.5 s for a 24 MP frame against a few hundred ms for JPEG, parallelised across cores at import. **A HEIF frame is published as JPEG**, developed or not (`publish::published_filename`), because Chrome and Firefox cannot display HEIC at all — only Safari can — so a HEIC in the gallery is a broken image for most visitors, and a developed one is JPEG bytes anyway. Converting either way keeps the published name stable across a develop, and the published filename is the URL. WebP needs none of this: it decodes natively and every browser shows it.
+
 **Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), and copying a photo *into* the library on import. `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
 
 ### Publish and sync are different things
@@ -652,13 +675,15 @@ Three manifests decide every file: what is local, what was last synced, what the
 
 Two transports, same trait: a folder (network share, external drive) or the gallery's own HTTP endpoints. `.meta/` is server-owned — the proofing submissions live there — and is excluded from every manifest in both directions.
 
+**A remote manifest is a document the server writes, so a pull checks every path in it** (`sync::accepts_remote_path`) before either write it makes: no empty segment, no `.` or `..`, nothing absolute, no NUL, no backslash — a separator on Windows — and no segment beginning with a dot. The local manifests already skip dot-names, so nothing this machine publishes or pushes is one; without the same rule on the way in, a server could put an `.htaccess` in the published tree that `npm run deploy` then rsyncs to the live host, and that neither manifest would ever mention again. A refused path is named in `PullOutcome.rejected` and the rest of the album still arrives.
+
 **A subscription follows its album.** Renaming or moving an album carries its subscription and its sub-albums' subscriptions; deleting an album drops its subscription. Nothing on the remote moves, though — a tracked album that was already pushed stays on the server under the old path too, and the next sync publishes it under the new one, so the server holds both until someone deletes the old copy with `allow_deletes`.
 
-**One album's failure never stops the batch.** "Sync all tracked" reports each album's outcome separately, a failed album included, and carries on with the rest — the same way `apply` already treats a single failing file.
+**One album's failure never stops the batch.** "Sync all tracked" reports each album's outcome separately, a failed album included, and carries on with the rest — the same way `apply` already treats a single failing file. Those single-file failures ride out through `PushOutcome.failed` and `SyncOutcome.failed`: a transfer that carries on past a refused upload has to name the frame, or a gallery arriving one photo short looks exactly like a clean push.
 
 ### Sync over HTTP
 
-`/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `desktop/UPLOAD-TRANSPORT.md` for the measurements and why the transport is what it is.
+`/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `dev-docs/sync-transport.md` for the measurements and why the transport is what it is.
 
 ### Commands
 

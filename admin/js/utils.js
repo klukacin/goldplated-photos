@@ -1,10 +1,17 @@
 // API Base URL
 const API_BASE = '';
 
-// Admin configuration (loaded from /api/config at startup; safe defaults)
+// Admin configuration (loaded from /api/config at startup; safe defaults).
+// The extension list is computed in src/site-features.mjs and served by the
+// admin server — this file is a classic <script>, so /api/config is its only
+// way to read the shared module. The default below is a fail-safe for the
+// moment before (or if) that fetch completes, and deliberately the narrow
+// universal set: falling back to "browser can paint it" is harmless, falling
+// back to "browser can paint HEIC" is a broken preview.
 const adminConfig = {
   previewUrl: 'http://localhost:4321',
-  siteUrl: null
+  siteUrl: null,
+  browserDisplayableImageExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.webp']
 };
 
 async function loadAdminConfig() {
@@ -198,27 +205,40 @@ function parseDate(dateString) {
   return new Date(dateString).toISOString();
 }
 
-// Debounce function
-function debounce(func, wait) {
-  let timeout;
-  return function executedFunction(...args) {
-    const later = () => {
-      clearTimeout(timeout);
-      func(...args);
-    };
-    clearTimeout(timeout);
-    timeout = setTimeout(later, wait);
-  };
-}
-
-// Get thumbnail URL
-function getThumbnailUrl(albumPath, filename, size = 'small') {
-  return `/api/thumbnail?path=${encodeURIComponent(`${albumPath}/${filename}`)}&size=${size}`;
-}
-
 // Get album image URL
 function getAlbumImageUrl(albumPath, filename) {
   return `/albums/${albumPath}/${filename}`;
+}
+
+// The gallery's thumbnail endpoint, on the dev server. The admin panel has no
+// image pipeline of its own; it borrows :4321's, which is also what already
+// fills the photo grid.
+function getPreviewThumbnailUrl(albumPath, filename, size = 'large') {
+  return `${adminConfig.previewUrl}/api/thumbnail?path=${encodeURIComponent(`${albumPath}/${filename}`)}&size=${size}`;
+}
+
+// Which image formats a browser can paint.
+//
+// Chrome and Firefox cannot decode HEIC — only Safari can. The photographer
+// uploads straight off an iPhone, so pointing an <img> at the original file
+// gives most of them a broken-image icon while it looks fine on a Mac. Every
+// admin preview therefore goes through the dev server's thumbnail endpoint,
+// which converts to JPEG/WebP, and never falls back to a raw .heic.
+//
+// The list itself comes from src/site-features.mjs via /api/config (see
+// adminConfig above), so it cannot drift from the gallery's.
+function isBrowserDisplayableImage(filenameOrUrl) {
+  if (!filenameOrUrl) return false;
+  const base = filenameOrUrl.split(/[?#]/)[0];
+  const name = base.slice(base.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return adminConfig.browserDisplayableImageExtensions.includes(name.slice(dot).toLowerCase());
+}
+
+// The original when the browser can render it, the transcode when it cannot.
+function browserSafeImageUrl(originalUrl, transcodedUrl) {
+  return isBrowserDisplayableImage(originalUrl) ? originalUrl : transcodedUrl;
 }
 
 // Initialize close buttons for all modals

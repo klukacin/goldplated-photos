@@ -75,6 +75,7 @@ pub const METHODS: &[&str] = &[
     "image_dirs",
     // import
     "import",
+    "cancel_import",
     "prune",
     // photos
     "photos",
@@ -87,6 +88,8 @@ pub const METHODS: &[&str] = &[
     // develop
     "photo_edits",
     "set_photo_edit",
+    "rotate_photos",
+    "toggle_photo_edit",
     "clear_photo_edit",
     "reset_photo_edits",
     // albums
@@ -232,6 +235,16 @@ pub(crate) fn dispatch(session: &Session, method: &str, args: &str) -> Result<Va
             let a: A = parse(args)?;
             ok(session.import(a.dir, None)?)
         }
+        // The one call that is useful *while* another is running, and the
+        // reason it works is that it never reaches the library: it raises an
+        // atomic flag the import reads between files. A foreign client that
+        // started a 2000-frame card on a background thread otherwise has
+        // nothing to do but wait out the tens of minutes it takes.
+        "cancel_import" => {
+            let _: NoArgs = parse(args)?;
+            session.cancel_import();
+            ok(())
+        }
         "prune" => {
             let _: NoArgs = parse(args)?;
             ok(session.prune()?)
@@ -314,6 +327,34 @@ pub(crate) fn dispatch(session: &Session, method: &str, args: &str) -> Result<Va
             }
             let a: A = parse(args)?;
             ok(session.set_photo_edit(a.ids, a.op)?)
+        }
+        // Relative, like the button: `quarter_turns` is how much further to
+        // turn, not where to end up. A selection can hold photos at different
+        // angles, and setting a `rotate` op instead would flatten them all to
+        // the same one.
+        "rotate_photos" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                ids: Vec<i64>,
+                /// Positive is clockwise; negative turns the other way.
+                quarter_turns: i32,
+            }
+            let a: A = parse(args)?;
+            ok(session.rotate_photos(a.ids, a.quarter_turns)?)
+        }
+        // For the flips, which have no zero to set: `set_photo_edit` would drop
+        // the existing mirror and push an identical one back, so pressing the
+        // button twice would never undo it.
+        "toggle_photo_edit" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                ids: Vec<i64>,
+                op: EditOp,
+            }
+            let a: A = parse(args)?;
+            ok(session.toggle_photo_edit(a.ids, a.op)?)
         }
         "clear_photo_edit" => {
             #[derive(Deserialize)]

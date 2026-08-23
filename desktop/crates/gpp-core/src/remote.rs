@@ -11,6 +11,29 @@
 //!
 //! Nothing outside the requested path is read, written or deleted, which is
 //! what keeps a machine holding three albums out of two hundred safe.
+//!
+//! # A pull only ever adds
+//!
+//! The one rule to have in mind before changing anything here. The file under
+//! the library root is the negative: the develop model is non-destructive
+//! precisely because Reset returns to it, and there is no second copy of it
+//! anywhere. So a pull writes a photo into the library only where none is
+//! there yet. Where one is, the server's version goes into the published tree
+//! and the original is left exactly as it was, named in
+//! [`PullOutcome::kept_originals`] for a person to judge.
+//!
+//! This is not a hypothetical. The plan that says "pull" compares the
+//! *published* copy against the remote, and the published copy holds developed
+//! pixels — so the library original was never part of that comparison, and a
+//! second machine developing one frame and republishing it was once enough to
+//! write its JPEG over the negative here.
+//!
+//! Two more guarantees ride out through the outcome types rather than through
+//! errors, because in both cases the rest of the work should still happen:
+//! [`PullOutcome::rejected`] names paths the server asked for that this machine
+//! would not write, and [`PushOutcome::failed`] names frames that never reached
+//! the server. A caller that drops either has turned a partial transfer into
+//! something indistinguishable from a clean one.
 
 use std::path::Path;
 
@@ -28,7 +51,13 @@ use crate::sync::{
 /// One album seen from this machine: where it exists, and how it syncs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteAlbum {
+    /// Gallery path, e.g. `2026/weddings/ana-ivan`. Identical on both sides —
+    /// it is the only thing that identifies a local album and a remote one as
+    /// the same album.
     pub path: String,
+    /// Read out of the remote `index.md` where the server has one, so the
+    /// picker offers the name the photographer typed rather than a folder slug.
+    /// `None` only when that file could not be read or parsed.
     pub title: Option<String>,
     /// Files under this album on the server (0 when it is local-only).
     pub file_count: usize,
@@ -48,10 +77,23 @@ pub struct RemoteAlbum {
 /// What a pull produced.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PullOutcome {
+    /// The path that was asked for — often not the only album touched, since
+    /// pulling one brings its folders and everything under it. `albums` is the
+    /// full list.
     pub album_path: String,
+    /// Files taken from the server. Each lands in the published tree; a photo
+    /// the library did not already hold lands there as well.
     pub files_pulled: usize,
+    /// Photos the catalog took in, new plus re-hashed. Ordinarily lower than
+    /// `files_pulled`: `index.md` is a file but not a photograph.
     pub photos_imported: usize,
+    /// Paths with nothing to move. Includes what a pull-only run may not act on
+    /// — a non-zero count here is the normal case, not a warning.
     pub skipped_unchanged: usize,
+    /// Photos that moved on both sides since the baseline; left as they are on
+    /// both. Metadata never appears here: `index.md` and `body.md` are derived
+    /// from the catalog this pull has just overwritten from the server anyway,
+    /// so holding them in a conflict would only strand them in one forever.
     pub conflicts: Vec<String>,
     /// Photos the server had a different version of, where this library already
     /// holds an original. The published copy was updated; the original was left
@@ -59,6 +101,11 @@ pub struct PullOutcome {
     /// guessing — the file under the library root is the negative, and there is
     /// no second copy of it anywhere.
     pub kept_originals: Vec<String>,
+    /// Paths the server offered that this machine would not write — see
+    /// `sync::accepts_remote_path`. Reported rather than fatal, and rather
+    /// than silent: a well-behaved server never names one, so a name here is
+    /// worth a photographer's attention even though the album still arrived.
+    pub rejected: Vec<String>,
     /// Every album this operation touched, shallowest first: the folders above
     /// the path, the path itself, and everything under it.
     pub albums: Vec<String>,
@@ -67,14 +114,29 @@ pub struct PullOutcome {
 /// What a push produced.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PushOutcome {
+    /// The path that was asked for. `albums` names everything it reached.
     pub album_path: String,
+    /// Files that reached the server, the ancestor folders' `index.md`
+    /// included.
     pub files_pushed: usize,
+    /// Files removed from the server — only ever non-zero when the caller
+    /// passed `allow_deletes`.
     pub deleted_remote: usize,
     /// Server files this push left in place because deletions weren't allowed.
     /// Ask the user about these, then push again with `allow_deletes`.
     pub withheld_deletes: Vec<String>,
+    /// Paths that diverged. Nothing was uploaded for them: a push does not get
+    /// to rule that this machine's copy is the right one.
     pub conflicts: Vec<String>,
+    /// Changes the push direction excluded. A file the server holds a newer
+    /// version of stays newer on the server.
     pub skipped: usize,
+    /// Files that never reached the server — a dropped connection, a refused
+    /// upload, a full disk. `sync::apply` deliberately carries on past one so
+    /// the rest of the album still goes up; throwing its report away here made
+    /// a gallery missing a frame indistinguishable from a clean push, and the
+    /// photographer heard about it from the client.
+    pub failed: Vec<(String, String)>,
     /// Every album this operation touched, shallowest first.
     pub albums: Vec<String>,
     /// Parent folders the server already had, configured differently from this
@@ -258,6 +320,14 @@ fn pull_one(
         if !is_direct_child(album_path, &change.path) {
             continue;
         }
+        // The only place a server's own string reaches this machine's disk
+        // without `sync::apply` in front of it. Checked before anything is
+        // fetched, because the two writes below go to two different roots and
+        // the last segment is also taken as a filename.
+        if !sync::accepts_remote_path(&change.path) {
+            outcome.rejected.push(change.path.clone());
+            continue;
+        }
         let filename = change.path.rsplit('/').next().unwrap_or_default();
         let is_metadata = filename == "index.md" || filename == "body.md";
 
@@ -424,6 +494,13 @@ pub fn pull_path(
         total.photos_imported += one.photos_imported;
         total.skipped_unchanged += one.skipped_unchanged;
         total.conflicts.extend(one.conflicts);
+        // Both of these are warnings, and this is the form the UI calls, so
+        // dropping them here is the same as never producing them: a kept
+        // original said the server disagrees about a negative there is only one
+        // copy of, and a rejected path said the server asked for something no
+        // honest one asks for. Neither reached a screen.
+        total.kept_originals.extend(one.kept_originals);
+        total.rejected.extend(one.rejected);
         total.albums.push(album);
     }
 
@@ -504,6 +581,7 @@ pub fn push_path(
     total.withheld_deletes = applied.withheld_deletes;
     total.conflicts = applied.conflicts;
     total.skipped = applied.skipped;
+    total.failed = applied.failed;
     total.albums.extend(subtree);
     Ok(total)
 }
@@ -580,6 +658,7 @@ pub fn sync_path(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts: pushed.conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }
@@ -606,6 +685,7 @@ pub fn sync_path(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }
@@ -661,6 +741,7 @@ pub fn push_album(
         withheld_deletes: outcome_inner.withheld_deletes,
         conflicts: outcome_inner.conflicts,
         skipped: outcome_inner.skipped,
+        failed: outcome_inner.failed,
         albums: vec![album_path.to_string()],
         folders_left_alone: Vec::new(),
     })
@@ -697,6 +778,7 @@ pub fn sync_album(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts: pushed.conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }
@@ -718,6 +800,7 @@ pub fn sync_album(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }

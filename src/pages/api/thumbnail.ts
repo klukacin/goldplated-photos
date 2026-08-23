@@ -5,6 +5,7 @@ import path from 'path';
 import { lookup } from 'mrmime';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
 import { imageJobSemaphore } from '../../lib/semaphore';
+import { chooseThumbnailFormat, needsBrowserTranscode, isDisabledImageFormat } from '../../lib/image-formats';
 
 export const prerender = false;
 
@@ -41,6 +42,12 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     return new Response('Not found', { status: 404 });
   }
 
+  // A format the feature flags have disabled (FEATURE_HEIC=0) is invisible —
+  // no thumbnails for files the rest of the site pretends do not exist.
+  if (isDisabledImageFormat(photoPath)) {
+    return new Response('Not found', { status: 404 });
+  }
+
   // Validate size
   if (!['small', 'medium', 'large'].includes(size)) {
     return new Response('Invalid size', { status: 400 });
@@ -60,10 +67,13 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     : 'public, max-age=31536000, immutable';
 
   // Content negotiation: serve WebP to clients that accept it (smaller files),
-  // JPEG otherwise. The disk cache is keyed by format; responses carry
+  // JPEG otherwise. The source format never gets a vote — Sharp decodes HEIC
+  // but Chrome and Firefox do not, so this endpoint always *writes* one of the
+  // two universal formats. The disk cache is keyed by format; responses carry
   // `Vary: Accept` so shared caches keep the variants apart.
-  const wantsWebp = (request.headers.get('accept') || '').includes('image/webp');
-  const format = FORMATS[wantsWebp ? 'webp' : 'jpeg'];
+  const formatName = chooseThumbnailFormat(request.headers.get('accept'));
+  const wantsWebp = formatName === 'webp';
+  const format = FORMATS[formatName];
 
   const width = THUMBNAIL_SIZES[size as keyof typeof THUMBNAIL_SIZES];
   const sourcePath = path.join(process.cwd(), 'src/content/albums', photoPath);
@@ -138,6 +148,15 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     // Fallback to original image if thumbnail generation fails.
     // Use the real MIME type and a SHORT cache so a transient Sharp failure
     // is not cached for a year by browsers/CDNs.
+    //
+    // Only for formats the browser can paint, though. Handing Chrome the raw
+    // bytes of a HEIC is not a fallback — it is the same broken image with a
+    // 200 status and an `image/heic` label, which also poisons any cache that
+    // trusted the header. Better to fail loudly so the log names the photo.
+    if (needsBrowserTranscode(photoPath)) {
+      return new Response('Thumbnail generation failed', { status: 500 });
+    }
+
     try {
       const original = await fs.readFile(sourcePath);
       const mimeType = lookup(path.extname(sourcePath).toLowerCase()) || 'application/octet-stream';

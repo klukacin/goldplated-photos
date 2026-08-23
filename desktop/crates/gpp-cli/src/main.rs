@@ -523,6 +523,13 @@ fn cmd_publish(args: &[String]) -> Result<()> {
             println!("    missing: {m}");
         }
 
+        // A frame the developer could not render is left out of the album, and
+        // a publish that says nothing about it looks exactly like a clean one —
+        // the photographer finds out from a client asking where the photo went.
+        for u in &r.unrenderable {
+            eprintln!("    could not be rendered, not published: {u}");
+        }
+
         // Two frames wanting one published name. Naming both sides is the
         // whole point: only the photographer can say which one the client
         // should get, and the other is not on the site until they do.
@@ -563,6 +570,9 @@ fn cmd_sync(args: &[String]) -> Result<()> {
             );
             for c in &outcome.conflicts {
                 println!("  conflict: {c}");
+            }
+            for (path, why) in &outcome.failed {
+                println!("  failed: {path} — {why}");
             }
         }
         None => {
@@ -736,6 +746,14 @@ fn cmd_pull(args: &[String]) -> Result<()> {
             println!("  {c}");
         }
     }
+    // An honest server never offers one of these, so a line here is worth
+    // reading even though the album itself arrived.
+    if !outcome.rejected.is_empty() {
+        println!("refused (the server named files this machine will not write):");
+        for c in &outcome.rejected {
+            println!("  {c}");
+        }
+    }
     Ok(())
 }
 
@@ -789,6 +807,15 @@ fn cmd_push(args: &[String]) -> Result<()> {
         for c in &outcome.conflicts {
             println!("  {c}");
         }
+    }
+    // One file failing does not stop the transfer, so it has to be said out
+    // loud here — otherwise the gallery is a photo short and nothing said so.
+    if !outcome.failed.is_empty() {
+        println!("{} file(s) did NOT reach the server:", outcome.failed.len());
+        for (path, why) in &outcome.failed {
+            println!("  {path}: {why}");
+        }
+        println!("re-run to try them again");
     }
     Ok(())
 }

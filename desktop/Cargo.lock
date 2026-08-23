@@ -432,6 +432,7 @@ dependencies = [
  "blake3",
  "chrono",
  "fast_image_resize",
+ "heif-oxide",
  "image",
  "kamadak-exif",
  "rand",
@@ -490,6 +491,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "heif-oxide"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e12acb6edcb3bb9227dc6a06dd375a221eafe397ae2de72a876d79313831e365"
+dependencies = [
+ "rust_h265",
+ "thiserror",
 ]
 
 [[package]]
@@ -1021,6 +1032,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust_h265"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dde60f5842f27ed06f1d84844cacd93d1a159f606365b30a5594c771e6b4eb17"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1096,7 +1113,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

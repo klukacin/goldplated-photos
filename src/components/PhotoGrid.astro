@@ -281,6 +281,10 @@ function getVideoMimeType(filename: string): string {
           </button>
         </div>
 
+        {/* The watermark endpoint 404s when FEATURE_WATERMARK is off, so the
+            button that calls it disappears with it. The click handler below
+            iterates over whatever buttons exist, so nothing else changes. */}
+        {siteConfig.features.watermark && (
         <button class="share-btn share-btn-instagram" data-action="instagram">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
             <path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zM12 0C8.741 0 8.333.014 7.053.072 2.695.272.273 2.69.073 7.052.014 8.333 0 8.741 0 12c0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98C8.333 23.986 8.741 24 12 24c3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98C15.668.014 15.259 0 12 0zm0 5.838a6.162 6.162 0 100 12.324 6.162 6.162 0 000-12.324zM12 16a4 4 0 110-8 4 4 0 010 8zm6.406-11.845a1.44 1.44 0 100 2.881 1.44 1.44 0 000-2.881z"/>
@@ -288,6 +292,7 @@ function getVideoMimeType(filename: string): string {
           Instagram
           <span class="share-btn-hint">Downloads watermarked image</span>
         </button>
+        )}
       </div>
     </div>
   </div>
@@ -1381,6 +1386,10 @@ function getVideoMimeType(filename: string): string {
   // Overlay markup lives in src/lib/media-info.ts so the escaping of
   // file-supplied EXIF/ffprobe strings can be unit-tested.
   import { formatExifData, formatVideoInfo } from '../lib/media-info';
+  // Chrome and Firefox cannot decode HEIC, so the Original-quality toggle has
+  // to keep serving the transcoded thumbnail for those files.
+  import { browserSafeImageUrl, needsBrowserTranscode } from '../lib/image-formats';
+  import { buildPhotoShareUrl } from '../lib/share-url';
 
   // Current photo URL for EXIF data
   let currentPhotoUrl = '';
@@ -1683,19 +1692,10 @@ function getVideoMimeType(filename: string): string {
   }
 
   // Build share URL with optional token for protected albums
+  // URL construction lives in lib/share-url.ts (unit-tested) — the
+  // photo/token query-parameter interplay is too easy to break blind here.
   function getPhotoShareUrl(filename: string): string {
-    let url = `${shareConfig.siteUrl}/photos/${shareConfig.albumPath}`;
-
-    if (filename) {
-      url += `?photo=${encodeURIComponent(filename)}`;
-    }
-
-    // Add token for protected albums
-    if (shareConfig.isProtected && shareConfig.albumToken) {
-      url += (filename ? '&' : '?') + `token=${shareConfig.albumToken}`;
-    }
-
-    return url;
+    return buildPhotoShareUrl(shareConfig, filename);
   }
 
   // Copy link to clipboard
@@ -2087,8 +2087,15 @@ function getVideoMimeType(filename: string): string {
       const originalSizeBytes = parseInt(photoItem?.getAttribute('data-photo-size') || '0');
 
       // Update size display based on mode
+      const photoUrlForFormat = element?.getAttribute('data-photo-url') || '';
+      const originalIsUndisplayable = needsBrowserTranscode(photoUrlForFormat);
+
       if (isOriginalMode) {
-        sizeDisplay.textContent = `Original · ${originalW}×${originalH} · ${formatFileSize(originalSizeBytes)}`;
+        // The pixels on screen are still the 1920px transcode for a HEIC — say
+        // so rather than claiming the browser is showing a 48-megapixel file it
+        // cannot even decode.
+        const label = originalIsUndisplayable ? 'Original (converted)' : 'Original';
+        sizeDisplay.textContent = `${label} · ${originalW}×${originalH} · ${formatFileSize(originalSizeBytes)}`;
       } else {
         // Thumbnail mode - calculate actual thumbnail dimensions (1920px max on longest side)
         const origW = parseInt(originalW) || 1920;
@@ -2120,6 +2127,9 @@ function getVideoMimeType(filename: string): string {
 
       // Update original button state
       originalBtn.classList.toggle('active', isOriginalMode);
+      originalBtn.title = originalIsUndisplayable
+        ? 'Original quality (O) — HEIC is shown converted; browsers cannot display it'
+        : 'Original quality (O)';
 
       // Update proofing heart state for the current photo
       proofingUpdateUI();
@@ -2132,13 +2142,19 @@ function getVideoMimeType(filename: string): string {
 
       const photoUrl = pswp.currSlide.data?.element?.getAttribute('data-photo-url');
       if (photoUrl) {
+        const path = photoUrl.replace('/albums/', '');
+        const largeThumb = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
         if (isOriginalMode) {
-          // Load original image for current slide
-          pswp.currSlide.data.src = photoUrl;
+          // Load the original file — except for HEIC/HEIF, which Chrome and
+          // Firefox cannot decode at all. Pointing an <img> at one of those
+          // replaces the photo with a broken-image icon, and only Safari users
+          // would ever see it work. Those stay on the 1920px transcode; the
+          // size readout below still reports the original's true dimensions
+          // and weight, so the toggle is honest about what exists on disk.
+          pswp.currSlide.data.src = browserSafeImageUrl(photoUrl, largeThumb);
         } else {
           // Revert to thumbnail
-          const path = photoUrl.replace('/albums/', '');
-          pswp.currSlide.data.src = `/api/thumbnail?path=${encodeURIComponent(path)}&size=large&v=3`;
+          pswp.currSlide.data.src = largeThumb;
         }
         pswp.refreshSlideContent(pswp.currIndex);
       }
