@@ -557,17 +557,45 @@ impl Library {
         })
     }
 
-    /// Set the explicit order of an album's photos. Ids not listed keep a
-    /// position after the listed ones.
+    /// Set the explicit order of an album's photos. Ids not listed follow the
+    /// listed ones, keeping the order they already had among themselves.
+    ///
+    /// Renumbering the rest is the whole job, not a tidy-up. Left where they
+    /// were, they hold positions the listed photos have just been given, and a
+    /// tie is settled by filename — so a photo nobody moved can sit ahead of
+    /// one that was deliberately placed first. A pull is where this arrives: a
+    /// server's `photoOrder` may name only part of an album, and the gallery
+    /// puts the photos it does not name after the ones it does, so anything
+    /// else republishes the client's gallery in an order nobody chose.
     pub fn reorder_album(&self, album_path: &str, photo_ids: &[i64]) -> Result<()> {
         let album = self
             .album_by_path(album_path)?
             .ok_or_else(|| Error::AlbumNotFound(album_path.to_string()))?;
+        let listed: std::collections::BTreeSet<i64> = photo_ids.iter().copied().collect();
         self.with_tx(|tx| {
+            let rest: Vec<i64> = {
+                // Same ordering the grid reads back, so "kept their order"
+                // means what the photographer was looking at.
+                let mut stmt = tx.prepare(
+                    "SELECT ap.photo_id FROM album_photos ap \
+                     JOIN photos p ON p.id = ap.photo_id \
+                     WHERE ap.album_id = ?1 ORDER BY ap.position ASC, p.filename ASC",
+                )?;
+                let rows = stmt.query_map(params![album.id], |r| r.get::<_, i64>(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let id = row?;
+                    if !listed.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                out
+            };
+
             let mut stmt = tx.prepare(
                 "UPDATE album_photos SET position = ?1 WHERE album_id = ?2 AND photo_id = ?3",
             )?;
-            for (i, id) in photo_ids.iter().enumerate() {
+            for (i, id) in photo_ids.iter().chain(rest.iter()).enumerate() {
                 stmt.execute(params![i as i64, album.id, id])?;
             }
             Ok(())
@@ -648,6 +676,19 @@ mod tests {
             path: path.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A catalog row is all these tests need — no pixels involved.
+    fn insert_photo(lib: &Library, filename: &str) -> i64 {
+        lib.with_conn(|c| {
+            c.execute(
+                "INSERT INTO photos(rel_path, filename, content_hash, file_size, \
+                 mtime_ms, imported_at) VALUES(?1, ?2, 'h', 0, 0, '')",
+                params![format!("a/{filename}"), filename],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .unwrap()
     }
 
     /// The sidebar draws this list as a tree, so a parent must never appear
@@ -872,6 +913,65 @@ mod tests {
         assert_eq!(top.len(), 2);
         let kids = l.child_albums(Some("2026")).unwrap();
         assert_eq!(kids.len(), 2);
+    }
+
+    /// A reorder that names only some of an album's photos has to move the
+    /// rest out of the way, not leave them sitting on the positions it just
+    /// handed out.
+    ///
+    /// A pull is where this arrives: the server's `photoOrder` may cover only
+    /// part of an album, and the gallery puts the photos it does not name
+    /// *after* the ones it does. A catalog that instead leaves them tied with
+    /// the named ones — settled by filename, so often ahead of them —
+    /// republishes the album in an order neither the photographer nor the
+    /// server ever chose, and the client's gallery reshuffles itself.
+    #[test]
+    fn reordering_part_of_an_album_moves_the_rest_behind_it() {
+        let l = lib();
+        l.create_album(&new_album("a")).unwrap();
+        let ids: Vec<i64> = ["one.jpg", "two.jpg", "three.jpg"]
+            .iter()
+            .map(|name| insert_photo(&l, name))
+            .collect();
+        l.add_photos_to_album("a", &ids).unwrap();
+
+        // Only the last photo is placed; the other two are not mentioned.
+        l.reorder_album("a", &[ids[2]]).unwrap();
+
+        let order: Vec<String> = l
+            .album_photos("a")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.filename)
+            .collect();
+        assert_eq!(order, vec!["three.jpg", "one.jpg", "two.jpg"]);
+    }
+
+    /// And the unnamed photos keep the order they already had among
+    /// themselves — a drag that touches two frames must not throw away the
+    /// arrangement of the other three hundred.
+    #[test]
+    fn a_partial_reorder_preserves_the_arrangement_of_what_it_does_not_name() {
+        let l = lib();
+        l.create_album(&new_album("a")).unwrap();
+        let ids: Vec<i64> = ["one.jpg", "two.jpg", "three.jpg", "four.jpg"]
+            .iter()
+            .map(|name| insert_photo(&l, name))
+            .collect();
+        l.add_photos_to_album("a", &ids).unwrap();
+        // An existing arrangement: reversed.
+        l.reorder_album("a", &[ids[3], ids[2], ids[1], ids[0]]).unwrap();
+
+        // Now pull one frame to the front.
+        l.reorder_album("a", &[ids[1]]).unwrap();
+
+        let order: Vec<String> = l
+            .album_photos("a")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.filename)
+            .collect();
+        assert_eq!(order, vec!["two.jpg", "four.jpg", "three.jpg", "one.jpg"]);
     }
 
     #[test]

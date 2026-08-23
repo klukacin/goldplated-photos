@@ -523,6 +523,13 @@ fn cmd_publish(args: &[String]) -> Result<()> {
             println!("    missing: {m}");
         }
 
+        // A frame the developer could not render is left out of the album, and
+        // a publish that says nothing about it looks exactly like a clean one —
+        // the photographer finds out from a client asking where the photo went.
+        for u in &r.unrenderable {
+            eprintln!("    could not be rendered, not published: {u}");
+        }
+
         // Two frames wanting one published name. Naming both sides is the
         // whole point: only the photographer can say which one the client
         // should get, and the other is not on the site until they do.
