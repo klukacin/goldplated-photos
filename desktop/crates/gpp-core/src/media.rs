@@ -4,6 +4,20 @@
 //! [`NullRawDecoder`], which catalogues RAW files (metadata + embedded preview
 //! when present) without developing them. Phase B drops in a LibRaw-backed
 //! implementation and nothing else in the codebase changes.
+//!
+//! # Two things everything downstream assumes
+//!
+//! **Upright.** [`load_oriented`] applies the EXIF orientation on the way in, so
+//! every size, every thumbnail and every developed render in this crate is the
+//! photograph the right way up. A caller that reads pixel dimensions off the
+//! file instead gets the sensor's idea of them, which for a portrait shot on a
+//! turned camera is the other way round — [`swap_for_orientation`] is there for
+//! the cases where decoding would be too expensive to bother.
+//!
+//! **Derived, never authoritative.** Everything this module writes lands under
+//! `.gpp/thumbs` and can be deleted at any time; the originals are only ever
+//! read. That is what makes clearing the cache a safe suggestion to give a
+//! photographer over the phone.
 
 use std::io::BufReader;
 use std::path::Path;
@@ -20,11 +34,25 @@ pub const THUMB_SIZES: [(&str, u32); 3] = [("small", 400), ("medium", 1200), ("l
 /// Long edge of the blur placeholder baked into the gallery HTML.
 const LQIP_SIZE: u32 = 20;
 
+/// The whole of the import filter: a file in a folder being imported is
+/// catalogued if — and only if — its extension is in one of these three lists.
+///
+/// Nothing sniffs magic bytes, so a `.jpg` that is really a text file is
+/// catalogued and fails later at decode, and a photograph saved with no
+/// extension is simply not seen. Comparison is lowercase, so `.JPG` off a
+/// camera card matches. Extending [`IMAGE_EXTENSIONS`] means promising the
+/// `image` crate can decode it; anything it cannot belongs in
+/// [`RAW_EXTENSIONS`], where the catalog records the file and its metadata but
+/// publish deliberately leaves it behind — a RAW is a negative, not something
+/// to hand a client.
 pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "tif", "tiff"];
+/// Camera RAW extensions. Catalogued and previewed, never published.
 pub const RAW_EXTENSIONS: &[&str] = &[
     "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "dng", "pef", "srw",
     "raw", "3fr", "iiq", "x3f",
 ];
+/// Video extensions. These ride along into a published album untouched — no
+/// thumbnail, no develop, no re-encode.
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv", "m4v"];
 
 /// Write a file so that nothing ever observes it half-finished.
@@ -108,19 +136,42 @@ pub fn classify(path: &Path) -> Option<PhotoKind> {
 // ------------------------------------------------------------------ metadata
 
 /// Camera metadata read from EXIF.
+///
+/// Every field is optional and every one of them is routinely absent: a
+/// screenshot, a scan, a frame exported by another editor, a file a client
+/// emailed. Nothing here may be treated as required, and `None` never means
+/// "not read yet" — [`read_metadata`] returns a fully-populated `Metadata` or a
+/// default one, and never an error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metadata {
+    /// Sensor dimensions as EXIF records them — *before* orientation. For a
+    /// portrait frame shot on a turned camera these are the landscape numbers;
+    /// [`swap_for_orientation`] turns them into what the viewer will see.
     pub width: Option<u32>,
+    /// See [`width`](Self::width) — the same caveat applies.
     pub height: Option<u32>,
+    /// EXIF orientation, 1..8. Feed it to [`apply_orientation`] rather than
+    /// interpreting it: 5–8 involve a mirror as well as a turn, and getting
+    /// those four wrong flips a photograph in a way that looks almost right.
     pub orientation: Option<u16>,
     /// ISO-8601, UTC-naive (EXIF has no timezone).
     pub captured_at: Option<String>,
+    /// Free text written by the camera body. Not sanitised here — these strings
+    /// travel as far as the gallery's info overlay, which escapes them, because
+    /// a photo from a second shooter can carry anything at all in them.
     pub camera_make: Option<String>,
+    /// See [`camera_make`](Self::camera_make).
     pub camera_model: Option<String>,
+    /// See [`camera_make`](Self::camera_make). Often absent even on bodies that
+    /// record everything else — plenty of lenses do not report themselves.
     pub lens: Option<String>,
     pub iso: Option<i64>,
+    /// f-number, so 2.8 means f/2.8.
     pub aperture: Option<f64>,
+    /// Exposure time in seconds — 1/200 s arrives as 0.005, not as 200.
     pub shutter: Option<f64>,
+    /// Millimetres, as recorded: the physical focal length, with no crop factor
+    /// applied.
     pub focal_length: Option<f64>,
 }
 
@@ -200,7 +251,13 @@ pub fn normalize_exif_datetime(raw: &str) -> Option<String> {
 
 /// Decoded RAW image plus whatever metadata the decoder recovered.
 pub struct DecodedRaw {
+    /// Already oriented. A decoder that hands back sensor-order pixels and
+    /// leaves the turn to its caller will have every RAW in the library
+    /// published on its side.
     pub image: DynamicImage,
+    /// What the decoder recovered, which for a RAW is usually richer than
+    /// [`read_metadata`] can see — the EXIF crate reads containers, not
+    /// proprietary maker formats.
     pub metadata: Metadata,
 }
 
@@ -210,7 +267,15 @@ pub struct DecodedRaw {
 /// library directly — that keeps licence decisions (LibRaw is LGPL-2.1 **or**
 /// CDDL-1.0) at the edge of the build rather than baked into the core.
 pub trait RawDecoder: Send + Sync {
+    /// Whether this decoder handles a given lowercase extension, with no dot.
+    /// Answering `true` and then failing in [`decode`](Self::decode) is worse
+    /// than answering `false`: the file is catalogued either way, but a
+    /// declined format falls back to the embedded preview instead of surfacing
+    /// as an error the photographer has to read.
     fn supports(&self, ext: &str) -> bool;
+    /// Develop the RAW into displayable, already-oriented pixels. Expensive by
+    /// nature — callers cache the result under a render key rather than calling
+    /// this per frame drawn.
     fn decode(&self, path: &Path) -> Result<DecodedRaw>;
     /// The embedded JPEG most RAW files carry — enough to show a grid.
     fn embedded_preview(&self, path: &Path) -> Result<Option<Vec<u8>>>;
@@ -239,7 +304,13 @@ impl RawDecoder for NullRawDecoder {
 /// Result of generating derived images for one file.
 #[derive(Debug, Clone, Default)]
 pub struct Derived {
+    /// Dimensions of the photograph *as displayed* — the source decoded and
+    /// turned upright, not the numbers in its EXIF. This is what the catalog
+    /// stores and what the gallery reserves space with, so a portrait frame
+    /// laid out from the sensor's width instead would leave a hole in the grid
+    /// that fills in sideways.
     pub width: u32,
+    /// See [`width`](Self::width).
     pub height: u32,
     /// base64 data URI of the tiny blur placeholder.
     pub lqip: Option<String>,

@@ -13,6 +13,28 @@
 //! gallery's content schema (`src/content/config.ts`). [`FRONTMATTER_FIELDS`]
 //! and its test exist so a drift fails here rather than producing an album the
 //! site refuses to render.
+//!
+//! # What publishing may and may not touch
+//!
+//! The destination is a folder other tools also write: the web admin panel puts
+//! files there, and the server puts proofing submissions under `.meta/`. So a
+//! publish adds and overwrites freely, but it only ever *removes* a file it has
+//! a record of putting there itself ([`Library::published_files`]). Nothing
+//! else in the folder is even looked at.
+//!
+//! Two more rules that the whole module bends around:
+//!
+//! - **What ships is the developed frame.** With no adjustments that is the
+//!   camera's own file, copied byte for byte. With adjustments it is a render at
+//!   [`crate::develop::DELIVERY_JPEG_QUALITY`], so moving one slider cannot
+//!   quietly cost the client detail.
+//! - **A filename is a URL.** Two photos wanting one published name are
+//!   reported as a collision and one of them ships nothing — never renamed,
+//!   because the photographer may already have sent that gallery out.
+//!
+//! One bad frame never fails an album. A missing original, an undecodable file,
+//! a develop that blew up: each is named in the [`PublishResult`] and the other
+//! four hundred photographs still reach the client.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +95,13 @@ pub const FRONTMATTER_FIELDS: &[&str] = &[
     "proofing",
 ];
 
+/// What to select out of an album, and whether to move pixels at all.
+///
+/// The default is the safe one for a delivery: every album member except the
+/// rejects, photos included. Note that these decide what is *published*, and
+/// a photo they exclude is also a photo the next publish prunes off the site —
+/// raising `min_rating` after a gallery has gone out withdraws frames the
+/// client has already seen.
 #[derive(Debug, Clone)]
 pub struct PublishOptions {
     /// Only publish photos rated at least this high. `None` publishes all
@@ -98,6 +127,8 @@ impl Default for PublishOptions {
 /// What a publish produced (or would produce, for a dry run).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PublishResult {
+    /// The album this describes — carried so a batch publish can report each
+    /// album's outcome separately instead of merging them into one total.
     pub album_path: String,
     /// Relative paths written, under the destination root. One entry per file
     /// that exists on disk afterwards — never the same path twice.
@@ -105,7 +136,14 @@ pub struct PublishResult {
     /// Photo files put in place, counted per destination. Two catalog photos
     /// racing for one name produce one copy, so this counts one.
     pub photos_copied: usize,
+    /// Photos already in place with a matching byte count, so nothing was
+    /// rewritten. They are still in [`written`](Self::written) and still on the
+    /// site — "skipped" is about work avoided, not about a photo left out.
     pub photos_skipped: usize,
+    /// Bytes the copies actually wrote — the *developed* frames, which on a
+    /// delivered album are mostly crops. Deliberately not the catalog's
+    /// `file_size`, which is the original's and was reporting a figure that had
+    /// never been written anywhere.
     pub bytes_copied: u64,
     /// Catalogued photos whose original file is gone from disk. Reported, not
     /// fatal: one unplugged drive must not abort an album. Any copy already in
@@ -1047,23 +1085,54 @@ mod tests {
 /// wrote. This parses the YAML subset we emit — quoted scalars, bare booleans
 /// and numbers, and `- item` lists — rather than pulling in a full YAML crate
 /// for a format we control on both ends.
+///
+/// Two things follow from that, and both matter when a pull turns one of these
+/// into an [`AlbumUpdate`](crate::albums::AlbumUpdate):
+///
+/// - **This is a document a server wrote**, possibly by another photographer's
+///   machine or another tool entirely. Every string in it is untrusted input,
+///   not something this app chose.
+/// - **`None` and `false` mean "the key was not there"**, which is not the same
+///   as "the album does not have it". A key the parser does not recognise is
+///   dropped, and a field left at its default here must not be written back as
+///   a deliberate clear, or a pull quietly strips settings off the album.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedFrontmatter {
     pub title: Option<String>,
     pub description: Option<String>,
     pub date: Option<String>,
+    /// The gallery's internal album id, and the one field that must survive a
+    /// round trip unchanged: it is what the site's access cookie names this
+    /// album by, so a pull that loses it logs out every client currently
+    /// holding an unlock.
     pub token: Option<String>,
+    /// Plain text, as the site stores it. A pull therefore carries the client's
+    /// password back into this machine's catalog.
     pub password: Option<String>,
+    /// The share-link secret. Same caveat as [`password`](Self::password), and
+    /// worth more: it is the entire protection on a link-shared album.
     pub share_token: Option<String>,
     pub sort: Option<String>,
     pub style: Option<String>,
+    /// The cover photo's *filename*, not an id — this side of the wire has no
+    /// idea what the other machine's catalog calls it.
     pub thumbnail: Option<String>,
+    /// Filenames in published order, meaningful only when `sort` is `custom`.
+    ///
+    /// May name only some of the album: the gallery puts what it does not name
+    /// after what it does, which is why applying one has to renumber the rest
+    /// rather than leave them where they were.
     pub photo_order: Vec<String>,
     pub tags: Vec<String>,
+    /// The four flags are written only when true, so an absent key is a
+    /// genuine `false` here rather than a gap — the one place in this struct
+    /// where a default and an absence really are the same thing.
     pub is_collection: bool,
     pub hidden: bool,
     pub allow_download: bool,
     pub proofing: bool,
+    /// The album's rank among its siblings — the gallery's `order`, which this
+    /// crate stores as `sort_order`.
     pub order: Option<i64>,
 }
 

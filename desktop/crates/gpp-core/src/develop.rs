@@ -39,34 +39,72 @@ pub const STACK_VERSION: u32 = 1;
 /// adjusted one is re-encoded here, and it has to land in the same range or
 /// moving one slider silently costs the delivered frame detail that was
 /// recorded at the wedding. Grid thumbnails are a separate decision — see
-/// [`media::THUMBNAIL_JPEG_QUALITY`].
+/// `media::THUMBNAIL_JPEG_QUALITY`, which is lower on purpose because nobody is
+/// ever sent one.
 pub const DELIVERY_JPEG_QUALITY: u8 = 92;
 
 /// One adjustment.
 ///
 /// Amounts are the -100..100 scale a slider hands over, except exposure, which
-/// is in stops because that is the unit photographers think in.
+/// is in stops because that is the unit photographers think in. Values are
+/// clamped by [`clamped`](Self::clamped) on the way into a stack, but a stack
+/// read back from the catalog has not been through that — treat anything
+/// arriving from disk as unbounded, including NaN.
+///
+/// The serialized field names are the on-disk format (`{"op":"exposure",...}`)
+/// and they feed the render key, so renaming one orphans every cached render in
+/// every library that has the old spelling.
+///
+/// The four geometry variants are described individually below, but the rule
+/// that governs them is not in any one of them: see [`EditStack`] — turns and
+/// mirrors are folded into a canonical framing rather than edited where they
+/// lie, and nothing may infer orientation from a single op.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum EditOp {
     /// Stops. +1 doubles the light, -1 halves it.
     Exposure { ev: f32 },
+    /// Pivoted on mid grey, so pushing contrast does not also brighten or
+    /// darken the frame overall.
     Contrast { amount: f32 },
+    /// Scales each channel's distance from the pixel's own luma, so -100 lands
+    /// on neutral grey rather than on black.
     Saturation { amount: f32 },
     /// Positive is warmer.
     Temperature { amount: f32 },
     /// Positive is magenta, negative green.
     Tint { amount: f32 },
     /// Recover blown highlights (negative) or lift them (positive).
+    ///
+    /// Masked by how bright the pixel already is, so a shadow is left exactly
+    /// where it was — a recovery slider that also lifted the blacks would be
+    /// unusable on a backlit ceremony.
     Highlights { amount: f32 },
+    /// The other end of the same mask: weighted towards the dark pixels, and
+    /// nothing above mid grey moves.
     Shadows { amount: f32 },
     /// Drop colour, keeping luminance.
     BlackAndWhite,
     /// Quarter turns clockwise, 0..3.
+    ///
+    /// At most one of these is ever stored, and its value is absolute, not a
+    /// press: the buttons go through [`EditStack::rotate_by`], which composes.
     Rotate { quarter_turns: u8 },
+    /// A left-to-right mirror — the only mirror the canonical form uses.
     FlipHorizontal,
+    /// A top-to-bottom mirror.
+    ///
+    /// Accepted from callers and from stacks written by older versions, but
+    /// never written by [`EditStack`]: a vertical mirror is a horizontal one
+    /// plus a half turn, and storing it that way is what keeps the eight
+    /// orientations closed under the buttons. Code looking for a vertical flip
+    /// in a stack will not find one, and should not be looking.
     FlipVertical,
-    /// Fractions of the frame, each 0..1, after rotation.
+    /// Fractions of the frame, each 0..1, taken after the turns and mirrors.
+    ///
+    /// The rectangle only means what the photographer drew while the framing
+    /// beneath it stays put, which is why the crop is kept last in the stack
+    /// and carried through every subsequent turn.
     Crop { x: f32, y: f32, w: f32, h: f32 },
 }
 
@@ -203,10 +241,38 @@ fn framing_of(ops: &[EditOp]) -> Framing {
 }
 
 /// Everything done to one photo, in order.
+///
+/// This is the whole of what "developed" means for a photograph: there is no
+/// other record, and the original file is never written. An empty stack is not
+/// a special case to branch on — it is the ordinary state of most of a library,
+/// and it is what lets [`ensure_rendered`] hand back the camera's own file with
+/// nothing copied and nothing cached.
+///
+/// # Geometry does not live where it looks like it lives
+///
+/// A caller may set tone ops freely. Turns and mirrors are different: they do
+/// not commute, so the stack stores the single canonical framing they add up to
+/// — one left-to-right mirror, then quarter turns — and every geometry button
+/// ([`rotate_by`](Self::rotate_by), [`toggle`](Self::toggle), and
+/// [`set`](Self::set) when handed a geometry op) composes onto the outside of
+/// that and rewrites it. Editing an op where it sits instead turned a mirrored
+/// photograph the wrong way, and made a second press of a flip mirror the wrong
+/// axis. Anything reading orientation back must fold the whole op list.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EditStack {
+    /// Format of the stored ops, not of the photograph. Bumped only when the
+    /// *meaning* of an existing op changes, because every catalog on disk holds
+    /// stacks written by older builds and they have to keep rendering the
+    /// picture the photographer approved. An absent field reads as the current
+    /// version.
     #[serde(default = "default_version")]
     pub version: u32,
+    /// The adjustments, in the order they were recorded.
+    ///
+    /// Order is meaning within tone — exposure then contrast is not contrast
+    /// then exposure — and within geometry. It is *not* meaning between the
+    /// two: [`apply`] runs geometry in one pass and tone in another, so where a
+    /// tone op sits relative to a crop cannot change a pixel.
     #[serde(default)]
     pub ops: Vec<EditOp>,
 }
@@ -223,6 +289,15 @@ impl EditStack {
         }
     }
 
+    /// True when this photo is still the camera's file.
+    ///
+    /// More than a length check, because three other things key off it: the
+    /// render key is the plain content hash, [`ensure_rendered`] returns the
+    /// original's own path, and [`Library::set_edits`] deletes the row rather
+    /// than storing an empty one. Something that reports edits on an untouched
+    /// photo therefore also costs it every thumbnail it already had.
+    ///
+    /// [`Library::set_edits`]: crate::catalog::Library::set_edits
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
@@ -326,20 +401,6 @@ impl EditStack {
         }
     }
 
-    /// Put a stack into the shape the buttons below assume: one canonical
-    /// framing, with the crop last.
-    ///
-    /// A stack written before orientation was stored canonically can hold the
-    /// crop *ahead* of the turns — the photographer framed the shot and then
-    /// straightened it, and each op was appended where it fell. Such stacks are
-    /// in catalogs on disk, and they still render correctly; it is the next
-    /// press of a geometry button that breaks them, because [`set_framing`]
-    /// moves the crop to the end, where the same four fractions are read
-    /// against a frame that has since turned. The bride ends up outside the
-    /// picture with nothing on screen to explain it. So the rectangle is first
-    /// carried through whatever framing used to follow it.
-    ///
-    /// [`set_framing`]: Self::set_framing
     /// Put the photograph at an absolute number of quarter turns, keeping any
     /// mirror and carrying the crop through the difference.
     ///
@@ -357,6 +418,20 @@ impl EditStack {
         self.carry_crop(delta, false, false);
     }
 
+    /// Put a stack into the shape the buttons below assume: one canonical
+    /// framing, with the crop last.
+    ///
+    /// A stack written before orientation was stored canonically can hold the
+    /// crop *ahead* of the turns — the photographer framed the shot and then
+    /// straightened it, and each op was appended where it fell. Such stacks are
+    /// in catalogs on disk, and they still render correctly; it is the next
+    /// press of a geometry button that breaks them, because [`set_framing`]
+    /// moves the crop to the end, where the same four fractions are read
+    /// against a frame that has since turned. The bride ends up outside the
+    /// picture with nothing on screen to explain it. So the rectangle is first
+    /// carried through whatever framing used to follow it.
+    ///
+    /// [`set_framing`]: Self::set_framing
     fn normalize_geometry(&mut self) {
         let Some(at) = self.ops.iter().position(|op| op.kind() == "crop") else {
             return;
@@ -410,18 +485,41 @@ impl EditStack {
         }
     }
 
+    /// Drop every op of one kind, named as [`EditOp::kind`] spells it.
+    ///
+    /// Fine for tone. Reaching for it to undo geometry is not: taking out
+    /// `"rotate"` leaves any mirror standing, and the result is a framing the
+    /// photographer never asked for. The buttons undo themselves —
+    /// [`rotate_by`](Self::rotate_by) with the opposite sign, or a second
+    /// [`toggle`](Self::toggle).
     pub fn remove(&mut self, kind: &str) {
         self.ops.retain(|op| op.kind() != kind);
     }
 
+    /// The op of one kind, if the stack holds it. Kinds are the strings
+    /// [`EditOp::kind`] returns; an unknown one is simply not found.
     pub fn get(&self, kind: &str) -> Option<&EditOp> {
         self.ops.iter().find(|op| op.kind() == kind)
     }
 
+    /// Serialize to the exact text stored in `edits.stack_json` — and hashed
+    /// into the render key.
+    ///
+    /// The key covers this string, not the ops it describes, so anything that
+    /// changes the *spelling* changes every key: a different field order, a
+    /// float printed as `1` rather than `1.0`, pretty-printing. Nothing renders
+    /// wrong, but every cached render and thumbnail in every existing library
+    /// is orphaned at once and the whole catalog re-renders on first sight.
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string(self)?)
     }
 
+    /// Read a stack back from the catalog, or from a hand-written one.
+    ///
+    /// What comes out has not been through [`EditOp::clamped`] and may hold
+    /// values no slider can produce, NaN included, so the renderer defends
+    /// itself rather than trusting the range. Geometry may also be in the old
+    /// non-canonical shape; the next geometry button normalises it.
     pub fn from_json(text: &str) -> Result<Self> {
         Ok(serde_json::from_str(text)?)
     }

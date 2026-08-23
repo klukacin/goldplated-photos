@@ -3,6 +3,22 @@
 //! Albums mirror the folder structure the web gallery publishes:
 //! `2026/weddings/ana-ivan`. Every field maps to gallery frontmatter — see
 //! [`crate::publish`] for the contract.
+//!
+//! # The path is the identity
+//!
+//! An album is named by its path, and so is everything that refers to one: the
+//! published folder, the URL a client was sent, the sync subscription, the row
+//! in `published_files`. There is a numeric `id` in the table, but it is a
+//! join key, not a name. That is why [`Library::move_album`] is more than an
+//! `UPDATE`: a rename has to carry the descendants and their subscriptions with
+//! it, and even then it cannot reach the copy already sitting on the server.
+//!
+//! # An album is a view, not a container
+//!
+//! Photos belong to the library; an album lists some of them in an order. So
+//! deleting an album deletes no photographs, one photo may appear in several
+//! albums, and the folder a file happens to live in on disk has nothing to do
+//! with which album publishes it.
 
 use rand::Rng;
 use rusqlite::{params, OptionalExtension};
@@ -16,13 +32,26 @@ use crate::model::Album;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewAlbum {
+    /// Slash-separated, run through [`normalize_path`] before use, so a path
+    /// typed with capitals or stray slashes is accepted and lowercased. Any
+    /// folders above it that the catalog does not have yet are created as
+    /// collections — see [`Library::ensure_collection_chain`].
     pub path: String,
+    /// Absent or blank derives one from the last path segment, dashes and
+    /// underscores becoming spaces: `ana-i-ivan` → "Ana i ivan". A derived
+    /// title is a placeholder, not a decision, and it is what a client sees at
+    /// the top of the gallery until someone changes it.
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// The shoot date shown in the gallery, as free text — nothing here parses
+    /// or validates it, and it is unrelated to any EXIF capture date.
     #[serde(default)]
     pub date: Option<String>,
+    /// A folder of albums rather than an album of photographs. The gallery
+    /// draws one as a grid of its children and never renders loose photos in
+    /// it, which is why [`Library::add_photos_to_album`] refuses one outright.
     #[serde(default)]
     pub is_collection: bool,
 }
@@ -56,28 +85,63 @@ pub struct AlbumUpdate {
     pub description: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub date: Option<Option<String>>,
+    /// The gallery's password, stored and published in plain text — that is the
+    /// web side's design, not an oversight here, and it means a catalog and a
+    /// published `index.md` both hold every client's password in the clear.
+    /// Clearing it (`Some(None)`) makes the album public the next time it is
+    /// published, with no further confirmation anywhere.
     #[serde(default, deserialize_with = "double_option")]
     pub password: Option<Option<String>>,
+    /// The secret in a share link. This *is* a credential: generate it with
+    /// [`generate_share_token`] rather than letting anyone choose one, because
+    /// a guessable value is the whole of the protection on a link-shared album.
     #[serde(default, deserialize_with = "double_option")]
     pub share_token: Option<Option<String>>,
+    /// How the gallery orders the photos: `date-desc` and friends, or `custom`,
+    /// which is the only value that makes the published `photoOrder` list mean
+    /// anything. Setting `custom` without also ordering the album leaves the
+    /// client looking at whatever order the rows happen to be in.
     #[serde(default)]
     pub sort: Option<String>,
+    /// The gallery layout — `single-column`, `grid`, `masonry`, `slideshow`.
     #[serde(default)]
     pub style: Option<String>,
+    /// The cover photo, by catalog id. It has to be a photo the album actually
+    /// publishes: [`crate::publish::render_frontmatter`] drops a cover that is
+    /// not among them rather than emit a `thumbnail` pointing at a file the
+    /// gallery would 404 on, and the site falls back to the first photo.
     #[serde(default, deserialize_with = "double_option")]
     pub cover_photo_id: Option<Option<i64>>,
+    /// Turning an album with photos into a collection does not move them; it
+    /// makes the gallery stop drawing them.
     #[serde(default)]
     pub is_collection: Option<bool>,
+    /// Keep the album out of listings. It stays reachable by anyone holding the
+    /// URL — this is tidiness, not access control; that is `password` and
+    /// `share_token`.
     #[serde(default)]
     pub hidden: Option<bool>,
+    /// Whether the gallery offers the ZIP of originals. Off by default, and the
+    /// site's download endpoint refuses without it.
     #[serde(default)]
     pub allow_download: Option<bool>,
+    /// Turn on client proofing: hearts on every photo and a review panel whose
+    /// submissions land in the album's server-owned `.meta/` folder. Publishing
+    /// never touches that folder, so selections survive a republish.
     #[serde(default)]
     pub proofing: Option<bool>,
+    /// Rank among siblings, published as the gallery's `order`. Lower first;
+    /// cleared (`Some(None)`) sorts the album after every ranked sibling, by
+    /// title. Normally written wholesale by [`Library::reorder_siblings`].
     #[serde(default, deserialize_with = "double_option")]
     pub sort_order: Option<Option<i64>>,
+    /// Prose shown under the album. Published as a separate `body.md`, not as
+    /// part of the frontmatter, and clearing it deletes that file.
     #[serde(default, deserialize_with = "double_option")]
     pub body: Option<Option<String>>,
+    /// The album's complete tag set, not additions: whatever is sent replaces
+    /// what is there, so a form that renders only some of the tags and posts
+    /// them back silently deletes the rest. Omit the field to leave tags alone.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
@@ -188,6 +252,16 @@ fn base64_url_safe(bytes: &[u8]) -> String {
 }
 
 impl Library {
+    /// Create an album, and any collection above it that does not exist yet.
+    ///
+    /// The new row gets a fresh `token` — the id the gallery's access cookie
+    /// names this album by. It is generated once and then never regenerated:
+    /// changing it invalidates every unlock a client is currently holding, so
+    /// an album adopted from another machine must be given that machine's token
+    /// through [`AlbumUpdate::token`] rather than being created afresh.
+    ///
+    /// Fails if the path is already taken — this never merges into an existing
+    /// album.
     pub fn create_album(&self, new: &NewAlbum) -> Result<Album> {
         let path = normalize_path(&new.path)?;
         if self.album_by_path(&path)?.is_some() {
@@ -257,6 +331,12 @@ impl Library {
         Ok(created)
     }
 
+    /// One album, fully hydrated — tags and cover filename included, which the
+    /// row itself does not carry.
+    ///
+    /// The path is matched exactly, *not* normalised: pass what
+    /// [`normalize_path`] produced, or a path a user typed with a capital in it
+    /// comes back as "no such album" for a folder that is plainly there.
     pub fn album_by_path(&self, path: &str) -> Result<Option<Album>> {
         let row = self.with_conn(|c| {
             Ok(c.query_row(
@@ -331,6 +411,15 @@ impl Library {
         Ok(())
     }
 
+    /// Apply a partial update and return the album as it now stands.
+    ///
+    /// Merge semantics, per [`AlbumUpdate`]: an omitted field is left alone, so
+    /// a caller need only send what it knows about. The one field that does not
+    /// merge is `tags`, which replaces the whole set.
+    ///
+    /// Nothing is published by this. The client's gallery still shows the old
+    /// title, the old password still opens it, and it stays that way until the
+    /// album is published and synced.
     pub fn update_album(&self, path: &str, update: &AlbumUpdate) -> Result<Album> {
         let album = self
             .album_by_path(path)?
@@ -542,6 +631,13 @@ impl Library {
         })
     }
 
+    /// Take photos out of an album. Returns how many memberships were actually
+    /// removed; ids that were not in it are not an error.
+    ///
+    /// The photographs themselves are untouched — this is a view, not a
+    /// container. The published copy on the site *is* affected, but not yet:
+    /// the next publish of this album prunes it, because it is in the record of
+    /// what this library put there.
     pub fn remove_photos_from_album(&self, album_path: &str, photo_ids: &[i64]) -> Result<usize> {
         let album = self
             .album_by_path(album_path)?
@@ -624,6 +720,8 @@ impl Library {
 
     // ---------------------------------------------------------------- tags
 
+    /// An album's tags, alphabetical. Keyed by row id, not path — this is the
+    /// hydration helper; ordinary callers read `Album::tags`.
     pub fn album_tags(&self, album_id: i64) -> Result<Vec<String>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -639,6 +737,15 @@ impl Library {
         })
     }
 
+    /// Replace an album's tags with exactly this list.
+    ///
+    /// Not additive — every existing tag is dropped first, so passing an empty
+    /// slice untags the album. Blank entries are skipped and each name is
+    /// trimmed, because the tag is what the gallery builds a `/photos/tags/…`
+    /// page from and " weddings" and "weddings" would be two of them.
+    ///
+    /// Tags are shared rows: unlinking the last album from one leaves the name
+    /// in the `tags` table, harmlessly.
     pub fn set_album_tags(&self, album_id: i64, tags: &[String]) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute("DELETE FROM album_tags WHERE album_id = ?1", params![album_id])?;
