@@ -329,7 +329,7 @@ particular op.
 
 Deletions on the server are withheld unless `allow_deletes` is passed. What was
 withheld comes back in `withheld_deletes` so you can name the files, ask, and
-run again — see `ARCHITECTURE.md` §6.3.
+run again — see `dev-docs/sync.md`.
 
 The Rust-side list is `gpp_ffi::METHODS`, and a test asserts that every name in
 it dispatches.

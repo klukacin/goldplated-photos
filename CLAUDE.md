@@ -14,6 +14,14 @@
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for full contribution guidelines.
 
+## Developer documentation
+
+The long-form developer documentation lives in [`dev-docs/`](dev-docs/README.md):
+architecture, core internals, sync design, security invariants, feature flags,
+extension recipes, and testing (including the traps that have already cost real
+time). This file stays the operational quick-reference; when the two disagree,
+fix whichever is wrong rather than trusting either blindly.
+
 ---
 
 ## Platform Compatibility
@@ -613,7 +621,7 @@ Changes made in admin are saved directly to `src/content/` and `public/`, then a
 
 A native photo workflow — import, cull, develop, publish, sync — sitting in front of the same gallery the admin panel edits. Written in Rust so it can run where a browser cannot: macOS today, iPadOS and Windows on the same code.
 
-`desktop/ARCHITECTURE.md` is the long form. This is what you need before touching it.
+Developer documentation lives in `dev-docs/` — [core.md](dev-docs/core.md) is the long form for this workspace. This is what you need before touching it.
 
 ### The shape
 
@@ -675,7 +683,7 @@ Two transports, same trait: a folder (network share, external drive) or the gall
 
 ### Sync over HTTP
 
-`/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `desktop/UPLOAD-TRANSPORT.md` for the measurements and why the transport is what it is.
+`/api/sync/manifest` and `/api/sync/file`, guarded by `SYNC_TOKEN` (min 16 chars). **Unset, they answer 503 rather than opening.** Paths are validated before touching disk; uploads are verified against `X-Content-Blake3` and written through a temp file. The server caches hashes by `(size, mtime)` — without it a sync re-hashed the whole library in JavaScript at 32 MB/s, which cost 40 s on every push. See `dev-docs/sync-transport.md` for the measurements and why the transport is what it is.
 
 ### Commands
 

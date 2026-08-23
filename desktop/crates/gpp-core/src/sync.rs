@@ -527,7 +527,7 @@ pub struct SyncOutcome {
 /// geometrically, so one-at-a-time leaves most of an upstream link idle no
 /// matter how fast it is. Parallel flows ramp independently and fill it. Four
 /// to eight is the useful band — rclone defaults to four — and above that you
-/// mostly buy packet loss. See UPLOAD-TRANSPORT.md §5.
+/// mostly buy packet loss. See dev-docs/sync-transport.md §5.
 pub const TRANSFER_CONCURRENCY: usize = 6;
 
 /// What one change turned into. Collected in parallel, folded in order.
@@ -1489,7 +1489,7 @@ mod direction_tests {
 
 /// The server half of a sync, over plain HTTP.
 ///
-/// Three deliberate choices, all argued in `desktop/UPLOAD-TRANSPORT.md`:
+/// Three deliberate choices, all argued in `dev-docs/sync-transport.md`:
 ///
 /// **HTTP/1.1, pinned.** Stock Apache and nginx both cap an HTTP/2 request body
 /// at a 64 KB flow-control window, which puts a per-stream ceiling of
