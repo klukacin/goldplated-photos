@@ -40,12 +40,16 @@ const LQIP_SIZE: u32 = 20;
 /// Nothing sniffs magic bytes, so a `.jpg` that is really a text file is
 /// catalogued and fails later at decode, and a photograph saved with no
 /// extension is simply not seen. Comparison is lowercase, so `.JPG` off a
-/// camera card matches. Extending [`IMAGE_EXTENSIONS`] means promising the
-/// `image` crate can decode it; anything it cannot belongs in
+/// camera card matches. Extending [`IMAGE_EXTENSIONS`] means promising [`decode`]
+/// can open it — which for everything but HEIF means the `image` crate, and for
+/// HEIF means the pure-Rust HEVC path. A format nothing can decode belongs in
 /// [`RAW_EXTENSIONS`], where the catalog records the file and its metadata but
 /// publish deliberately leaves it behind — a RAW is a negative, not something
 /// to hand a client.
-pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "tif", "tiff"];
+pub const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "heic", "heif",
+];
+
 /// Camera RAW extensions. Catalogued and previewed, never published.
 pub const RAW_EXTENSIONS: &[&str] = &[
     "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "dng", "pef", "srw",
@@ -54,6 +58,59 @@ pub const RAW_EXTENSIONS: &[&str] = &[
 /// Video extensions. These ride along into a published album untouched — no
 /// thumbnail, no develop, no re-encode.
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv", "m4v"];
+
+/// HEIF-family extensions, which the `image` crate cannot open — see
+/// [`decode`].
+const HEIF_EXTENSIONS: &[&str] = &["heic", "heif"];
+
+fn is_heif(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| HEIF_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Decode a still image, whatever container it arrived in.
+///
+/// The `image` crate covers everything here except HEIF, which is what an
+/// iPhone shoots by default and what half the guests at a wedding will send.
+/// That gap is filled by a pure-Rust HEVC decoder rather than libheif: libheif
+/// is LGPL, which the licence policy does not allow, and linking C would cost
+/// the portability contract that keeps an iPad build possible.
+///
+/// The price is speed — around 9 MP/s on one core, so roughly two and a half
+/// seconds for a 24 MP frame against a few hundred milliseconds for JPEG.
+/// Import runs across every core, so a card of them is minutes rather than
+/// hours, but it is why a HEIC import is visibly slower than a JPEG one.
+pub fn decode(path: &Path) -> Result<DynamicImage> {
+    if is_heif(path) {
+        return decode_heif(path);
+    }
+    Ok(image::open(path)?)
+}
+
+fn decode_heif(path: &Path) -> Result<DynamicImage> {
+    let decoded = heif_oxide::decode_file(path)
+        .map_err(|e| Error::other(format!("{}: {e:?}", path.display())))?;
+    let rgba = decoded.to_rgba8();
+    image::RgbaImage::from_raw(decoded.width, decoded.height, rgba)
+        .map(DynamicImage::ImageRgba8)
+        .ok_or_else(|| Error::other(format!("{}: decoded pixels do not fit the frame", path.display())))
+}
+
+/// The frame's size, as cheaply as the format allows.
+///
+/// The metadata-only import path exists to be fast — it reads the header rather
+/// than decoding twenty-four megapixels to learn two numbers. HEIF has no such
+/// shortcut here, so it costs a full decode; a caller with EXIF dimensions
+/// already in hand should not call this at all.
+pub fn read_dimensions(path: &Path) -> Result<(u32, u32)> {
+    if is_heif(path) {
+        let img = decode_heif(path)?;
+        return Ok((img.width(), img.height()));
+    }
+    Ok(image::image_dimensions(path)?)
+}
 
 /// Write a file so that nothing ever observes it half-finished.
 ///
@@ -318,7 +375,7 @@ pub struct Derived {
 
 /// Load an image, applying EXIF orientation so downstream sizes are upright.
 pub fn load_oriented(path: &Path, orientation: Option<u16>) -> Result<DynamicImage> {
-    let img = image::open(path)?;
+    let img = decode(path)?;
     Ok(apply_orientation(img, orientation))
 }
 

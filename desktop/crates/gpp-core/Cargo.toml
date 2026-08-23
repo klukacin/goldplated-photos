@@ -16,6 +16,7 @@ blake3.workspace = true
 image.workspace = true
 fast_image_resize.workspace = true
 kamadak-exif.workspace = true
+heif-oxide = "0.1"
 rayon.workspace = true
 walkdir.workspace = true
 serde.workspace = true

@@ -545,7 +545,7 @@ fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<
         // The no-thumbnail path exists to be fast, so read the header rather
         // than decoding twenty-four megapixels to learn two numbers. Only
         // needed when EXIF did not already carry them.
-        match image::image_dimensions(&cand.abs_path) {
+        match media::read_dimensions(&cand.abs_path) {
             Ok((w, h)) => {
                 let (w, h) = media::swap_for_orientation(w, h, metadata.orientation);
                 width = Some(w);

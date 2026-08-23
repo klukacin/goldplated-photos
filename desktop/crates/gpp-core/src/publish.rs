@@ -171,6 +171,34 @@ pub struct PublishCollision {
     pub sources: Vec<String>,
 }
 
+/// The name a photograph takes in the published tree.
+///
+/// Almost always its own, but a HEIF frame is published as JPEG and so changes
+/// extension. Two reasons, and both bite:
+///
+/// Chrome and Firefox cannot display HEIC — only Safari can — so a HEIC in the
+/// gallery is a broken image for most of the people it exists for, and a client
+/// who downloads one gets something their photo viewer refuses. And the moment
+/// a frame carries an adjustment the published bytes *are* a JPEG, because that
+/// is what the renderer emits; shipping those under a `.HEIC` name is a lie
+/// about the file.
+///
+/// Converting either way keeps the name stable across a develop, which matters
+/// because the published filename is the URL. A client who has the link should
+/// not lose it because the photographer moved a slider.
+pub fn published_filename(photo: &Photo) -> String {
+    let is_heif = std::path::Path::new(&photo.filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_lowercase().as_str(), "heic" | "heif"))
+        .unwrap_or(false);
+    if !is_heif {
+        return photo.filename.clone();
+    }
+    let stem = photo.filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&photo.filename);
+    format!("{stem}.jpg")
+}
+
 /// Publish one album into `dest_root` (the gallery's `src/content/albums`).
 pub fn publish_album(
     lib: &Library,
@@ -253,7 +281,22 @@ pub fn publish_album(
                     continue;
                 }
             };
-            let dest = album_dir.join(&photo.filename);
+            let published = published_filename(photo);
+            let dest = album_dir.join(&published);
+
+            // A HEIF frame with no adjustments would otherwise be *copied*,
+            // which under its new `.jpg` name would be HEIC bytes wearing the
+            // wrong extension — the same lie in the other direction. Transcode
+            // it instead, at the quality a developed frame is delivered at.
+            let src = if published != photo.filename && src == original {
+                let img = crate::media::load_oriented(&original, photo.orientation)?;
+                let jpeg = crate::media::encode_jpeg(&img, crate::develop::DELIVERY_JPEG_QUALITY)?;
+                let transcoded = lib.thumb_dir().join(format!("{}.jpg", photo.content_hash));
+                crate::media::write_atomic(&transcoded, &jpeg)?;
+                transcoded
+            } else {
+                src
+            };
 
             // Skip when destination already matches by size — cheap and
             // correct enough, since a real change alters the byte count or the
@@ -261,7 +304,7 @@ pub fn publish_album(
             if let (Ok(s), Ok(d)) = (std::fs::metadata(&src), std::fs::metadata(&dest)) {
                 if s.len() == d.len() {
                     result.photos_skipped += 1;
-                    result.written.push(format!("{album_path}/{}", photo.filename));
+                    result.written.push(format!("{album_path}/{published}"));
                     continue;
                 }
             }
@@ -277,7 +320,7 @@ pub fn publish_album(
             // reported a figure that was never written anywhere.
             result.bytes_copied += std::fs::copy(&src, &dest).map_err(|e| Error::io(&src, e))?;
             result.photos_copied += 1;
-            result.written.push(format!("{album_path}/{}", photo.filename));
+            result.written.push(format!("{album_path}/{published}"));
         }
 
         prune_published(lib, album_path, &album_dir, &photos, &mut result)?;
@@ -299,7 +342,7 @@ fn prune_published(
     photos: &[Photo],
     result: &mut PublishResult,
 ) -> Result<()> {
-    let current: BTreeSet<String> = photos.iter().map(|p| p.filename.clone()).collect();
+    let current: BTreeSet<String> = photos.iter().map(published_filename).collect();
 
     for stale in lib.published_files(album_path)?.difference(&current) {
         // A photo whose original vanished keeps its published copy: that is a
@@ -371,13 +414,13 @@ fn split_filename_collisions(
     let mut losers: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for photo in selected {
-        match claimed.get(&photo.filename) {
+        match claimed.get(&published_filename(&photo)) {
             Some(_) => losers
-                .entry(photo.filename.clone())
+                .entry(published_filename(&photo))
                 .or_default()
                 .push(photo.rel_path),
             None => {
-                claimed.insert(photo.filename.clone(), kept.len());
+                claimed.insert(published_filename(&photo), kept.len());
                 kept.push(photo);
             }
         }
@@ -421,7 +464,7 @@ pub fn render_frontmatter(album: &Album, photos: &[Photo]) -> String {
     if album.sort == "custom" && !photos.is_empty() {
         out.push_str("photoOrder:\n");
         for p in photos {
-            out.push_str(&format!("  - {}\n", yaml_scalar(&p.filename)));
+            out.push_str(&format!("  - {}\n", yaml_scalar(&published_filename(p))));
         }
     }
 
@@ -431,7 +474,7 @@ pub fn render_frontmatter(album: &Album, photos: &[Photo]) -> String {
     if let Some(cover) = album
         .cover_filename
         .as_deref()
-        .filter(|c| photos.iter().any(|p| p.filename == *c))
+        .filter(|c| photos.iter().any(|p| published_filename(p) == *c))
     {
         out.push_str(&yaml_kv("thumbnail", cover));
     }
