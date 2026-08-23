@@ -75,6 +75,12 @@ pub struct PushOutcome {
     pub withheld_deletes: Vec<String>,
     pub conflicts: Vec<String>,
     pub skipped: usize,
+    /// Files that never reached the server — a dropped connection, a refused
+    /// upload, a full disk. `sync::apply` deliberately carries on past one so
+    /// the rest of the album still goes up; throwing its report away here made
+    /// a gallery missing a frame indistinguishable from a clean push, and the
+    /// photographer heard about it from the client.
+    pub failed: Vec<(String, String)>,
     /// Every album this operation touched, shallowest first.
     pub albums: Vec<String>,
     /// Parent folders the server already had, configured differently from this
@@ -424,6 +430,11 @@ pub fn pull_path(
         total.photos_imported += one.photos_imported;
         total.skipped_unchanged += one.skipped_unchanged;
         total.conflicts.extend(one.conflicts);
+        // The negatives this pull declined to overwrite. Dropping them here
+        // silenced the report everywhere it is actually read — the sync panel
+        // and the CLI both go through the path form — so a server that
+        // disagrees about a frame looked like a clean pull.
+        total.kept_originals.extend(one.kept_originals);
         total.albums.push(album);
     }
 
@@ -504,6 +515,7 @@ pub fn push_path(
     total.withheld_deletes = applied.withheld_deletes;
     total.conflicts = applied.conflicts;
     total.skipped = applied.skipped;
+    total.failed = applied.failed;
     total.albums.extend(subtree);
     Ok(total)
 }
@@ -580,6 +592,7 @@ pub fn sync_path(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts: pushed.conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }
@@ -606,6 +619,7 @@ pub fn sync_path(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }
@@ -661,6 +675,7 @@ pub fn push_album(
         withheld_deletes: outcome_inner.withheld_deletes,
         conflicts: outcome_inner.conflicts,
         skipped: outcome_inner.skipped,
+        failed: outcome_inner.failed,
         albums: vec![album_path.to_string()],
         folders_left_alone: Vec::new(),
     })
@@ -697,6 +712,7 @@ pub fn sync_album(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts: pushed.conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }
@@ -718,6 +734,7 @@ pub fn sync_album(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
+                failed: pushed.failed,
                 ..Default::default()
             })
         }

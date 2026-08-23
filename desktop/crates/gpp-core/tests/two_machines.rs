@@ -510,3 +510,104 @@ fn a_pull_never_overwrites_the_library_original() {
         "the pull wrote over the photographer's original — it is not recoverable"
     );
 }
+
+/// …and it has to say so.
+///
+/// Keeping the negative is only half the job: the photographer has to be told
+/// the server holds a different version, or they never look. Both the sync
+/// panel and the CLI report through `pull_path` — the album form is the inner
+/// step — and that is where the list was being dropped on the floor.
+#[test]
+fn a_pull_names_the_originals_it_kept() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/ana-ivan", &["a1.jpg"]);
+    remote::push_album(&a.lib, &server, "2026/ana-ivan", a.published_root(), &opts, false).unwrap();
+
+    server
+        .put("2026/ana-ivan/a1.jpg", b"developed on another machine")
+        .unwrap();
+
+    let pulled = remote::pull_path(&a.lib, &server, "2026/ana-ivan", a.published_root()).unwrap();
+    assert_eq!(
+        pulled.kept_originals,
+        vec!["2026/ana-ivan/a1.jpg".to_string()],
+        "the server disagrees about a frame and nothing said so"
+    );
+}
+
+/// A server that refuses one file — a dropped connection, a full disk, a 500.
+struct FlakyServer {
+    inner: FsTransport,
+    refuse: String,
+}
+
+impl RemoteTransport for FlakyServer {
+    fn manifest(&self) -> gpp_core::Result<gpp_core::sync::Manifest> {
+        self.inner.manifest()
+    }
+    fn put(&self, rel: &str, bytes: &[u8]) -> gpp_core::Result<()> {
+        if rel.ends_with(&self.refuse) {
+            return Err(gpp_core::Error::other("http status: 500"));
+        }
+        self.inner.put(rel, bytes)
+    }
+    fn get(&self, rel: &str) -> gpp_core::Result<Vec<u8>> {
+        self.inner.get(rel)
+    }
+    fn delete(&self, rel: &str) -> gpp_core::Result<()> {
+        self.inner.delete(rel)
+    }
+}
+
+/// A frame the server refused must be named, not just silently missing.
+///
+/// `sync::apply` deliberately carries on past one failed file so the rest of
+/// the album still goes up, and it returns the list of what it could not send.
+/// Every caller above it threw that list away, so a gallery arriving one photo
+/// short was indistinguishable from a clean push — and the photographer found
+/// out when the client asked where their photo had gone.
+#[test]
+fn a_push_names_the_frames_the_server_refused() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FlakyServer {
+        inner: FsTransport::new(server_dir.path()),
+        refuse: "a2.jpg".to_string(),
+    };
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/ana-ivan", &["a1.jpg", "a2.jpg"]);
+
+    let pushed =
+        remote::push_path(&a.lib, &server, "2026/ana-ivan", a.published_root(), &opts, false)
+            .unwrap();
+    assert!(
+        !server.manifest().unwrap().contains_key("2026/ana-ivan/a2.jpg"),
+        "the frame reached the server after all — the test proves nothing"
+    );
+    assert_eq!(
+        pushed.failed.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        vec!["2026/ana-ivan/a2.jpg"],
+        "a frame that never reached the client's gallery was reported as a clean push"
+    );
+
+    // And the same through the entry point the sync panel actually calls.
+    let synced = remote::sync_path(
+        &a.lib,
+        &server,
+        "2026/ana-ivan",
+        SyncDirection::Push,
+        a.published_root(),
+        &opts,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        synced.failed.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        vec!["2026/ana-ivan/a2.jpg"]
+    );
+}

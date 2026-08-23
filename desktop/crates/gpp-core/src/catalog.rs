@@ -390,10 +390,16 @@ impl Library {
 // -------------------------------------------------------------------- schema
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);",
-    )?;
-    let current: Option<i64> = conn
+    // One transaction for the whole thing. SQLite makes DDL transactional, so a
+    // catalog either arrives at the new schema or stays exactly where it was.
+    // Run step by step in autocommit — which is what this did — a laptop closed
+    // between creating a table and writing the version number down reopened,
+    // saw the old version, and tried to create that table again. The open
+    // failed, and it failed the same way every time after: the photographer's
+    // whole library, gone behind "table album_sync already exists".
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);")?;
+    let current: Option<i64> = tx
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
             r.get(0)
         })
@@ -402,10 +408,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     match current {
         None => {
             // Fresh catalog: create at the current version directly.
-            conn.execute_batch(SCHEMA_V1)?;
-            conn.execute_batch(SCHEMA_V2)?;
-            conn.execute_batch(SCHEMA_V3)?;
-            conn.execute(
+            tx.execute_batch(SCHEMA_V1)?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch(SCHEMA_V3)?;
+            tx.execute(
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
             )?;
@@ -413,26 +419,30 @@ fn migrate(conn: &Connection) -> Result<()> {
         Some(v) => {
             // Stepped: a catalog two versions behind runs both migrations.
             if v < 2 {
-                conn.execute_batch(SCHEMA_V2)?;
+                tx.execute_batch(SCHEMA_V2)?;
             }
             if v < 3 {
-                conn.execute_batch(SCHEMA_V3)?;
+                tx.execute_batch(SCHEMA_V3)?;
             }
             if v < SCHEMA_VERSION {
-                conn.execute(
+                tx.execute(
                     "UPDATE schema_version SET version = ?1",
                     params![SCHEMA_VERSION],
                 )?;
             }
         }
     }
-    // Further migrations step forward from here. The catalog is a rebuildable
-    // index, so a failed migration is recoverable by re-importing.
+    tx.commit()?;
+    // Further migrations step forward from here. Every statement in them has to
+    // stay idempotent — `IF NOT EXISTS` throughout — so that a catalog already
+    // wedged by the old non-atomic version is carried across rather than left
+    // permanently unopenable. The catalog is a rebuildable index, but only by a
+    // program that can open it first.
     Ok(())
 }
 
 const SCHEMA_V1: &str = r#"
-CREATE TABLE photos (
+CREATE TABLE IF NOT EXISTS photos (
   id            INTEGER PRIMARY KEY,
   rel_path      TEXT    NOT NULL UNIQUE,
   filename      TEXT    NOT NULL,
@@ -457,13 +467,13 @@ CREATE TABLE photos (
   blur_lqip     TEXT,
   imported_at   TEXT    NOT NULL
 );
-CREATE INDEX idx_photos_hash     ON photos(content_hash);
-CREATE INDEX idx_photos_rating   ON photos(rating);
-CREATE INDEX idx_photos_captured ON photos(captured_at);
-CREATE INDEX idx_photos_camera   ON photos(camera_model);
-CREATE INDEX idx_photos_kind     ON photos(kind);
+CREATE INDEX IF NOT EXISTS idx_photos_hash     ON photos(content_hash);
+CREATE INDEX IF NOT EXISTS idx_photos_rating   ON photos(rating);
+CREATE INDEX IF NOT EXISTS idx_photos_captured ON photos(captured_at);
+CREATE INDEX IF NOT EXISTS idx_photos_camera   ON photos(camera_model);
+CREATE INDEX IF NOT EXISTS idx_photos_kind     ON photos(kind);
 
-CREATE TABLE albums (
+CREATE TABLE IF NOT EXISTS albums (
   id             INTEGER PRIMARY KEY,
   path           TEXT    NOT NULL UNIQUE,
   parent_path    TEXT,
@@ -483,39 +493,39 @@ CREATE TABLE albums (
   sort_order     INTEGER,
   body           TEXT
 );
-CREATE INDEX idx_albums_parent ON albums(parent_path);
+CREATE INDEX IF NOT EXISTS idx_albums_parent ON albums(parent_path);
 
-CREATE TABLE album_photos (
+CREATE TABLE IF NOT EXISTS album_photos (
   album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
   photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
   position INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(album_id, photo_id)
 );
-CREATE INDEX idx_album_photos_photo ON album_photos(photo_id);
+CREATE INDEX IF NOT EXISTS idx_album_photos_photo ON album_photos(photo_id);
 
-CREATE TABLE tags (
+CREATE TABLE IF NOT EXISTS tags (
   id   INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
-CREATE TABLE photo_tags (
+CREATE TABLE IF NOT EXISTS photo_tags (
   photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
   tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
   PRIMARY KEY(photo_id, tag_id)
 );
-CREATE TABLE album_tags (
+CREATE TABLE IF NOT EXISTS album_tags (
   album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
   tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
   PRIMARY KEY(album_id, tag_id)
 );
 
 -- Reserved for the develop phase: an ordered, non-destructive operation list.
-CREATE TABLE edits (
+CREATE TABLE IF NOT EXISTS edits (
   photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
   version    INTEGER NOT NULL DEFAULT 1,
   stack_json TEXT    NOT NULL
 );
 
-CREATE TABLE sync_state (
+CREATE TABLE IF NOT EXISTS sync_state (
   entity_kind    TEXT NOT NULL,
   entity_key     TEXT NOT NULL,
   local_hash     TEXT,
@@ -525,7 +535,7 @@ CREATE TABLE sync_state (
   PRIMARY KEY(entity_kind, entity_key)
 );
 
-CREATE TABLE settings (
+CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
@@ -537,7 +547,7 @@ CREATE TABLE settings (
 /// is invisible to sync: never pushed, never pulled, never deleted. That is
 /// what lets one machine hold three albums out of two hundred safely.
 const SCHEMA_V2: &str = r#"
-CREATE TABLE album_sync (
+CREATE TABLE IF NOT EXISTS album_sync (
   album_path     TEXT PRIMARY KEY,
   direction      TEXT NOT NULL DEFAULT 'both',   -- push | pull | both
   last_synced_at TEXT
@@ -550,7 +560,7 @@ const SCHEMA_V3: &str = r#"
 -- Publishing prunes a file only if it appears here: that is how a photo removed
 -- from an album disappears from the gallery, while anything another tool put in
 -- the same folder is left strictly alone.
-CREATE TABLE published_files (
+CREATE TABLE IF NOT EXISTS published_files (
   album_path TEXT NOT NULL,
   filename   TEXT NOT NULL,
   PRIMARY KEY (album_path, filename)
@@ -681,6 +691,32 @@ mod tests {
             .expect("second writer should wait for the lock, not fail");
         done.wait();
         writer.join().unwrap();
+    }
+
+    /// A catalog caught half-way through a migration must still open.
+    ///
+    /// The steps used to run in autocommit, so a laptop closed between creating
+    /// a table and writing the new version number down left a catalog claiming
+    /// to be older than it is. Every open after that tried to create a table
+    /// that was already there and failed — the same way, for ever. The library
+    /// is a rebuildable index, but only by a program that can open it.
+    #[test]
+    fn a_half_applied_migration_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let lib = Library::open(dir.path()).unwrap();
+            drop(lib);
+            // Wind the books back to where the crash left them: v2's table on
+            // disk, v3's not, and the version still saying 1.
+            let conn = Connection::open(dir.path().join(GPP_DIR).join("catalog.db")).unwrap();
+            conn.execute("UPDATE schema_version SET version = 1", []).unwrap();
+            conn.execute("DROP TABLE published_files", []).unwrap();
+        }
+
+        let lib = Library::open(dir.path()).expect("the library can no longer be opened");
+        // …and it comes back at the current schema, not stuck one behind.
+        lib.record_published_files("a", &Default::default()).unwrap();
+        assert!(lib.album_subscriptions().unwrap().is_empty());
     }
 
     #[test]

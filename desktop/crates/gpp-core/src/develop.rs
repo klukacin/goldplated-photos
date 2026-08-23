@@ -177,6 +177,21 @@ impl Framing {
     }
 }
 
+/// Fold a run of ops into the one framing they add up to. Anything that is not
+/// a turn or a mirror leaves the frame where it is.
+fn framing_of(ops: &[EditOp]) -> Framing {
+    let mut f = Framing::UPRIGHT;
+    for op in ops {
+        f = match op {
+            EditOp::Rotate { quarter_turns } => f.then_turn(i32::from(*quarter_turns)),
+            EditOp::FlipHorizontal => f.then_mirror_h(),
+            EditOp::FlipVertical => f.then_mirror_v(),
+            _ => f,
+        };
+    }
+    f
+}
+
 /// Everything done to one photo, in order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EditStack {
@@ -225,16 +240,7 @@ impl EditStack {
 
     /// Read the turns and mirrors in the stack as one transform.
     fn framing(&self) -> Framing {
-        let mut f = Framing::UPRIGHT;
-        for op in &self.ops {
-            f = match op {
-                EditOp::Rotate { quarter_turns } => f.then_turn(i32::from(*quarter_turns)),
-                EditOp::FlipHorizontal => f.then_mirror_h(),
-                EditOp::FlipVertical => f.then_mirror_v(),
-                _ => f,
-            };
-        }
-        f
+        framing_of(&self.ops)
     }
 
     /// Write a framing back, replacing every turn and mirror in the stack.
@@ -293,10 +299,39 @@ impl EditStack {
         }
     }
 
+    /// Put a stack into the shape the buttons below assume: one canonical
+    /// framing, with the crop last.
+    ///
+    /// A stack written before orientation was stored canonically can hold the
+    /// crop *ahead* of the turns — the photographer framed the shot and then
+    /// straightened it, and each op was appended where it fell. Such stacks are
+    /// in catalogs on disk, and they still render correctly; it is the next
+    /// press of a geometry button that breaks them, because [`set_framing`]
+    /// moves the crop to the end, where the same four fractions are read
+    /// against a frame that has since turned. The bride ends up outside the
+    /// picture with nothing on screen to explain it. So the rectangle is first
+    /// carried through whatever framing used to follow it.
+    ///
+    /// [`set_framing`]: Self::set_framing
+    fn normalize_geometry(&mut self) {
+        let Some(at) = self.ops.iter().position(|op| op.kind() == "crop") else {
+            return;
+        };
+        let after = framing_of(&self.ops[at + 1..]);
+        if after != Framing::UPRIGHT {
+            // A framing is a mirror and then turns, and that is the order
+            // `carry_crop` applies them in.
+            self.carry_crop(after.turns, after.mirrored, false);
+        }
+        let whole = self.framing();
+        self.set_framing(whole);
+    }
+
     /// Turn a further quarter on top of whatever turn is already recorded.
     ///
     /// Rotate buttons are relative — two clicks of "right" mean 180°.
     pub fn rotate_by(&mut self, quarter_turns: i32) {
+        self.normalize_geometry();
         let f = self.framing().then_turn(quarter_turns);
         self.set_framing(f);
         self.carry_crop(quarter_turns, false, false);
@@ -310,11 +345,13 @@ impl EditStack {
     pub fn toggle(&mut self, op: EditOp) {
         match op {
             EditOp::FlipHorizontal => {
+                self.normalize_geometry();
                 let f = self.framing().then_mirror_h();
                 self.set_framing(f);
                 self.carry_crop(0, true, false);
             }
             EditOp::FlipVertical => {
+                self.normalize_geometry();
                 let f = self.framing().then_mirror_v();
                 self.set_framing(f);
                 self.carry_crop(0, false, true);
@@ -428,12 +465,28 @@ pub fn apply(img: &DynamicImage, stack: &EditStack) -> DynamicImage {
 }
 
 fn crop(img: &DynamicImage, x: f32, y: f32, w: f32, h: f32) -> DynamicImage {
-    let (iw, ih) = (img.width() as f32, img.height() as f32);
-    let cx = (x * iw).round() as u32;
-    let cy = (y * ih).round() as u32;
-    let cw = ((w * iw).round() as u32).max(1).min(img.width().saturating_sub(cx).max(1));
-    let ch = ((h * ih).round() as u32).max(1).min(img.height().saturating_sub(cy).max(1));
+    let (iw, ih) = (img.width(), img.height());
+    if iw == 0 || ih == 0 {
+        return img.clone();
+    }
+    // The origin is held one pixel inside the frame. A rectangle dragged flat
+    // against the right or bottom edge rounds to an origin *on* that edge,
+    // where there is nothing left to take: the width clamp below then asks for
+    // one pixel out of zero available and gets zero, and a zero-pixel image is
+    // a JPEG the encoder refuses. That refusal came back as the whole album
+    // declining to publish, over one frame's crop handle.
+    let cx = (clamp_index(x, iw)).min(iw - 1);
+    let cy = (clamp_index(y, ih)).min(ih - 1);
+    let cw = clamp_index(w, iw).max(1).min(iw - cx);
+    let ch = clamp_index(h, ih).max(1).min(ih - cy);
     img.crop_imm(cx, cy, cw, ch)
+}
+
+/// A 0..1 fraction of an edge, as a pixel count. Negatives and NaN — which a
+/// stack read straight from the catalog has never been clamped against — read
+/// as zero rather than wrapping into an enormous `u32`.
+fn clamp_index(fraction: f32, edge: u32) -> u32 {
+    (fraction * edge as f32).round().max(0.0) as u32
 }
 
 /// Rec. 709 luma — the weighting that matches how bright a colour looks.
@@ -879,6 +932,84 @@ mod tests {
             apply(&img, &stack_of(&[EditOp::Rotate { quarter_turns: 2 }])).to_rgb8().as_raw(),
             "both mirrors together must be exactly a half turn"
         );
+    }
+
+    /// A stack the previous version wrote, with the crop ahead of the turn.
+    ///
+    /// The photographer framed the shot and then straightened it, so each op
+    /// was appended where it fell. Those stacks are in catalogs on disk and
+    /// they still render correctly — it is the next press of a geometry button
+    /// that has to keep them framing the same part of the picture.
+    #[test]
+    fn a_crop_recorded_before_the_turn_still_frames_the_same_picture() {
+        let base = DynamicImage::ImageRgb8(RgbImage::from_fn(4, 2, |x, y| {
+            Rgb([(x * 60) as u8, (y * 120) as u8, 7])
+        }));
+
+        for legacy in [
+            r#"[{"op":"crop","x":0.0,"y":0.0,"w":1.0,"h":0.5},{"op":"rotate","quarter_turns":1}]"#,
+            r#"[{"op":"crop","x":0.25,"y":0.0,"w":0.5,"h":1.0},{"op":"flip-vertical"}]"#,
+            r#"[{"op":"crop","x":0.0,"y":0.5,"w":0.5,"h":0.5},{"op":"flip-horizontal"},{"op":"rotate","quarter_turns":3}]"#,
+        ] {
+            for press in [1i32, -1] {
+                let mut s =
+                    EditStack::from_json(&format!(r#"{{"version":1,"ops":{legacy}}}"#)).unwrap();
+                let before = apply(&base, &s);
+
+                s.rotate_by(press);
+                let after = apply(&base, &s);
+
+                let mut quarter = EditStack::new();
+                quarter.rotate_by(press);
+                let expected = apply(&before, &quarter);
+
+                assert_eq!(
+                    (after.width(), after.height()),
+                    (expected.width(), expected.height()),
+                    "{legacy} turned by {press} reframed the picture"
+                );
+                assert_eq!(
+                    after.to_rgb8().as_raw(),
+                    expected.to_rgb8().as_raw(),
+                    "{legacy} turned by {press} landed on a different part of the frame"
+                );
+            }
+
+            // …and the same for a mirror.
+            let mut s = EditStack::from_json(&format!(r#"{{"version":1,"ops":{legacy}}}"#)).unwrap();
+            let before = apply(&base, &s);
+            s.toggle(EditOp::FlipHorizontal);
+            let after = apply(&base, &s);
+            let expected = apply(&before, &stack_of(&[EditOp::FlipHorizontal]));
+            assert_eq!(
+                after.to_rgb8().as_raw(),
+                expected.to_rgb8().as_raw(),
+                "{legacy} mirrored landed on a different part of the frame"
+            );
+        }
+    }
+
+    /// A crop handle dragged flat against an edge.
+    ///
+    /// There is no such thing as a photograph of no pixels: the JPEG encoder
+    /// refuses one, and that refusal reached the photographer as the whole
+    /// album declining to publish.
+    #[test]
+    fn a_crop_flat_against_an_edge_still_leaves_a_picture() {
+        let img = flat(90, 90, 90);
+        for (x, y, w, h) in [
+            (1.0, 0.0, 0.2, 1.0),
+            (0.0, 1.0, 1.0, 0.2),
+            (1.0, 1.0, 1.0, 1.0),
+            (0.99, 0.99, 0.0, 0.0),
+        ] {
+            let out = apply(&img, &stack_of(&[EditOp::Crop { x, y, w, h }]));
+            assert!(
+                out.width() >= 1 && out.height() >= 1,
+                "crop {x},{y} {w}x{h} left nothing to encode: {:?}",
+                (out.width(), out.height())
+            );
+        }
     }
 
     #[test]
