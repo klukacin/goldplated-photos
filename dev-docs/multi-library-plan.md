@@ -1,9 +1,10 @@
 # Multi-library, multi-remote, master catalog — design decisions
 
-> Status: **agreed direction, phased delivery** — defined 2026-08-24 with the
-> project owner. Phase 1 (Lightroom import + library switching) and phase 2
-> (multiple remotes, sync scopes, cross-library push) are being implemented;
-> the master catalog is a design constraint for now, not a deliverable.
+> Status: **phases 1 and 2 DELIVERED** (2026-08-24): Lightroom import
+> (schema V4), library switching, multiple remotes/publish targets with
+> web|full sync scopes, cross-library push and XMP export (schema V5), with
+> the app UI for all of it. The master catalog remains a design constraint,
+> not a deliverable.
 > This document records the decisions so later schema work does not
 > accidentally close the door on them.
 
