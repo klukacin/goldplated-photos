@@ -18,12 +18,14 @@ pub mod catalog;
 pub mod develop;
 pub mod error;
 pub mod import;
+pub mod lightroom;
 pub mod media;
 pub mod model;
 pub mod publish;
 pub mod remote;
 pub mod session;
 pub mod sync;
+pub mod xmp;
 
 pub use error::{Error, Result};
 pub use model::{Album, Flag, Photo, PhotoFilter, PhotoKind};

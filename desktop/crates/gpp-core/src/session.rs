@@ -186,6 +186,40 @@ impl Session {
         self.with(|lib| lib.prune_missing())
     }
 
+    // ---------------------------------------------------------- lightroom
+
+    /// Look inside a Lightroom Classic catalog without changing anything:
+    /// root folders (and whether each could import in place), collections,
+    /// keywords, missing files. The `.lrcat` itself is only ever copied and
+    /// read — never opened in place, never written.
+    pub fn lr_scan(&self, lrcat_path: String) -> Result<crate::lightroom::LrScanReport> {
+        self.with(|lib| crate::lightroom::scan(lib, Path::new(&lrcat_path)))
+    }
+
+    /// Import a Lightroom Classic catalog: photos copied in (or catalogued in
+    /// place when they already live under the library root), collections
+    /// mapped to albums, keywords to tags. Idempotent — re-running with the
+    /// same catalog syncs rather than duplicates — and stoppable the same way
+    /// an ordinary import is, via [`Session::cancel_import`].
+    pub fn lr_import(
+        &self,
+        lrcat_path: String,
+        options: crate::lightroom::LrImportOptions,
+        on_progress: Option<&(dyn Fn(crate::model::ImportProgress) + Sync)>,
+    ) -> Result<crate::lightroom::LrImportReport> {
+        // Same latch as `import`: clear a cancel left over from the last run.
+        self.import_cancel.store(false, Ordering::SeqCst);
+        self.with(|lib| {
+            crate::lightroom::lr_import(
+                lib,
+                Path::new(&lrcat_path),
+                &options,
+                on_progress,
+                Some(&|| self.import_cancel.load(Ordering::SeqCst)),
+            )
+        })
+    }
+
     // -------------------------------------------------------------- photos
 
     /// The grid's contents: everything matching the filter, ordered by the

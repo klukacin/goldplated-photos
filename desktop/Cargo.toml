@@ -30,6 +30,7 @@ fast_image_resize = { version = "5", features = ["image"] }        # MIT/Apache-
 kamadak-exif = "0.5"                                                # BSD-2-Clause
 rayon = "1"                                                         # MIT/Apache-2.0
 walkdir = "2"                                                       # MIT/Unlicense
+quick-xml = "0.37"                                                  # MIT
 serde = { version = "1", features = ["derive"] }                    # MIT/Apache-2.0
 serde_json = "1"                                                    # MIT/Apache-2.0
 thiserror = "2"                                                     # MIT/Apache-2.0

@@ -77,6 +77,9 @@ pub const METHODS: &[&str] = &[
     "import",
     "cancel_import",
     "prune",
+    // lightroom
+    "lr_scan",
+    "lr_import",
     // photos
     "photos",
     "photo",
@@ -248,6 +251,32 @@ pub(crate) fn dispatch(session: &Session, method: &str, args: &str) -> Result<Va
         "prune" => {
             let _: NoArgs = parse(args)?;
             ok(session.prune()?)
+        }
+
+        // ---------------------------------------------------------- lightroom
+        "lr_scan" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                lrcat_path: String,
+            }
+            let a: A = parse(args)?;
+            ok(session.lr_scan(a.lrcat_path)?)
+        }
+        // Synchronous and silent through this door, like `import` — run it on
+        // a background thread; `cancel_import` stops it too.
+        "lr_import" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                lrcat_path: String,
+                /// Omit for the defaults: copy under `lr/`, all collections,
+                /// no prefix, auto collision handling, a real (non-dry) run.
+                #[serde(default)]
+                options: gpp_core::lightroom::LrImportOptions,
+            }
+            let a: A = parse(args)?;
+            ok(session.lr_import(a.lrcat_path, a.options, None)?)
         }
 
         // ------------------------------------------------------------- photos

@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::{Error, Result};
 use crate::model::{Album, Flag, Photo, PhotoFilter, PhotoKind, PhotoSort};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Directory (relative to the library root) holding all derived data.
 pub const GPP_DIR: &str = ".gpp";
@@ -200,6 +200,16 @@ impl Library {
             );
             wheres.push("a.path = ?".into());
             args.push(Box::new(album.clone()));
+        }
+        if let Some(tag) = &filter.tag {
+            // A subquery rather than a join: joining `photo_tags` would also
+            // multiply rows for a photo carrying several tags.
+            wheres.push(
+                "p.id IN (SELECT pt.photo_id FROM photo_tags pt \
+                 JOIN tags t ON t.id = pt.tag_id WHERE t.name = ?)"
+                    .into(),
+            );
+            args.push(Box::new(tag.clone()));
         }
         if let Some(min) = filter.min_rating {
             wheres.push("p.rating >= ?".into());
@@ -495,6 +505,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V1)?;
             tx.execute_batch(SCHEMA_V2)?;
             tx.execute_batch(SCHEMA_V3)?;
+            tx.execute_batch(SCHEMA_V4)?;
             tx.execute(
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
@@ -521,6 +532,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
             if v < 3 {
                 tx.execute_batch(SCHEMA_V3)?;
+            }
+            if v < 4 {
+                tx.execute_batch(SCHEMA_V4)?;
             }
             if v < SCHEMA_VERSION {
                 tx.execute(
@@ -662,6 +676,31 @@ CREATE TABLE IF NOT EXISTS published_files (
   album_path TEXT NOT NULL,
   filename   TEXT NOT NULL,
   PRIMARY KEY (album_path, filename)
+);
+"#;
+
+/// v4 — provenance links for Lightroom Classic imports.
+///
+/// `lrcat_id` is a stable identifier of the *source catalog* (an id read from
+/// the lrcat when it offers one, else the blake3 of its canonicalized path),
+/// so two different catalogs can both be imported into one library without
+/// their image ids colliding. A link is what makes re-running an import a sync
+/// instead of a duplication: an LR image or collection that is already linked
+/// is updated in place rather than imported again.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS lr_links (
+  lrcat_id TEXT    NOT NULL,
+  lr_image INTEGER NOT NULL,
+  photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+  PRIMARY KEY (lrcat_id, lr_image)
+);
+CREATE INDEX IF NOT EXISTS idx_lr_links_photo ON lr_links(photo_id);
+
+CREATE TABLE IF NOT EXISTS lr_album_links (
+  lrcat_id      TEXT    NOT NULL,
+  lr_collection INTEGER NOT NULL,
+  album_path    TEXT    NOT NULL,
+  PRIMARY KEY (lrcat_id, lr_collection)
 );
 "#;
 

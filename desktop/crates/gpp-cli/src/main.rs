@@ -45,6 +45,7 @@ fn run(args: &[String]) -> Result<()> {
         "rate" => cmd_rate(rest),
         "flag" => cmd_flag(rest),
         "album" => cmd_album(rest),
+        "lr" => cmd_lr(rest),
         "develop" => cmd_develop(rest),
         "publish" => cmd_publish(rest),
         "sync" => cmd_sync(rest),
@@ -87,7 +88,7 @@ fn positional(args: &[String]) -> Option<&str> {
                     | "--share-link" | "--no-share-link" | "--proofing" | "--no-proofing"
                     | "--allow-download" | "--metadata-only" | "--include-rejected"
                     | "--no-recursive" | "--bw" | "--no-bw" | "--flip-h" | "--flip-v"
-                    | "--reset" | "--show"
+                    | "--reset" | "--show" | "--dry-run"
             );
             skip_next = takes_value;
             continue;
@@ -485,6 +486,122 @@ fn cmd_album(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `gpp lr <scan|import> <catalog.lrcat>` — Lightroom Classic catalogs.
+fn cmd_lr(args: &[String]) -> Result<()> {
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp lr <scan|import> <catalog.lrcat>"))?;
+    let rest = &args[1..];
+    let session = open_session(rest)?;
+    let lrcat = positional(rest)
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp lr <scan|import> <catalog.lrcat>"))?
+        .to_string();
+
+    match sub {
+        "scan" => {
+            let report = session.lr_scan(lrcat)?;
+            println!("catalog id: {}", report.catalog_id);
+            println!("\nroot folders:");
+            for r in &report.root_folders {
+                println!(
+                    "  {:<40} {:>5} files, {} missing — {}",
+                    r.path,
+                    r.file_count,
+                    r.missing_files,
+                    if r.in_place {
+                        "inside this library (imports in place)"
+                    } else {
+                        "outside this library (imports by copy)"
+                    }
+                );
+            }
+            if !report.collections.is_empty() {
+                println!("\ncollections:");
+                for c in &report.collections {
+                    println!("  {:<40} {:<10} {:>5} members", c.path, c.kind, c.member_count);
+                }
+            }
+            println!("\nkeywords: {}", report.keyword_count);
+            if report.images_without_files > 0 {
+                println!("images without files: {}", report.images_without_files);
+            }
+            for note in &report.notes {
+                eprintln!("note: {note}");
+            }
+        }
+        "import" => {
+            let options = gpp_core::lightroom::LrImportOptions {
+                dest_subdir: opt(rest, "--dest-subdir").map(String::from),
+                collections: opt(rest, "--collections")
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).collect()),
+                album_prefix: opt(rest, "--prefix").map(String::from),
+                collision: match opt(rest, "--collision") {
+                    Some("merge") => gpp_core::lightroom::MergePolicy::Merge,
+                    Some("suffix") => gpp_core::lightroom::MergePolicy::Suffix,
+                    Some(other) => {
+                        return Err(gpp_core::Error::other(format!(
+                            "--collision wants merge or suffix, not '{other}'"
+                        )))
+                    }
+                    None => gpp_core::lightroom::MergePolicy::Auto,
+                },
+                dry_run: has(rest, "--dry-run"),
+            };
+
+            let last = std::sync::Mutex::new(0usize);
+            let report = session.lr_import(
+                lrcat,
+                options,
+                Some(&|p| {
+                    let mut last = last.lock().unwrap();
+                    if p.processed == p.total || p.processed >= *last + 25 {
+                        *last = p.processed;
+                        eprintln!("  [{}/{}] {}", p.processed, p.total, p.current);
+                    }
+                }),
+            )?;
+
+            if report.dry_run {
+                println!("dry run — nothing was written; this is what an import would do:");
+            }
+            println!(
+                "photos: {} copied ({} bytes) · {} in place · {} linked to existing · {} missing",
+                report.photos_copied,
+                report.bytes_copied,
+                report.photos_in_place,
+                report.photos_linked_existing,
+                report.skipped_missing_files
+            );
+            println!(
+                "albums: {} created · {} updated · {} memberships · {} tag links",
+                report.albums_created,
+                report.albums_updated,
+                report.memberships_added,
+                report.tags_added
+            );
+            for c in &report.collisions {
+                println!("  collision: {c}");
+            }
+            for c in &report.conflicts {
+                println!("  conflict: {c}");
+            }
+            for d in &report.lr_deleted {
+                println!("  deleted in Lightroom, kept here: {d}");
+            }
+            if report.cancelled {
+                println!("stopped early — every count above is a partial tally");
+            }
+        }
+        other => {
+            return Err(gpp_core::Error::other(format!(
+                "unknown lr subcommand '{other}' — scan or import"
+            )))
+        }
+    }
+    Ok(())
+}
+
 fn cmd_publish(args: &[String]) -> Result<()> {
     let lib = open_library(args)?;
     let dest = opt(args, "--dest").ok_or_else(|| {
@@ -870,6 +987,16 @@ COMMANDS
                    [--allow-download] [--tags a,b]
   album move <from> --to <to>
   album rm <path>
+
+  lr scan <catalog.lrcat>         Look inside a Lightroom Classic catalog:
+                                  root folders (copy vs in-place), collections,
+                                  keywords, missing files. Writes nothing.
+  lr import <catalog.lrcat>       Import it: photos copied in (or catalogued in
+                                  place when already under the library root),
+                                  collections -> albums, keywords -> tags.
+                                  Idempotent: re-running syncs, never duplicates.
+                                  [--dry-run] [--collections a,b/*] [--prefix p]
+                                  [--dest-subdir d] [--collision merge|suffix]
 
   publish [album] --dest <dir>    Write the gallery content tree
                                   [--min-rating N] [--metadata-only]

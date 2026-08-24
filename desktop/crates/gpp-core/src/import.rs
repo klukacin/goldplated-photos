@@ -41,14 +41,42 @@ impl Default for ImportOptions {
 }
 
 /// One scanned file, before any expensive work.
+///
+/// Crate-visible so the Lightroom importer can feed files it discovered
+/// through a catalog rather than a directory walk into the same pipeline.
 #[derive(Debug, Clone)]
-struct Candidate {
-    abs_path: PathBuf,
-    rel_path: String,
-    filename: String,
-    kind: PhotoKind,
-    file_size: i64,
-    mtime_ms: i64,
+pub(crate) struct Candidate {
+    pub(crate) abs_path: PathBuf,
+    pub(crate) rel_path: String,
+    pub(crate) filename: String,
+    pub(crate) kind: PhotoKind,
+    pub(crate) file_size: i64,
+    pub(crate) mtime_ms: i64,
+}
+
+/// Build a candidate for one file already inside the library.
+///
+/// `rel_path` must be the library-relative, '/'-separated spelling of
+/// `abs_path` — the caller has both in hand, so nothing is re-derived here.
+pub(crate) fn candidate_for(abs_path: &Path, rel_path: &str, kind: PhotoKind) -> Result<Candidate> {
+    let meta = abs_path.metadata().map_err(|e| Error::io(abs_path, e))?;
+    Ok(Candidate {
+        filename: abs_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        rel_path: rel_path.to_string(),
+        abs_path: abs_path.to_path_buf(),
+        kind,
+        file_size: meta.len() as i64,
+        mtime_ms: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    })
 }
 
 /// What happened to one candidate.
@@ -61,16 +89,19 @@ enum Outcome {
 }
 
 /// Fully processed file, ready for insertion.
-struct Processed {
-    candidate: Candidate,
-    content_hash: String,
-    metadata: Metadata,
-    lqip: Option<String>,
+pub(crate) struct Processed {
+    pub(crate) candidate: Candidate,
+    pub(crate) content_hash: String,
+    pub(crate) metadata: Metadata,
+    pub(crate) lqip: Option<String>,
     /// Dimensions after orientation is applied.
-    width: Option<u32>,
-    height: Option<u32>,
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
     /// No decoder could read this file's pixels.
-    undecodable: bool,
+    pub(crate) undecodable: bool,
+    /// The `photo.xmp` sidecar found beside the file, if any. Applied on the
+    /// row's *first* import only — see [`upsert_processed`].
+    pub(crate) xmp: Option<crate::xmp::XmpSidecar>,
 }
 
 /// Import every supported file under `dir`.
@@ -202,72 +233,11 @@ pub fn import_dir(
     // Single transaction for every write.
     let now = chrono::Utc::now().to_rfc3339();
     lib.with_tx(|tx| {
-        let mut existing_hash = tx.prepare(
-            "SELECT content_hash FROM photos WHERE rel_path = ?1",
-        )?;
-        let mut dup_check = tx.prepare(
-            "SELECT COUNT(*) FROM photos WHERE content_hash = ?1 AND rel_path <> ?2",
-        )?;
-        let mut upsert = tx.prepare(
-            "INSERT INTO photos(
-                rel_path, filename, content_hash, file_size, mtime_ms, kind,
-                width, height, orientation, captured_at, camera_make, camera_model,
-                lens, iso, aperture, shutter, focal_length, blur_lqip, imported_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
-             ON CONFLICT(rel_path) DO UPDATE SET
-                content_hash = excluded.content_hash,
-                file_size    = excluded.file_size,
-                mtime_ms     = excluded.mtime_ms,
-                width        = excluded.width,
-                height       = excluded.height,
-                orientation  = excluded.orientation,
-                captured_at  = excluded.captured_at,
-                camera_make  = excluded.camera_make,
-                camera_model = excluded.camera_model,
-                lens         = excluded.lens,
-                iso          = excluded.iso,
-                aperture     = excluded.aperture,
-                shutter      = excluded.shutter,
-                focal_length = excluded.focal_length,
-                blur_lqip    = excluded.blur_lqip",
-        )?;
-
         for p in &to_insert {
-            let was_known: Option<String> = existing_hash
-                .query_row(params![p.candidate.rel_path], |r| r.get(0))
-                .optional()?;
-
-            // Same bytes already catalogued under a different path.
-            let dupes: i64 = dup_check.query_row(
-                params![p.content_hash, p.candidate.rel_path],
-                |r| r.get(0),
-            )?;
-
-            upsert.execute(params![
-                p.candidate.rel_path,
-                p.candidate.filename,
-                p.content_hash,
-                p.candidate.file_size,
-                p.candidate.mtime_ms,
-                p.candidate.kind.as_str(),
-                p.width.map(|v| v as i64),
-                p.height.map(|v| v as i64),
-                p.metadata.orientation.map(|v| v as i64),
-                p.metadata.captured_at,
-                p.metadata.camera_make,
-                p.metadata.camera_model,
-                p.metadata.lens,
-                p.metadata.iso,
-                p.metadata.aperture,
-                p.metadata.shutter,
-                p.metadata.focal_length,
-                p.lqip,
-                now,
-            ])?;
-
-            if was_known.is_some() {
+            let done = upsert_processed(tx, p, &now)?;
+            if done.was_known {
                 summary.updated += 1;
-            } else if dupes > 0 {
+            } else if done.duplicate {
                 summary.duplicates += 1;
                 summary.imported += 1;
             } else {
@@ -278,6 +248,124 @@ pub fn import_dir(
     })?;
 
     Ok(summary)
+}
+
+/// What [`upsert_processed`] did with one file.
+pub(crate) struct Upserted {
+    pub(crate) photo_id: i64,
+    /// The path was already catalogued; the row was updated in place.
+    pub(crate) was_known: bool,
+    /// The same bytes were already catalogued under a different path.
+    pub(crate) duplicate: bool,
+}
+
+/// Write one processed file into the catalog, inside the caller's transaction.
+///
+/// Shared by the directory import and the Lightroom import so the two cannot
+/// drift on what a catalog row is. The update clause deliberately omits
+/// `rating`, `flag` and `color_label` — those are the hand-entered fields the
+/// catalog cannot rebuild, so a re-import never touches them.
+///
+/// Sidecar values ([`Processed::xmp`]) are applied only when the row is *new*:
+/// on first import the sidecar's rating, label and keywords are taken; on a
+/// re-import of an existing row the catalog's values — hand-set or not — are
+/// left alone.
+pub(crate) fn upsert_processed(
+    tx: &rusqlite::Transaction<'_>,
+    p: &Processed,
+    now: &str,
+) -> Result<Upserted> {
+    let was_known: Option<String> = tx
+        .query_row(
+            "SELECT content_hash FROM photos WHERE rel_path = ?1",
+            params![p.candidate.rel_path],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    // Same bytes already catalogued under a different path.
+    let dupes: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM photos WHERE content_hash = ?1 AND rel_path <> ?2",
+        params![p.content_hash, p.candidate.rel_path],
+        |r| r.get(0),
+    )?;
+
+    tx.execute(
+        "INSERT INTO photos(
+            rel_path, filename, content_hash, file_size, mtime_ms, kind,
+            width, height, orientation, captured_at, camera_make, camera_model,
+            lens, iso, aperture, shutter, focal_length, blur_lqip, imported_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+         ON CONFLICT(rel_path) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            file_size    = excluded.file_size,
+            mtime_ms     = excluded.mtime_ms,
+            width        = excluded.width,
+            height       = excluded.height,
+            orientation  = excluded.orientation,
+            captured_at  = excluded.captured_at,
+            camera_make  = excluded.camera_make,
+            camera_model = excluded.camera_model,
+            lens         = excluded.lens,
+            iso          = excluded.iso,
+            aperture     = excluded.aperture,
+            shutter      = excluded.shutter,
+            focal_length = excluded.focal_length,
+            blur_lqip    = excluded.blur_lqip",
+        params![
+            p.candidate.rel_path,
+            p.candidate.filename,
+            p.content_hash,
+            p.candidate.file_size,
+            p.candidate.mtime_ms,
+            p.candidate.kind.as_str(),
+            p.width.map(|v| v as i64),
+            p.height.map(|v| v as i64),
+            p.metadata.orientation.map(|v| v as i64),
+            p.metadata.captured_at,
+            p.metadata.camera_make,
+            p.metadata.camera_model,
+            p.metadata.lens,
+            p.metadata.iso,
+            p.metadata.aperture,
+            p.metadata.shutter,
+            p.metadata.focal_length,
+            p.lqip,
+            now,
+        ],
+    )?;
+
+    let photo_id: i64 = tx.query_row(
+        "SELECT id FROM photos WHERE rel_path = ?1",
+        params![p.candidate.rel_path],
+        |r| r.get(0),
+    )?;
+
+    if was_known.is_none() {
+        if let Some(xmp) = &p.xmp {
+            if let Some(rating) = xmp.rating {
+                tx.execute(
+                    "UPDATE photos SET rating = ?1 WHERE id = ?2",
+                    params![rating.min(5) as i64, photo_id],
+                )?;
+            }
+            if let Some(label) = &xmp.label {
+                tx.execute(
+                    "UPDATE photos SET color_label = ?1 WHERE id = ?2",
+                    params![label, photo_id],
+                )?;
+            }
+            if !xmp.keywords.is_empty() {
+                crate::albums::write_photo_tags(tx, photo_id, &xmp.keywords)?;
+            }
+        }
+    }
+
+    Ok(Upserted {
+        photo_id,
+        was_known: was_known.is_some(),
+        duplicate: dupes > 0,
+    })
 }
 
 /// Where an outside folder was copied to, and how much of it arrived.
@@ -418,7 +506,7 @@ fn free_destination(root: &Path, name: &str) -> (PathBuf, String) {
 
 /// Same length and same bytes — cheap enough for the resume check, and the
 /// length test rejects almost everything before any reading happens.
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     let (Ok(ma), Ok(mb)) = (a.metadata(), b.metadata()) else {
         return false;
     };
@@ -516,9 +604,19 @@ fn to_rel(root: &Path, path: &Path) -> Option<String> {
 }
 
 /// Everything expensive for one file, done off the DB thread.
-fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<Processed> {
+pub(crate) fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<Processed> {
     let content_hash = hash_file(&cand.abs_path)?;
-    let metadata = media::read_metadata(&cand.abs_path);
+    let mut metadata = media::read_metadata(&cand.abs_path);
+
+    // A sidecar beside the file supplies what the file itself does not: an
+    // orientation for a format whose EXIF was stripped, and — at insert time —
+    // a rating, label and keywords. The file's own EXIF wins where both speak.
+    let xmp = crate::xmp::sidecar_for(&cand.abs_path).and_then(|p| crate::xmp::read_sidecar(&p));
+    if let Some(x) = &xmp {
+        if metadata.orientation.is_none() {
+            metadata.orientation = x.orientation;
+        }
+    }
 
     let mut width = metadata.width;
     let mut height = metadata.height;
@@ -573,6 +671,7 @@ fn process_one(cand: &Candidate, thumb_root: &Path, thumbnails: bool) -> Result<
         width,
         height,
         undecodable,
+        xmp,
     })
 }
 
@@ -978,6 +1077,75 @@ mod tests {
         assert_eq!(hash_file(&a).unwrap(), hash_file(&b).unwrap());
         std::fs::write(&b, b"different").unwrap();
         assert_ne!(hash_file(&a).unwrap(), hash_file(&b).unwrap());
+    }
+
+    /// A `photo.xmp` beside the file supplies what the catalog cannot rebuild:
+    /// rating, colour label, keywords. Taken on first import.
+    #[test]
+    fn a_sidecar_supplies_rating_label_and_keywords_on_first_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_jpeg(&root.join("a.jpg"), 60, 40);
+        std::fs::write(
+            root.join("a.xmp"),
+            r#"<rdf:RDF xmlns:rdf="r"><rdf:Description xmlns:xmp="x" xmlns:dc="d"
+                 xmp:Rating="4" xmp:Label="Red">
+               <dc:subject><rdf:Bag><rdf:li>Wedding</rdf:li><rdf:li>Bride</rdf:li>
+               </rdf:Bag></dc:subject></rdf:Description></rdf:RDF>"#,
+        )
+        .unwrap();
+        // A second photo with no sidecar keeps its defaults.
+        write_jpeg(&root.join("b.jpg"), 60, 40);
+
+        let lib = Library::open(root).unwrap();
+        import_dir(&lib, root, &ImportOptions::default(), None, None).unwrap();
+
+        let a = lib.photo_by_rel_path("a.jpg").unwrap().unwrap();
+        assert_eq!(a.rating, 4);
+        assert_eq!(a.color_label.as_deref(), Some("Red"));
+        let mut tags = lib.photo_tags(a.id).unwrap();
+        tags.sort();
+        assert_eq!(tags, vec!["bride", "wedding"], "keywords land lowercased");
+
+        let b = lib.photo_by_rel_path("b.jpg").unwrap().unwrap();
+        assert_eq!((b.rating, b.color_label), (0, None));
+        assert!(lib.photo_tags(b.id).unwrap().is_empty());
+    }
+
+    /// Rating, flag and colour label are the fields the catalog cannot rebuild,
+    /// so a re-import — even of a changed file whose sidecar still says 4 —
+    /// must never overwrite what a person set by hand.
+    #[test]
+    fn a_re_import_does_not_clobber_a_hand_set_rating() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_jpeg(&root.join("a.jpg"), 60, 40);
+        std::fs::write(
+            root.join("a.xmp"),
+            r#"<r xmlns:xmp="x"><d xmp:Rating="4" xmp:Label="Red"/></r>"#,
+        )
+        .unwrap();
+
+        let lib = Library::open(root).unwrap();
+        import_dir(&lib, root, &ImportOptions::default(), None, None).unwrap();
+        let a = lib.photo_by_rel_path("a.jpg").unwrap().unwrap();
+        assert_eq!(a.rating, 4, "first import takes the sidecar's rating");
+
+        // The photographer decides otherwise.
+        lib.set_rating(a.id, 2).unwrap();
+        lib.set_color_label(a.id, None).unwrap();
+
+        // The file changes on disk, so the row really is re-imported…
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_jpeg(&root.join("a.jpg"), 80, 50);
+        let s = import_dir(&lib, root, &ImportOptions::default(), None, None).unwrap();
+        assert_eq!(s.updated, 1);
+
+        // …and the hand-set values stand.
+        let after = lib.photo_by_rel_path("a.jpg").unwrap().unwrap();
+        assert_eq!(after.rating, 2, "the sidecar's 4 overwrote a hand-set rating");
+        assert_eq!(after.color_label, None, "the cleared label came back");
+        assert_eq!(after.width, Some(80), "the rebuildable fields did update");
     }
 
     #[test]

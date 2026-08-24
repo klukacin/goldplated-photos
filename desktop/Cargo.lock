@@ -421,7 +421,10 @@ name = "gpp-cli"
 version = "0.1.0"
 dependencies = [
  "gpp-core",
+ "image",
+ "rusqlite",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -435,6 +438,7 @@ dependencies = [
  "heif-oxide",
  "image",
  "kamadak-exif",
+ "quick-xml",
  "rand",
  "rayon",
  "rusqlite",
@@ -453,6 +457,7 @@ version = "0.1.0"
 dependencies = [
  "gpp-core",
  "image",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -936,6 +941,15 @@ name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+
+[[package]]
+name = "quick-xml"
+version = "0.37.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quote"

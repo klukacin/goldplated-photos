@@ -240,6 +240,10 @@ pub struct PhotoFilter {
     /// Membership is direct, not inherited: a collection's path matches nothing,
     /// because photos hang off albums and never off the folders above them.
     pub album_path: Option<String>,
+    /// Restrict to photos carrying this tag, exactly as stored. Tags are
+    /// written trimmed and lowercased (see `Library::set_photo_tags`), so a
+    /// caller should ask in lowercase too.
+    pub tag: Option<String>,
     /// ISO date bounds on `captured_at` (inclusive), e.g. "2026-06-01".
     ///
     /// Compared as strings against the stored ISO timestamp, which works only

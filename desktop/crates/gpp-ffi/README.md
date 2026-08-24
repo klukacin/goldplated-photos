@@ -242,6 +242,29 @@ had already landed stays landed, and importing the same folder again finishes
 the job. Calling it when nothing is running is harmless: the next `import`
 clears the flag before it reads a file.
 
+### Lightroom
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `lr_scan` | `lrcat_path` | `LrScanReport` — root folders (with per-folder in-place/copy verdicts and missing-file counts), collections, keyword count, catalog id. Writes nothing. |
+| `lr_import` | `lrcat_path`, `options` *(optional `LrImportOptions`)* | `LrImportReport` |
+
+`LrImportOptions` is snake_case like the rest of this door: `dest_subdir`
+(where copied files land, default `"lr"`), `collections` (paths or `*` globs
+narrowing which collections map to albums; photos import regardless),
+`album_prefix`, `collision` (`"auto"` \| `"merge"` \| `"suffix"` — what to do
+when a collection's album path is already taken by an unlinked album), and
+`dry_run` (compute the full report, write nothing).
+
+The `.lrcat` is copied under the library's `.gpp` directory and only the copy
+is read — Lightroom can stay open, and the original is never touched. Both
+calls block like `import` does; run `lr_import` on a background thread, and
+`cancel_import` stops it the same way. Re-running with the same catalog syncs
+instead of duplicating: photos and collections are remembered per source
+catalog, renames in Lightroom follow (unless the album was renamed locally too
+— reported in `conflicts`, nothing moved), and Lightroom-side deletions are
+reported in `lr_deleted`, never propagated.
+
 ### Photos
 
 | Method | Arguments | Returns |

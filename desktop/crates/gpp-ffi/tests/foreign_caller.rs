@@ -621,6 +621,113 @@ fn the_newest_methods_refuse_hostile_arguments_without_panicking() {
     assert_eq!(c.ok("import", "{}")["cancelled"], json!(false));
 }
 
+/// The Lightroom door, given every argument a caller gets wrong: pointers that
+/// are not there, catalogs that are not catalogs, keys that are not the keys.
+/// Each must come back as a named error and never as `"kind":"panic"`.
+#[test]
+fn the_lightroom_methods_refuse_hostile_arguments_without_panicking() {
+    let (c, dir) = ForeignCaller::with_library();
+
+    let refused = |method: &str, args: &str, expected: &str| {
+        let reply = c.call(method, args);
+        let kind = error_kind(&reply);
+        assert_ne!(kind, "panic", "{method} panicked on {args}: {reply}");
+        assert_eq!(kind, expected, "{method} on {args} gave {reply}");
+    };
+
+    // Missing and misspelled arguments.
+    refused("lr_scan", "{}", "bad-arguments");
+    refused("lr_scan", r#"{"lrcatPath":"/x"}"#, "bad-arguments");
+    refused("lr_import", "{}", "bad-arguments");
+    refused(
+        "lr_import",
+        r#"{"lrcat_path":"/x","options":{"dryRun":true}}"#,
+        "bad-arguments",
+    );
+    refused(
+        "lr_import",
+        r#"{"lrcat_path":"/x","options":{"collision":"overwrite"}}"#,
+        "bad-arguments",
+    );
+    refused("lr_import", r#"{"lrcat_path":"/x","options":[1]}"#, "bad-arguments");
+
+    // A path that is not a catalog: no such file, and then a SQLite file that
+    // is not a Lightroom catalog at all (the library's own catalog).
+    refused("lr_scan", r#"{"lrcat_path":"/no/such/catalog.lrcat"}"#, "other");
+    let own_catalog = dir.path().join(".gpp/catalog.db").display().to_string();
+    let reply = c.call("lr_scan", &json!({ "lrcat_path": own_catalog }).to_string());
+    assert_eq!(error_kind(&reply), "other");
+    assert!(
+        reply["error"].as_str().unwrap().contains("AgLibraryRootFolder"),
+        "the refusal should name the missing table: {reply}"
+    );
+
+    // Bytes that are not text, and a session that is not there.
+    for method in ["lr_scan", "lr_import"] {
+        assert_eq!(
+            error_kind(&raw_call(c.0, Some(method.as_bytes()), Some(&[0xff, b'x']))),
+            "invalid-utf8"
+        );
+        assert_eq!(
+            error_kind(&raw_call(ptr::null_mut(), Some(method.as_bytes()), Some(b"{}"))),
+            "null-pointer"
+        );
+    }
+
+    // None of it disturbed the session.
+    assert_eq!(c.ok("is_open", "{}"), json!(true));
+}
+
+/// The happy path across the boundary: a generated fixture is scanned and
+/// imported the way a Swift shell would drive it.
+#[test]
+fn a_lightroom_catalog_crosses_the_boundary() {
+    let (c, dir) = ForeignCaller::with_library();
+    let shoot = dir.path().join("shoot");
+    write_jpeg(&shoot.join("one.jpg"), 60, 40);
+
+    // A minimal single-root catalog, written the way the core's own fixture
+    // writes one.
+    let lrcat = dir.path().join("cat.lrcat");
+    {
+        let conn = rusqlite::Connection::open(&lrcat).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TABLE AgLibraryRootFolder (id_local INTEGER, absolutePath TEXT, name TEXT);
+            CREATE TABLE AgLibraryFolder (id_local INTEGER, pathFromRoot TEXT, rootFolder INTEGER);
+            CREATE TABLE AgLibraryFile (id_local INTEGER, idx_filename TEXT, folder INTEGER);
+            CREATE TABLE Adobe_images (id_local INTEGER, rootFile INTEGER, rating REAL,
+              colorLabels TEXT, pick REAL);
+            INSERT INTO AgLibraryRootFolder VALUES (1, '{}/', 'shoot');
+            INSERT INTO AgLibraryFolder VALUES (10, '', 1);
+            INSERT INTO AgLibraryFile VALUES (100, 'one.jpg', 10);
+            INSERT INTO Adobe_images VALUES (1000, 100, 5.0, NULL, 0.0);
+            "#,
+            shoot.display()
+        ))
+        .unwrap();
+    }
+
+    let scanned = c.ok("lr_scan", &json!({ "lrcat_path": lrcat.display().to_string() }).to_string());
+    assert_eq!(scanned["root_folders"][0]["file_count"], json!(1));
+    assert_eq!(scanned["root_folders"][0]["in_place"], json!(true));
+
+    let imported = c.ok(
+        "lr_import",
+        &json!({
+            "lrcat_path": lrcat.display().to_string(),
+            "options": {"dry_run": false}
+        })
+        .to_string(),
+    );
+    assert_eq!(imported["photos_in_place"], json!(1));
+    assert_eq!(imported["photos_copied"], json!(0));
+
+    let photos = c.ok("photos", "{}");
+    assert_eq!(photos.as_array().unwrap().len(), 1);
+    assert_eq!(photos[0]["rating"], json!(5));
+}
+
 #[test]
 fn freeing_a_null_pointer_is_a_no_op() {
     unsafe {

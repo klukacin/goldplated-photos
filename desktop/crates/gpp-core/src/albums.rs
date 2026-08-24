@@ -785,6 +785,89 @@ impl Library {
             Ok(())
         })
     }
+
+    /// A photo's tags, alphabetical.
+    pub fn photo_tags(&self, photo_id: i64) -> Result<Vec<String>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT t.name FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id \
+                 WHERE pt.photo_id = ?1 ORDER BY t.name",
+            )?;
+            let rows = stmt.query_map(params![photo_id], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Replace a photo's tags with exactly this list.
+    ///
+    /// Same replace-set semantics as [`set_album_tags`](Self::set_album_tags):
+    /// blank entries are skipped, each name is trimmed and lowercased (photo
+    /// tags come from keyword sources — XMP sidecars, Lightroom catalogs — and
+    /// "Wedding" and "wedding" are one keyword there). Unlike album tags, tag
+    /// rows nothing references any more are pruned, so a keyword removed from
+    /// the last photo carrying it does not linger in the vocabulary.
+    ///
+    /// Refuses an unknown photo rather than doing nothing quietly.
+    pub fn set_photo_tags(&self, photo_id: i64, tags: &[String]) -> Result<()> {
+        self.with_tx(|tx| {
+            let known: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM photos WHERE id = ?1",
+                params![photo_id],
+                |r| r.get(0),
+            )?;
+            if known == 0 {
+                return Err(Error::PhotoNotFound(photo_id.to_string()));
+            }
+            tx.execute("DELETE FROM photo_tags WHERE photo_id = ?1", params![photo_id])?;
+            write_photo_tags(tx, photo_id, tags)?;
+            prune_orphan_tags(tx)?;
+            Ok(())
+        })
+    }
+}
+
+/// Link `tags` to a photo, creating tag rows as needed. Additive — existing
+/// links stay — so callers wanting replace-set semantics delete first, as
+/// [`Library::set_photo_tags`] does. Returns how many links were newly made.
+///
+/// Crate-visible so the import paths can tag photos inside a transaction they
+/// already hold; taking the `Library` lock again from there would deadlock.
+pub(crate) fn write_photo_tags(
+    conn: &rusqlite::Connection,
+    photo_id: i64,
+    tags: &[String],
+) -> Result<usize> {
+    let mut insert_tag =
+        conn.prepare("INSERT INTO tags(name) VALUES(?1) ON CONFLICT(name) DO NOTHING")?;
+    let mut find_tag = conn.prepare("SELECT id FROM tags WHERE name = ?1")?;
+    let mut link = conn.prepare(
+        "INSERT INTO photo_tags(photo_id, tag_id) VALUES(?1,?2) ON CONFLICT DO NOTHING",
+    )?;
+    let mut added = 0;
+    for tag in tags {
+        let tag = tag.trim().to_lowercase();
+        if tag.is_empty() {
+            continue;
+        }
+        insert_tag.execute(params![tag])?;
+        let tag_id: i64 = find_tag.query_row(params![tag], |r| r.get(0))?;
+        added += link.execute(params![photo_id, tag_id])?;
+    }
+    Ok(added)
+}
+
+/// Drop tag rows no photo and no album references any more.
+pub(crate) fn prune_orphan_tags(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM photo_tags) \
+         AND id NOT IN (SELECT tag_id FROM album_tags)",
+        [],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1157,6 +1240,62 @@ mod tests {
             .map(|p| p.filename)
             .collect();
         assert_eq!(order, vec!["two.jpg", "four.jpg", "three.jpg", "one.jpg"]);
+    }
+
+    #[test]
+    fn photo_tags_replace_filter_and_prune() {
+        let l = lib();
+        let a = insert_photo(&l, "a.jpg");
+        let b = insert_photo(&l, "b.jpg");
+
+        // Replace-set, trimmed and lowercased, blanks dropped.
+        l.set_photo_tags(a, &[" Wedding ".into(), "BRIDE".into(), "  ".into()])
+            .unwrap();
+        assert_eq!(l.photo_tags(a).unwrap(), vec!["bride", "wedding"]);
+        l.set_photo_tags(a, &["wedding".into()]).unwrap();
+        assert_eq!(l.photo_tags(a).unwrap(), vec!["wedding"]);
+
+        // The filter finds photos by tag.
+        l.set_photo_tags(b, &["portrait".into()]).unwrap();
+        let found = l
+            .photos(&crate::model::PhotoFilter {
+                tag: Some("wedding".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].filename, "a.jpg");
+
+        // An unknown photo is refused, not silently ignored.
+        assert!(matches!(
+            l.set_photo_tags(9999, &["x".into()]),
+            Err(Error::PhotoNotFound(_))
+        ));
+    }
+
+    /// Untagging the last photo carrying a name prunes the tag row — unless an
+    /// album still uses it, because album and photo tags share the vocabulary.
+    #[test]
+    fn orphaned_photo_tag_rows_are_pruned_but_album_tags_are_not() {
+        let l = lib();
+        let album = l.create_album(&new_album("a")).unwrap();
+        l.set_album_tags(album.id, &["wedding".into()]).unwrap();
+        let p = insert_photo(&l, "a.jpg");
+        l.set_photo_tags(p, &["wedding".into(), "bride".into()]).unwrap();
+
+        l.set_photo_tags(p, &[]).unwrap();
+        let names: Vec<String> = l
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT name FROM tags ORDER BY name")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            names,
+            vec!["wedding"],
+            "bride is orphaned and goes; wedding is still an album's"
+        );
     }
 
     #[test]
