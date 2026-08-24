@@ -77,3 +77,6 @@ docs/site/
 # vanished under *.png).
 !desktop/crates/gpp-core/tests/fixtures/*.heic
 !desktop/crates/gpp-core/tests/fixtures/*.webp
+
+# Full-scope sync store (desktop app originals + metadata; never gallery content)
+.sync-full/

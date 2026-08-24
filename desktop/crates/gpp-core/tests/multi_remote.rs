@@ -1,0 +1,551 @@
+//! Multiple remotes, sync scopes, cross-library push — schema v5 end to end.
+//!
+//! Follows the `two_machines.rs` pattern: each machine is its own library and
+//! published tree, each server a folder transport, and every scenario is one
+//! the design document names. The invariants that must not bend anywhere in
+//! here: originals are never overwritten or deleted without an explicit,
+//! confirmed request; conflicts are reported and never guessed; untracked
+//! albums are untouched on every side.
+
+use std::path::Path;
+
+use gpp_core::albums::NewAlbum;
+use gpp_core::develop::EditOp;
+use gpp_core::full::{self, FULL_PREFIX};
+use gpp_core::import::{import_dir, ImportOptions};
+use gpp_core::publish::PublishOptions;
+use gpp_core::remote;
+use gpp_core::sync::{FsTransport, RemoteTransport, SyncDirection, SyncScopeKind};
+use gpp_core::Library;
+
+struct Machine {
+    lib: Library,
+    published: tempfile::TempDir,
+    _root: tempfile::TempDir,
+}
+
+fn machine() -> Machine {
+    let root = tempfile::tempdir().unwrap();
+    let lib = Library::open(root.path()).unwrap();
+    Machine {
+        lib,
+        published: tempfile::tempdir().unwrap(),
+        _root: root,
+    }
+}
+
+impl Machine {
+    fn published_root(&self) -> &Path {
+        self.published.path()
+    }
+}
+
+fn write_jpeg(path: &Path, w: u32, h: u32) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    image::DynamicImage::new_rgb8(w, h)
+        .save_with_format(path, image::ImageFormat::Jpeg)
+        .unwrap();
+}
+
+fn author_album(m: &Machine, album: &str, files: &[&str]) {
+    let dir = m.lib.resolve(album).unwrap();
+    for (i, name) in files.iter().enumerate() {
+        if name.ends_with(".nef") {
+            // A camera negative: catalogued, never decoded, never published
+            // to the web tree — exactly what full scope exists to carry.
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), format!("raw sensor bytes {i}")).unwrap();
+        } else {
+            write_jpeg(&dir.join(name), 120 + i as u32 * 10, 90);
+        }
+    }
+    import_dir(&m.lib, &dir, &ImportOptions::default(), None, None).unwrap();
+
+    m.lib
+        .create_album(&NewAlbum {
+            path: album.to_string(),
+            title: Some(format!("Album {album}")),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let prefix = format!("{album}/");
+    let ids: Vec<i64> = m
+        .lib
+        .photos(&Default::default())
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.rel_path.starts_with(&prefix))
+        .map(|p| p.id)
+        .collect();
+    m.lib.add_photos_to_album(album, &ids).unwrap();
+}
+
+// ------------------------------------------------------------- two remotes
+
+/// Two remotes, independent everything: album A tracked push on remote 1
+/// only, album B on remote 2 only, and the same album on both with baselines
+/// of its own on each — a conflict against one remote is not a conflict
+/// against the other.
+#[test]
+fn two_remotes_keep_independent_subscriptions_and_baselines() {
+    let server1_dir = tempfile::tempdir().unwrap();
+    let server2_dir = tempfile::tempdir().unwrap();
+    let server1 = FsTransport::new(server1_dir.path());
+    let server2 = FsTransport::new(server2_dir.path());
+    let opts = PublishOptions::default();
+
+    let m = machine();
+    let r1 = m.lib.add_remote("One", server1_dir.path().to_str().unwrap(), None).unwrap();
+    let r2 = m.lib.add_remote("Two", server2_dir.path().to_str().unwrap(), None).unwrap();
+
+    author_album(&m, "2026/a", &["a1.jpg"]);
+    author_album(&m, "2026/b", &["b1.jpg"]);
+    author_album(&m, "2026/shared", &["s1.jpg"]);
+
+    // A goes to remote 1 only, B to remote 2 only, shared to both.
+    remote::push_path_for(
+        &m.lib, r1, &server1, "2026/a", m.published_root(), &opts, false, SyncScopeKind::Web,
+    )
+    .unwrap();
+    remote::push_path_for(
+        &m.lib, r2, &server2, "2026/b", m.published_root(), &opts, false, SyncScopeKind::Web,
+    )
+    .unwrap();
+    for (rid, server) in [(r1, &server1), (r2, &server2)] {
+        remote::push_path_for(
+            &m.lib, rid, server, "2026/shared", m.published_root(), &opts, false,
+            SyncScopeKind::Web,
+        )
+        .unwrap();
+    }
+
+    // Subscriptions are per remote: remote 1 knows nothing of album B.
+    let subs1: Vec<String> = m
+        .lib
+        .album_subscriptions_for(r1)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.album_path)
+        .collect();
+    let subs2: Vec<String> = m
+        .lib
+        .album_subscriptions_for(r2)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.album_path)
+        .collect();
+    assert_eq!(subs1, vec!["2026/a", "2026/shared"]);
+    assert_eq!(subs2, vec!["2026/b", "2026/shared"]);
+
+    // Album B never reached server 1 in any form, and vice versa.
+    assert!(!server1.manifest().unwrap().keys().any(|k| k.contains("2026/b")));
+    assert!(!server2.manifest().unwrap().keys().any(|k| k.contains("2026/a")));
+
+    // The shared album diverges ON SERVER 2 ONLY, while the local copy also
+    // moves: that is a conflict against remote 2 and a plain push against
+    // remote 1 — the baselines are not shared.
+    server2.put("2026/shared/s1.jpg", b"changed on server two").unwrap();
+    write_jpeg(&m.published_root().join("2026/shared/s1.jpg"), 300, 200);
+
+    let plan1 = remote::plan_album_sync_for(
+        &m.lib, r1, &server1, "2026/shared", SyncDirection::Both, m.published_root(),
+    )
+    .unwrap();
+    let plan2 = remote::plan_album_sync_for(
+        &m.lib, r2, &server2, "2026/shared", SyncDirection::Both, m.published_root(),
+    )
+    .unwrap();
+    assert!(!plan1.has_conflicts(), "remote 1 never diverged: {:?}", plan1.changes);
+    assert!(plan2.has_conflicts(), "remote 2 diverged on both sides");
+}
+
+// -------------------------------------------------------------- full scope
+
+/// The device-to-device story: A pushes `full` (RAW and edits included), a
+/// fresh B pulls `full` and can continue culling and developing the same
+/// frames — originals byte-identical, ratings and stacks carried. And where B
+/// already holds a *different* original, B's file survives and is named.
+#[test]
+fn full_scope_round_trips_originals_ratings_and_edit_stacks() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    // --- A authors: a JPEG with an edit and a rating, plus a RAW -----------
+    let a = machine();
+    author_album(&a, "2026/x", &["one.jpg", "neg.nef"]);
+    let one = a.lib.photo_by_rel_path("2026/x/one.jpg").unwrap().unwrap();
+    let neg = a.lib.photo_by_rel_path("2026/x/neg.nef").unwrap().unwrap();
+    a.lib.set_rating(one.id, 4).unwrap();
+    a.lib.set_flag(neg.id, gpp_core::Flag::Pick).unwrap();
+    a.lib.set_photo_tags(one.id, &["wedding".to_string()]).unwrap();
+    let mut stack = a.lib.edits(one.id).unwrap();
+    stack.set(EditOp::Exposure { ev: 0.4 });
+    a.lib.set_edits(one.id, &stack).unwrap();
+
+    let pushed = remote::push_path_for(
+        &a.lib,
+        a.lib.ensure_default_remote().unwrap(),
+        &server,
+        "2026/x",
+        a.published_root(),
+        &opts,
+        false,
+        SyncScopeKind::Full,
+    )
+    .unwrap();
+    assert!(pushed.failed.is_empty(), "{:?}", pushed.failed);
+
+    // The namespace holds the originals byte-identically — the RAW the web
+    // tree never carries, and the *undeveloped* JPEG (the web copy holds the
+    // developed pixels; the negative rides only here).
+    let raw_bytes = std::fs::read(a.lib.resolve("2026/x/neg.nef").unwrap()).unwrap();
+    assert_eq!(
+        server.get(&format!("{FULL_PREFIX}/2026/x/neg.nef")).unwrap(),
+        raw_bytes
+    );
+    let original_jpeg = std::fs::read(a.lib.resolve("2026/x/one.jpg").unwrap()).unwrap();
+    assert_eq!(
+        server.get(&format!("{FULL_PREFIX}/2026/x/one.jpg")).unwrap(),
+        original_jpeg
+    );
+    let doc = full::doc_from_bytes(
+        &server
+            .get(&format!("{FULL_PREFIX}/2026/x/album.gpp.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc.library_id, a.lib.library_id().unwrap());
+    assert_eq!(doc.membership, vec!["neg.nef", "one.jpg"]);
+
+    // --- a fresh B pulls full ---------------------------------------------
+    let b = machine();
+    let pulled = remote::pull_path_for(
+        &b.lib,
+        b.lib.ensure_default_remote().unwrap(),
+        &server,
+        "2026/x",
+        b.published_root(),
+        SyncScopeKind::Full,
+    )
+    .unwrap();
+    assert!(pulled.metadata_conflicts.is_empty(), "{:?}", pulled.metadata_conflicts);
+
+    // Originals arrived byte-identical, RAW included…
+    assert_eq!(
+        std::fs::read(b.lib.resolve("2026/x/neg.nef").unwrap()).unwrap(),
+        raw_bytes
+    );
+    assert_eq!(
+        std::fs::read(b.lib.resolve("2026/x/one.jpg").unwrap()).unwrap(),
+        original_jpeg
+    );
+    // …the RAW is catalogued and a member of the album…
+    let b_photos = b.lib.album_photos("2026/x").unwrap();
+    assert!(b_photos.iter().any(|p| p.filename == "neg.nef"), "{b_photos:?}");
+    // …and ratings, flags, tags and the develop stack carried.
+    let b_one = b.lib.photo_by_rel_path("2026/x/one.jpg").unwrap().unwrap();
+    let b_neg = b.lib.photo_by_rel_path("2026/x/neg.nef").unwrap().unwrap();
+    assert_eq!(b_one.rating, 4);
+    assert_eq!(b_neg.flag, gpp_core::Flag::Pick);
+    assert_eq!(b.lib.photo_tags(b_one.id).unwrap(), vec!["wedding"]);
+    assert_eq!(
+        b.lib.edits(b_one.id).unwrap(),
+        a.lib.edits(one.id).unwrap(),
+        "B can continue developing the same frame"
+    );
+
+    // The subscription remembers the scope, so plain sync keeps moving full.
+    let sub = b.lib.album_subscription("2026/x").unwrap().unwrap();
+    assert_eq!(sub.scope, SyncScopeKind::Full);
+}
+
+/// A full pull into a library that already holds a *different* original for
+/// one frame: the local negative is kept, byte for byte, and named — the same
+/// rule the web pull has always enforced. Local metadata that diverged is
+/// reported, not overwritten.
+#[test]
+fn a_full_pull_keeps_differing_local_originals_and_reports_metadata_divergence() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/x", &["one.jpg"]);
+    let a_one = a.lib.photo_by_rel_path("2026/x/one.jpg").unwrap().unwrap();
+    a.lib.set_rating(a_one.id, 5).unwrap();
+    remote::push_path_for(
+        &a.lib,
+        a.lib.ensure_default_remote().unwrap(),
+        &server,
+        "2026/x",
+        a.published_root(),
+        &opts,
+        false,
+        SyncScopeKind::Full,
+    )
+    .unwrap();
+
+    // B holds its own, different one.jpg — its negative — already rated 2.
+    // Written at another size so the two machines genuinely disagree.
+    let b = machine();
+    write_jpeg(&b.lib.resolve("2026/x").unwrap().join("one.jpg"), 300, 200);
+    import_dir(
+        &b.lib,
+        &b.lib.resolve("2026/x").unwrap(),
+        &ImportOptions::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    b.lib
+        .create_album(&NewAlbum { path: "2026/x".into(), ..Default::default() })
+        .unwrap();
+    let b_ids: Vec<i64> = b
+        .lib
+        .photos(&Default::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    b.lib.add_photos_to_album("2026/x", &b_ids).unwrap();
+    let b_bytes = std::fs::read(b.lib.resolve("2026/x/one.jpg").unwrap()).unwrap();
+    assert_ne!(
+        b_bytes,
+        std::fs::read(a.lib.resolve("2026/x/one.jpg").unwrap()).unwrap(),
+        "the two machines must disagree for this test to prove anything"
+    );
+    let b_one = b.lib.photo_by_rel_path("2026/x/one.jpg").unwrap().unwrap();
+    b.lib.set_rating(b_one.id, 2).unwrap();
+
+    let pulled = remote::pull_path_for(
+        &b.lib,
+        b.lib.ensure_default_remote().unwrap(),
+        &server,
+        "2026/x",
+        b.published_root(),
+        SyncScopeKind::Full,
+    )
+    .unwrap();
+
+    // B's negative survived, byte for byte, and the disagreement is named.
+    assert_eq!(
+        std::fs::read(b.lib.resolve("2026/x/one.jpg").unwrap()).unwrap(),
+        b_bytes,
+        "a pull wrote over the photographer's original"
+    );
+    assert!(
+        pulled
+            .kept_originals
+            .contains(&format!("{FULL_PREFIX}/2026/x/one.jpg")),
+        "the kept original must be named: {:?}",
+        pulled.kept_originals
+    );
+    // The rating both sides set differently: reported, unchanged.
+    assert_eq!(
+        b.lib.photo_by_rel_path("2026/x/one.jpg").unwrap().unwrap().rating,
+        2,
+        "a metadata divergence must never be resolved by guessing"
+    );
+    assert!(
+        pulled.metadata_conflicts.iter().any(|c| c.contains("rating")),
+        "the divergence must be reported: {:?}",
+        pulled.metadata_conflicts
+    );
+}
+
+/// A web-scope client — every existing remote consumer — must never see the
+/// namespace: not as an album, not in a web pull, not in a web push's
+/// deletions.
+#[test]
+fn web_scope_clients_never_see_the_full_namespace() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/x", &["one.jpg", "neg.nef"]);
+    remote::push_path_for(
+        &a.lib,
+        a.lib.ensure_default_remote().unwrap(),
+        &server,
+        "2026/x",
+        a.published_root(),
+        &opts,
+        false,
+        SyncScopeKind::Full,
+    )
+    .unwrap();
+    assert!(
+        server
+            .manifest()
+            .unwrap()
+            .keys()
+            .any(|k| k.starts_with(FULL_PREFIX)),
+        "the namespace has to exist for this test to prove anything"
+    );
+
+    // A web machine listing albums sees exactly the real one.
+    let b = machine();
+    let rid = b.lib.ensure_default_remote().unwrap();
+    let listed = remote::remote_albums_for(&b.lib, rid, &server).unwrap();
+    let paths: Vec<&str> = listed.iter().map(|a| a.path.as_str()).collect();
+    assert_eq!(paths, vec!["2026", "2026/x"], "no __gpp_full__ album anywhere");
+
+    // A web pull of the album brings the published files only.
+    let pulled = remote::pull_path_for(
+        &b.lib, rid, &server, "2026/x", b.published_root(), SyncScopeKind::Web,
+    )
+    .unwrap();
+    assert!(!b.lib.resolve("2026/x/neg.nef").unwrap().exists(), "RAW is full-scope only");
+    assert!(pulled.rejected.is_empty());
+
+    // And a web push with deletions allowed cannot touch the namespace: it is
+    // outside every web plan's scope.
+    let before = server.manifest().unwrap();
+    remote::push_path_for(
+        &b.lib, rid, &server, "2026/x", b.published_root(), &opts, true, SyncScopeKind::Web,
+    )
+    .unwrap();
+    let after = server.manifest().unwrap();
+    assert_eq!(
+        before.keys().filter(|k| k.starts_with(FULL_PREFIX)).count(),
+        after.keys().filter(|k| k.starts_with(FULL_PREFIX)).count(),
+        "a web push deleted from the full namespace"
+    );
+}
+
+// ------------------------------------------------------ cross-library push
+
+/// A stateless push against a foreign remote: uploads what is new or
+/// different, refuses to delete anything (there is no allow_deletes to even
+/// pass), names every overwrite, and carries the sender's identity.
+#[test]
+fn a_foreign_push_never_deletes_and_names_its_overwrites() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    // The receiving library's own content, which the sender must not disturb.
+    server.put("2026/theirs/index.md", b"---\ntitle: \"Theirs\"\n---\n").unwrap();
+    server.put("2026/theirs/t1.jpg", b"their photo").unwrap();
+    // And a file inside the very album the sender will push, differing.
+    server.put("2026/x/one.jpg", b"their version of one.jpg").unwrap();
+
+    let a = machine();
+    author_album(&a, "2026/x", &["one.jpg", "two.jpg"]);
+
+    let outcome = remote::push_album_to(
+        &a.lib, &server, "2026/x", a.published_root(), &opts, SyncScopeKind::Web,
+    )
+    .unwrap();
+
+    // Provenance travels with the outcome.
+    assert_eq!(outcome.library_id, a.lib.library_id().unwrap());
+    assert!(!outcome.library_name.is_empty());
+
+    // The differing file was replaced — and named, so a UI can warn.
+    assert_eq!(outcome.overwritten, vec!["2026/x/one.jpg".to_string()]);
+    assert!(outcome.files_pushed >= 3, "index.md + two photos");
+
+    // Nothing was deleted anywhere: the receiver's album is intact.
+    assert_eq!(server.get("2026/theirs/t1.jpg").unwrap(), b"their photo");
+
+    // Stateless: no subscription, no baselines were recorded for this remote.
+    assert!(a.lib.album_subscriptions().unwrap().is_empty());
+    assert!(a.lib.synced_manifest().unwrap().is_empty());
+
+    // Now the sender drops a photo locally and pushes again: a stateful push
+    // would want a deletion — a foreign push simply cannot express one.
+    let two = a.lib.photo_by_rel_path("2026/x/two.jpg").unwrap().unwrap();
+    a.lib.remove_photos_from_album("2026/x", &[two.id]).unwrap();
+    remote::push_album_to(&a.lib, &server, "2026/x", a.published_root(), &opts, SyncScopeKind::Web)
+        .unwrap();
+    assert!(
+        server.get("2026/x/two.jpg").is_ok(),
+        "a foreign push deleted from someone else's remote"
+    );
+}
+
+/// Full scope works through the foreign door too: the namespace rides along.
+#[test]
+fn a_foreign_push_can_carry_full_scope() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/x", &["one.jpg", "neg.nef"]);
+    let outcome = remote::push_album_to(
+        &a.lib, &server, "2026/x", a.published_root(), &opts, SyncScopeKind::Full,
+    )
+    .unwrap();
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(server.get(&format!("{FULL_PREFIX}/2026/x/neg.nef")).is_ok());
+    assert!(server.get(&format!("{FULL_PREFIX}/2026/x/album.gpp.json")).is_ok());
+}
+
+// ------------------------------------------------- reading foreign catalogs
+
+#[test]
+fn read_library_remotes_reads_v5_and_legacy_catalogs_without_migrating_them() {
+    // --- a v5 library ------------------------------------------------------
+    let v5 = machine();
+    v5.lib.add_remote("Studio", "https://studio.example/api/sync", Some("tok-tok-tok-tok!"))
+        .unwrap();
+    v5.lib.add_remote("Drive", "/mnt/backup", None).unwrap();
+    let listed = gpp_core::remotes::read_library_remotes(v5._root.path()).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name, "Studio");
+    assert_eq!(listed[0].token.as_deref(), Some("tok-tok-tok-tok!"));
+    assert!(listed[0].is_default);
+
+    // --- a legacy (pre-v5) library: settings keys only ---------------------
+    let legacy_root = tempfile::tempdir().unwrap();
+    let gpp = legacy_root.path().join(".gpp");
+    std::fs::create_dir_all(&gpp).unwrap();
+    {
+        let conn = rusqlite::Connection::open(gpp.join("catalog.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version(version INTEGER NOT NULL);
+             INSERT INTO schema_version(version) VALUES(4);
+             CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO settings(key, value) VALUES('remote.dir', '/srv/old-remote');
+             INSERT INTO settings(key, value) VALUES('remote.token', 'legacy-token-16ch!');",
+        )
+        .unwrap();
+    }
+    let listed = gpp_core::remotes::read_library_remotes(legacy_root.path()).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "Main");
+    assert_eq!(listed[0].target, "/srv/old-remote");
+    assert_eq!(listed[0].token.as_deref(), Some("legacy-token-16ch!"));
+
+    // Reading did NOT migrate the foreign catalog: still v4, no remotes table.
+    {
+        let conn = rusqlite::Connection::open(gpp.join("catalog.db")).unwrap();
+        let v: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4, "a foreign catalog belongs to whatever build manages it");
+        let has_remotes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='remotes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_remotes, 0);
+    }
+
+    // --- a catalog from a newer build is refused by name --------------------
+    {
+        let conn = rusqlite::Connection::open(gpp.join("catalog.db")).unwrap();
+        conn.execute("UPDATE schema_version SET version = 99", []).unwrap();
+    }
+    let err = gpp_core::remotes::read_library_remotes(legacy_root.path()).unwrap_err();
+    assert!(err.to_string().contains("v99"), "{err}");
+
+    // --- not a library at all ----------------------------------------------
+    let empty = tempfile::tempdir().unwrap();
+    assert!(gpp_core::remotes::read_library_remotes(empty.path()).is_err());
+}

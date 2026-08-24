@@ -10,9 +10,9 @@ import type { APIRoute } from 'astro';
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { checkSyncAuth, safeScope } from '../../../lib/sync-auth';
+import { checkSyncAuth, safeScope, splitSyncPath } from '../../../lib/sync-auth';
 import { cachedHash, flushHashCache } from './_hash-cache';
-import { CONTENT_ROOT, jsonError } from './_shared';
+import { CONTENT_ROOT, FULL_SYNC_ROOT, jsonError } from './_shared';
 
 export const prerender = false;
 
@@ -23,11 +23,28 @@ export const GET: APIRoute = async ({ request, url }) => {
   const scope = safeScope(url.searchParams.get('scope'));
   if (scope === null) return jsonError('Invalid scope', 400);
 
-  const root = scope ? path.join(CONTENT_ROOT, scope) : CONTENT_ROOT;
   const files: Array<{ path: string; hash: string }> = [];
-
   try {
-    await walk(root, files);
+    if (scope === undefined) {
+      // The whole of what sync may see: the gallery tree plus the private
+      // full-scope store, the latter reported under its reserved prefix so
+      // the same key names the same file on both sides of the wire.
+      await walk(CONTENT_ROOT, CONTENT_ROOT, '', files);
+      await walk(FULL_SYNC_ROOT, FULL_SYNC_ROOT, '__gpp_full__/', files);
+    } else {
+      const routed = splitSyncPath(scope);
+      if (!routed) return jsonError('Invalid scope', 400);
+      if (routed.tree === 'full') {
+        await walk(
+          path.join(FULL_SYNC_ROOT, routed.rest),
+          FULL_SYNC_ROOT,
+          '__gpp_full__/',
+          files
+        );
+      } else {
+        await walk(path.join(CONTENT_ROOT, scope), CONTENT_ROOT, '', files);
+      }
+    }
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException)?.code;
     // A scope that does not exist yet is an empty manifest, not an error: it is
@@ -45,7 +62,12 @@ export const GET: APIRoute = async ({ request, url }) => {
   });
 };
 
-async function walk(dir: string, out: Array<{ path: string; hash: string }>) {
+async function walk(
+  dir: string,
+  root: string,
+  prefix: string,
+  out: Array<{ path: string; hash: string }>
+) {
   for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
     // Dotfiles stay server-owned and invisible to sync — `.meta/proofing` above
     // all, which the client must never overwrite or delete.
@@ -53,9 +75,9 @@ async function walk(dir: string, out: Array<{ path: string; hash: string }>) {
 
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      await walk(full, out);
+      await walk(full, root, prefix, out);
     } else if (entry.isFile()) {
-      const rel = path.relative(CONTENT_ROOT, full).split(path.sep).join('/');
+      const rel = prefix + path.relative(root, full).split(path.sep).join('/');
       out.push({ path: rel, hash: await cachedHash(full, rel) });
     }
   }

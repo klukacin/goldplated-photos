@@ -90,3 +90,38 @@ export function safeScope(raw: string | null): string | null | undefined {
   if (raw === null || raw === '') return undefined;
   return safeRelPath(raw);
 }
+
+/**
+ * The desktop app's full-scope sync namespace. Everything under it — camera
+ * originals (RAW included) and per-album metadata — is device-to-device
+ * payload, NOT gallery content: it must never land under `src/content/albums`
+ * where the site would build and serve it. The endpoints route it to a
+ * private root instead (`.sync-full/`, outside the content tree).
+ */
+export const FULL_SYNC_PREFIX = '__gpp_full__';
+
+/**
+ * Decide which tree a **validated** rel path belongs to.
+ *
+ * Pure routing, factored out so the security-relevant part is unit-testable:
+ * call it only with the output of {@link safeRelPath} (or a validated scope).
+ * A path beginning with the reserved prefix maps into the private full-sync
+ * tree, with the prefix stripped; anything else is ordinary gallery content.
+ * The bare prefix itself names no file and maps to nothing.
+ *
+ * The prefix segments are ordinary names (no dots), so `safeRelPath` has
+ * already refused every escape shape — `__gpp_full__/../x`, backslashes, NUL,
+ * dotfiles — before this ever runs; only a *leading* prefix is reserved, so an
+ * album someone really named `2026/__gpp_full__` stays ordinary content.
+ */
+export function splitSyncPath(
+  rel: string
+): { tree: 'content' | 'full'; rest: string } | null {
+  if (rel === FULL_SYNC_PREFIX) return null;
+  if (rel.startsWith(`${FULL_SYNC_PREFIX}/`)) {
+    const rest = rel.slice(FULL_SYNC_PREFIX.length + 1);
+    if (rest === '') return null;
+    return { tree: 'full', rest };
+  }
+  return { tree: 'content', rest: rel };
+}

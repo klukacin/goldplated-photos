@@ -15,19 +15,23 @@ import { join } from 'node:path';
  * endpoints and the hash cache read the root from here, so redirecting it moves
  * the whole subsystem into a temp directory.
  */
-const { CONTENT_ROOT } = await vi.hoisted(async () => {
+const { CONTENT_ROOT, FULL_SYNC_ROOT } = await vi.hoisted(async () => {
   const { mkdtemp } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join: joinPath } = await import('node:path');
-  return { CONTENT_ROOT: await mkdtemp(joinPath(tmpdir(), 'gpp-sync-endpoints-')) };
+  const base = await mkdtemp(joinPath(tmpdir(), 'gpp-sync-endpoints-'));
+  return {
+    CONTENT_ROOT: joinPath(base, 'albums'),
+    FULL_SYNC_ROOT: joinPath(base, '.sync-full'),
+  };
 });
 
 vi.mock('../src/pages/api/sync/_shared', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/pages/api/sync/_shared')>();
-  return { ...actual, CONTENT_ROOT };
+  return { ...actual, CONTENT_ROOT, FULL_SYNC_ROOT };
 });
 
-import { checkSyncAuth, safeRelPath, safeScope } from '../src/lib/sync-auth';
+import { checkSyncAuth, safeRelPath, safeScope, splitSyncPath } from '../src/lib/sync-auth';
 import { useCacheFileForTests } from '../src/pages/api/sync/_hash-cache';
 import { blake3HexOf } from '../src/pages/api/sync/_shared';
 import { GET as fileGET, PUT as filePUT, DELETE as fileDELETE } from '../src/pages/api/sync/file';
@@ -88,6 +92,7 @@ async function listing(dir: string): Promise<string[]> {
 beforeEach(async () => {
   process.env.SYNC_TOKEN = TOKEN;
   await rm(CONTENT_ROOT, { recursive: true, force: true });
+  await rm(FULL_SYNC_ROOT, { recursive: true, force: true });
   await mkdir(CONTENT_ROOT, { recursive: true });
   // The cache keeps its map in module state; this points it at the fresh root
   // and starts it cold, so no test inherits another's hashes.
@@ -97,6 +102,7 @@ beforeEach(async () => {
 afterAll(async () => {
   delete process.env.SYNC_TOKEN;
   await rm(CONTENT_ROOT, { recursive: true, force: true });
+  await rm(FULL_SYNC_ROOT, { recursive: true, force: true });
 });
 
 describe('sync authentication', () => {
@@ -581,5 +587,145 @@ describe('sync upload and manifest agree', () => {
     await manifest();
     await upload('2025/wedding/a.jpg', 'omega');
     expect(await manifest()).toEqual([{ path: '2025/wedding/a.jpg', hash: hashOf('omega') }]);
+  });
+});
+
+describe('splitSyncPath', () => {
+  // Pure routing over already-validated paths: this is the function that
+  // decides whether bytes land in the served gallery tree or the private
+  // full-scope store, so its whole table is stated here.
+  it('routes ordinary paths to the content tree, untouched', () => {
+    for (const rel of ['2025/wedding/a.jpg', 'index.md', 'a/b/c.txt']) {
+      expect(splitSyncPath(rel)).toEqual({ tree: 'content', rest: rel });
+    }
+  });
+
+  it('routes the reserved prefix to the full tree, stripped', () => {
+    expect(splitSyncPath('__gpp_full__/2025/w/a.nef')).toEqual({
+      tree: 'full',
+      rest: '2025/w/a.nef',
+    });
+    expect(splitSyncPath('__gpp_full__/2025/w/album.gpp.json')).toEqual({
+      tree: 'full',
+      rest: '2025/w/album.gpp.json',
+    });
+  });
+
+  it('refuses the bare prefix — it names no file', () => {
+    expect(splitSyncPath('__gpp_full__')).toBeNull();
+  });
+
+  it('reserves only a LEADING prefix; elsewhere it is an ordinary name', () => {
+    expect(splitSyncPath('2025/__gpp_full__/a.jpg')).toEqual({
+      tree: 'content',
+      rest: '2025/__gpp_full__/a.jpg',
+    });
+    expect(splitSyncPath('__gpp_full__extra/a.jpg')).toEqual({
+      tree: 'content',
+      rest: '__gpp_full__extra/a.jpg',
+    });
+  });
+
+  it('never sees an escape: safeRelPath refuses them first', () => {
+    // The prefix grants nothing — a hostile manifest cannot ride it out of
+    // either tree, because validation runs before routing.
+    for (const hostile of [
+      '__gpp_full__/../escape.txt',
+      '__gpp_full__/2025/../../etc/passwd',
+      '__gpp_full__/.meta/x.json',
+      '__gpp_full__\\..\\x',
+      '__gpp_full__/a\0b',
+      '__gpp_full__/',
+    ]) {
+      expect(safeRelPath(hostile), hostile).toBeNull();
+    }
+  });
+});
+
+describe('full-scope sync storage', () => {
+  const fullUpload = (rel: string, text: string) => upload(rel, text);
+
+  it('stores a __gpp_full__ upload under the private root, never the content tree', async () => {
+    const response = await fullUpload('__gpp_full__/2025/w/a.nef', 'raw bytes');
+    expect(response.status).toBe(204);
+
+    // In the private store, with the prefix stripped…
+    expect(await readFile(join(FULL_SYNC_ROOT, '2025/w/a.nef'), 'utf8')).toBe('raw bytes');
+    // …and nowhere under the tree the gallery builds and the deploy rsyncs.
+    expect(await exists(join(CONTENT_ROOT, '__gpp_full__'))).toBe(false);
+    expect(await exists(join(CONTENT_ROOT, '2025/w/a.nef'))).toBe(false);
+  });
+
+  it('serves a stored full-scope file back, and deletes it, by its prefixed name', async () => {
+    await fullUpload('__gpp_full__/2025/w/a.nef', 'raw bytes');
+
+    const url = fileUrl('__gpp_full__/2025/w/a.nef');
+    const found = await call(fileGET, new Request(url, { headers: authorized() }), url);
+    expect(found.status).toBe(200);
+    expect(await found.text()).toBe('raw bytes');
+
+    const gone = await call(
+      fileDELETE,
+      new Request(url, { method: 'DELETE', headers: authorized() }),
+      url
+    );
+    expect(gone.status).toBe(204);
+    expect(await exists(join(FULL_SYNC_ROOT, '2025/w/a.nef'))).toBe(false);
+    // The private root itself survives an emptying delete.
+    expect(await exists(FULL_SYNC_ROOT)).toBe(true);
+  });
+
+  it('verifies full-scope uploads against the declared hash like any other', async () => {
+    const response = await upload('__gpp_full__/2025/w/a.nef', 'corrupt', hashOf('intact'));
+    expect(response.status).toBe(422);
+    expect(await exists(join(FULL_SYNC_ROOT, '2025/w/a.nef'))).toBe(false);
+  });
+
+  it('lists both trees in one manifest, full entries under their prefix', async () => {
+    await upload('2025/w/a.jpg', 'web pixels');
+    await fullUpload('__gpp_full__/2025/w/a.nef', 'raw bytes');
+    await fullUpload('__gpp_full__/2025/w/album.gpp.json', '{"version":1}');
+
+    const files = await manifest();
+    expect(new Map(files.map((f) => [f.path, f.hash]))).toEqual(
+      new Map([
+        ['2025/w/a.jpg', hashOf('web pixels')],
+        ['__gpp_full__/2025/w/a.nef', hashOf('raw bytes')],
+        ['__gpp_full__/2025/w/album.gpp.json', hashOf('{"version":1}')],
+      ])
+    );
+  });
+
+  it('scopes a manifest to one tree at a time', async () => {
+    await upload('2025/w/a.jpg', 'web pixels');
+    await fullUpload('__gpp_full__/2025/w/a.nef', 'raw bytes');
+
+    expect((await manifest('2025')).map((f) => f.path)).toEqual(['2025/w/a.jpg']);
+    expect((await manifest('__gpp_full__/2025')).map((f) => f.path)).toEqual([
+      '__gpp_full__/2025/w/a.nef',
+    ]);
+    // A full store that does not exist yet is an empty manifest — the first
+    // full-scope push of a new deployment must not error.
+    await rm(FULL_SYNC_ROOT, { recursive: true, force: true });
+    expect(await manifest('__gpp_full__/2025')).toEqual([]);
+  });
+
+  it('refuses every escape and dotfile shape through the prefix, and writes nothing', async () => {
+    for (const path of [
+      '__gpp_full__',
+      '__gpp_full__/../escape.txt',
+      '__gpp_full__/2025/../../etc/passwd',
+      '__gpp_full__/.meta/proofing/x.json',
+    ]) {
+      const url = fileUrl(path);
+      const request = new Request(url, {
+        method: 'PUT',
+        headers: authorized(undefined, { 'x-content-blake3': hashOf('x') }),
+        body: bytesOf('x'),
+      });
+      expect((await call(filePUT, request, url)).status, path).toBe(400);
+    }
+    expect(await exists(FULL_SYNC_ROOT)).toBe(false);
+    expect(await listing(CONTENT_ROOT)).toEqual([]);
   });
 });

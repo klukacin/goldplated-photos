@@ -29,7 +29,9 @@ use crate::catalog::Library;
 use crate::error::{Error, Result};
 use crate::import::{import_dir, ImportOptions};
 use crate::model::{Album, Flag, ImportSummary, Photo, PhotoFilter};
-use crate::publish::{publish_album, PublishOptions, PublishResult};
+use crate::publish::{publish_album_for, PublishOptions, PublishResult};
+use crate::remotes::{PublishTargetInfo, PublishTargetUpdate, RemoteInfo, RemoteUpdate};
+use crate::sync::SyncScopeKind;
 
 /// Holds the currently open library. `None` until the user picks one.
 #[derive(Default)]
@@ -91,11 +93,6 @@ pub struct PublishTarget {
     /// [`Session::set_publish_target`] for why that distinction cost a shoot.
     pub min_rating: Option<u8>,
 }
-
-const SETTING_PUBLISH_DEST: &str = "publish.dest";
-const SETTING_PUBLISH_MIN_RATING: &str = "publish.min_rating";
-const SETTING_REMOTE_DIR: &str = "remote.dir";
-const SETTING_REMOTE_TOKEN: &str = "remote.token";
 
 impl Session {
     /// A session with nothing open. Every method below fails with "no library
@@ -474,47 +471,93 @@ impl Session {
     // ------------------------------------------------------------- publish
 
     /// Read back where publishing writes, and how much of the album it ships.
+    ///
+    /// A thin compatibility view over the **default** publish target row
+    /// (schema v5) — the shape every existing caller binds to.
     pub fn publish_target(&self) -> Result<PublishTarget> {
         self.with(|lib| {
-            Ok(PublishTarget {
-                dest: lib.get_setting(SETTING_PUBLISH_DEST)?,
-                min_rating: lib
-                    .get_setting(SETTING_PUBLISH_MIN_RATING)?
-                    .and_then(|v| v.parse().ok()),
+            Ok(match lib.default_target_id()? {
+                Some(id) => {
+                    let t = lib
+                        .publish_target_by_id(id)?
+                        .ok_or_else(|| Error::other("the default publish target vanished"))?;
+                    PublishTarget {
+                        dest: Some(t.dest_root).filter(|d| !d.is_empty()),
+                        min_rating: t.min_rating,
+                    }
+                }
+                None => PublishTarget::default(),
             })
         })
     }
 
-    /// Save both settings. The two halves are treated differently on purpose:
-    /// an absent destination leaves the stored one alone, while an absent
-    /// minimum rating really does clear it.
+    /// Save both settings, onto the default publish target row. The two
+    /// halves are treated differently on purpose: an absent destination
+    /// leaves the stored one alone, while an absent minimum rating really
+    /// does clear it — "no minimum" is one of the choices the panel offers.
     pub fn set_publish_target(&self, target: PublishTarget) -> Result<()> {
         self.with(|lib| {
-            if let Some(dest) = &target.dest {
-                lib.set_setting(SETTING_PUBLISH_DEST, dest)?;
-            }
-            // Written whichever way it came, unlike the destination: "no
-            // minimum" is one of the choices the panel offers, and reading a
-            // cleared field as "leave it alone" kept publishing only the
-            // four-star frames after the photographer had turned the filter
-            // off. An empty value reads back as no minimum.
-            let min = target.min_rating.map(|m| m.to_string()).unwrap_or_default();
-            lib.set_setting(SETTING_PUBLISH_MIN_RATING, &min)?;
-            Ok(())
+            let id = lib.ensure_default_target()?;
+            lib.update_publish_target(
+                id,
+                &PublishTargetUpdate {
+                    dest_root: target.dest.clone(),
+                    min_rating: Some(target.min_rating),
+                    ..Default::default()
+                },
+            )
         })
     }
 
-    /// Publish one album, or every album when `album_path` is `None`.
+    /// Every publish target this library knows.
+    pub fn publish_targets(&self) -> Result<Vec<PublishTargetInfo>> {
+        self.with(|lib| lib.publish_targets())
+    }
+
+    /// Add a publish target; returns its id. The first one becomes default.
+    pub fn add_publish_target(
+        &self,
+        name: String,
+        dest_root: String,
+        min_rating: Option<u8>,
+    ) -> Result<i64> {
+        self.with(|lib| lib.add_publish_target(&name, &dest_root, min_rating))
+    }
+
+    /// Change a publish target; absent fields are left alone.
+    pub fn update_publish_target(&self, id: i64, update: PublishTargetUpdate) -> Result<()> {
+        self.with(|lib| lib.update_publish_target(id, &update))
+    }
+
+    /// Remove a publish target and its publish records. The files in its
+    /// tree stay where they are.
+    pub fn remove_publish_target(&self, id: i64) -> Result<()> {
+        self.with(|lib| lib.remove_publish_target(id))
+    }
+
+    /// Choose which publish target the un-suffixed calls act on.
+    pub fn set_default_publish_target(&self, id: i64) -> Result<()> {
+        self.with(|lib| lib.set_default_publish_target(id))
+    }
+
+    /// Publish one album, or every album when `album_path` is `None`, to the
+    /// default publish target.
     pub fn publish(&self, album_path: Option<String>) -> Result<Vec<PublishResult>> {
-        let target = self.publish_target()?;
-        let dest = target
-            .dest
-            .ok_or_else(|| Error::other("no publish destination configured"))?;
-        let dest = PathBuf::from(dest);
+        self.publish_on(album_path, None)
+    }
+
+    /// [`Self::publish`], to a chosen publish target (`None` = default).
+    pub fn publish_on(
+        &self,
+        album_path: Option<String>,
+        target_id: Option<i64>,
+    ) -> Result<Vec<PublishResult>> {
+        let info = self.resolve_publish_target(target_id)?;
+        let dest = PathBuf::from(&info.dest_root);
 
         self.with(|lib| {
             let opts = PublishOptions {
-                min_rating: target.min_rating,
+                min_rating: info.min_rating,
                 ..Default::default()
             };
             let targets: Vec<String> = match &album_path {
@@ -523,41 +566,127 @@ impl Session {
             };
             let mut out = Vec::new();
             for path in targets {
-                out.push(publish_album(lib, &path, &dest, &opts)?);
+                out.push(publish_album_for(lib, info.id, &path, &dest, &opts)?);
             }
             Ok(out)
         })
     }
 
+    /// One publish target row, default when `None`, refusing an unconfigured
+    /// or empty destination with the message callers have always seen.
+    fn resolve_publish_target(&self, target_id: Option<i64>) -> Result<PublishTargetInfo> {
+        self.with(|lib| {
+            let id = match target_id {
+                Some(id) => id,
+                None => lib
+                    .default_target_id()?
+                    .ok_or_else(|| Error::other("no publish destination configured"))?,
+            };
+            let info = lib
+                .publish_target_by_id(id)?
+                .ok_or_else(|| Error::other(format!("no publish target with id {id}")))?;
+            if info.dest_root.is_empty() {
+                return Err(Error::other("no publish destination configured"));
+            }
+            Ok(info)
+        })
+    }
+
     // -------------------------------------------------------------- remote
 
-    /// Where the remote lives. A directory today (network share, external
-    /// drive, or a folder another tool keeps in sync); SFTP/HTTP transports
-    /// slot in behind the same trait later.
+    /// Where the **default** remote lives — a folder path, or the `http(s)`
+    /// URL of a gallery's sync API. A thin compatibility view over remotes
+    /// row #1 (schema v5); `None` while nothing is configured.
     pub fn remote_dir(&self) -> Result<Option<String>> {
-        self.with(|lib| lib.get_setting(SETTING_REMOTE_DIR))
+        self.with(|lib| {
+            Ok(match lib.default_remote_id()? {
+                Some(id) => lib
+                    .remote_by_id(id)?
+                    .map(|r| r.target)
+                    .filter(|t| !t.is_empty()),
+                None => None,
+            })
+        })
     }
 
-    /// Point this library at a remote: a folder path, or the `http(s)` URL of a
-    /// gallery's sync API. One text box in the UI — which kind it is gets read
-    /// off the string, so there is no type to pick and no way to pick it wrong.
+    /// Point the default remote at a target: a folder path, or the `http(s)`
+    /// URL of a gallery's sync API. One text box in the UI — which kind it is
+    /// gets read off the string, so there is no type to pick and no way to
+    /// pick it wrong.
     pub fn set_remote_dir(&self, dir: String) -> Result<()> {
-        self.with(|lib| lib.set_setting(SETTING_REMOTE_DIR, &dir))
+        self.with(|lib| {
+            let id = lib.ensure_default_remote()?;
+            lib.update_remote(id, &RemoteUpdate { target: Some(dir.clone()), ..Default::default() })
+        })
     }
 
-    /// The remote, whatever kind it is.
-    ///
-    /// Chosen by what the setting looks like rather than by a separate type
-    /// field, so the UI keeps one text box: a path is a directory, an `http(s)`
-    /// URL is the sync API. Adding SFTP later is another arm here and no UI
-    /// change.
-    fn transport(&self) -> Result<Box<dyn crate::sync::RemoteTransport>> {
-        let target = self
-            .remote_dir()?
-            .ok_or_else(|| Error::other("no remote configured"))?;
+    /// Every remote this library knows.
+    pub fn remotes(&self) -> Result<Vec<RemoteInfo>> {
+        self.with(|lib| lib.remotes())
+    }
 
+    /// Add a remote; returns its id. The first one added becomes the default.
+    pub fn add_remote(&self, name: String, target: String, token: Option<String>) -> Result<i64> {
+        self.with(|lib| lib.add_remote(&name, &target, token.as_deref()))
+    }
+
+    /// Change a remote; absent fields are left alone, `token: Some(None)`
+    /// clears the stored secret.
+    pub fn update_remote(&self, id: i64, update: RemoteUpdate) -> Result<()> {
+        self.with(|lib| lib.update_remote(id, &update))
+    }
+
+    /// Remove a remote. Cascades this library's subscriptions and baselines
+    /// for it — **locally**. The server it pointed at is never touched.
+    pub fn remove_remote(&self, id: i64) -> Result<()> {
+        self.with(|lib| lib.remove_remote(id))
+    }
+
+    /// Choose which remote the un-suffixed calls act on.
+    pub fn set_default_remote(&self, id: i64) -> Result<()> {
+        self.with(|lib| lib.set_default_remote(id))
+    }
+
+    /// The remotes of a library that is **not** open here, read from its own
+    /// catalog without opening a session on it (and without migrating it).
+    pub fn read_library_remotes(&self, library_root: String) -> Result<Vec<RemoteInfo>> {
+        crate::remotes::read_library_remotes(library_root)
+    }
+
+    /// One remote row plus its transport — default when `None`, with the
+    /// errors callers have always seen for an unconfigured one.
+    fn transport_on(
+        &self,
+        remote_id: Option<i64>,
+    ) -> Result<(i64, Box<dyn crate::sync::RemoteTransport>)> {
+        let info = self.with(|lib| {
+            let id = match remote_id {
+                Some(id) => id,
+                None => lib
+                    .default_remote_id()?
+                    .ok_or_else(|| Error::other("no remote configured"))?,
+            };
+            lib.remote_by_id(id)?
+                .ok_or_else(|| Error::other(format!("no remote with id {id}")))
+        })?;
+        if info.target.is_empty() {
+            return Err(Error::other("no remote configured"));
+        }
+        Ok((info.id, Self::build_transport(&info.target, info.token)?))
+    }
+
+    /// A transport for a bare target/token pair — what a cross-library push
+    /// uses, since a foreign remote has no row in this catalog.
+    ///
+    /// Chosen by what the target looks like rather than by a type field, so
+    /// the UI keeps one text box: a path is a directory, an `http(s)` URL is
+    /// the sync API. Adding SFTP later is another arm here and no UI change.
+    fn build_transport(
+        target: &str,
+        token: Option<String>,
+    ) -> Result<Box<dyn crate::sync::RemoteTransport>> {
         if target.starts_with("http://") || target.starts_with("https://") {
-            let token = self.remote_token()?.ok_or_else(|| {
+            let token = token.filter(|t| !t.is_empty()).ok_or_else(|| {
                 Error::other(
                     "this remote needs an access token — set it in the sync panel, \
                      or with `gpp sync --remote-token <token>`",
@@ -568,16 +697,40 @@ impl Session {
         Ok(Box::new(crate::sync::FsTransport::new(target)))
     }
 
-    /// Shared secret for an HTTP remote. Stored in the catalog beside the URL.
+    /// Shared secret of the default remote. Stored in the catalog beside the
+    /// URL.
     pub fn remote_token(&self) -> Result<Option<String>> {
-        self.with(|lib| lib.get_setting(SETTING_REMOTE_TOKEN))
+        self.with(|lib| {
+            Ok(match lib.default_remote_id()? {
+                Some(id) => lib.remote_by_id(id)?.and_then(|r| r.token),
+                None => None,
+            })
+        })
     }
 
-    /// Store the secret an HTTP remote requires. It has to equal the gallery's
-    /// `SYNC_TOKEN`; a gallery with none configured answers 503 and stays shut
-    /// rather than open, so a blank on either side never quietly works.
+    /// Store the secret an HTTP remote requires, on the default remote. It
+    /// has to equal the gallery's `SYNC_TOKEN`; a gallery with none configured
+    /// answers 503 and stays shut rather than open, so a blank on either side
+    /// never quietly works.
     pub fn set_remote_token(&self, token: String) -> Result<()> {
-        self.with(|lib| lib.set_setting(SETTING_REMOTE_TOKEN, &token))
+        self.with(|lib| {
+            let id = lib.ensure_default_remote()?;
+            lib.update_remote(
+                id,
+                &RemoteUpdate { token: Some(Some(token.clone())), ..Default::default() },
+            )
+        })
+    }
+
+    /// The scope an album's subscription on `remote_id` carries — `Web` when
+    /// it is not tracked there at all.
+    fn scope_of(&self, remote_id: i64, album_path: &str) -> Result<SyncScopeKind> {
+        self.with(|lib| {
+            Ok(lib
+                .album_subscription_for(remote_id, album_path)?
+                .map(|s| s.scope)
+                .unwrap_or_default())
+        })
     }
 
     fn published_root(&self) -> Result<PathBuf> {
@@ -592,16 +745,33 @@ impl Session {
         })
     }
 
-    /// Albums on the remote, annotated with what this machine knows about them.
+    /// Albums on the default remote, annotated with what this machine knows
+    /// about them.
     pub fn remote_albums(&self) -> Result<Vec<crate::remote::RemoteAlbum>> {
-        let transport = self.transport()?;
-        let transport = transport.as_ref();
-        self.with(|lib| crate::remote::remote_albums(lib, transport))
+        self.remote_albums_on(None)
     }
 
-    /// Which albums this machine syncs, and in which direction.
+    /// [`Self::remote_albums`], against a chosen remote (`None` = default).
+    pub fn remote_albums_on(&self, remote_id: Option<i64>) -> Result<Vec<crate::remote::RemoteAlbum>> {
+        let (id, transport) = self.transport_on(remote_id)?;
+        let transport = transport.as_ref();
+        self.with(|lib| crate::remote::remote_albums_for(lib, id, transport))
+    }
+
+    /// Which albums this machine syncs with the default remote, and how.
     pub fn album_subscriptions(&self) -> Result<Vec<crate::sync::AlbumSubscription>> {
         self.with(|lib| lib.album_subscriptions())
+    }
+
+    /// [`Self::album_subscriptions`], for a chosen remote (`None` = default).
+    pub fn album_subscriptions_on(
+        &self,
+        remote_id: Option<i64>,
+    ) -> Result<Vec<crate::sync::AlbumSubscription>> {
+        self.with(|lib| match remote_id {
+            Some(id) => lib.album_subscriptions_for(id),
+            None => lib.album_subscriptions(),
+        })
     }
 
     /// Subscribe to an album and say which way it may move, replacing any
@@ -612,14 +782,42 @@ impl Session {
     /// either side — so a laptop holding three albums out of two hundred can
     /// sync without endangering the other hundred and ninety-seven.
     pub fn track_album(&self, album_path: String, direction: crate::sync::SyncDirection) -> Result<()> {
-        self.with(|lib| lib.track_album(&album_path, direction))
+        self.track_album_on(album_path, direction, None, None)
+    }
+
+    /// [`Self::track_album`] on a chosen remote, optionally choosing how much
+    /// of the album moves: `web` (the default — the published tree) or `full`
+    /// (originals and metadata as well). An absent scope keeps whatever the
+    /// subscription already carries.
+    pub fn track_album_on(
+        &self,
+        album_path: String,
+        direction: crate::sync::SyncDirection,
+        scope: Option<SyncScopeKind>,
+        remote_id: Option<i64>,
+    ) -> Result<()> {
+        self.with(|lib| {
+            let id = match remote_id {
+                Some(id) => id,
+                None => lib.ensure_default_remote()?,
+            };
+            lib.track_album_for(&album_path, direction, scope, id)
+        })
     }
 
     /// Stop syncing an album. Files stay exactly where they are on both sides;
     /// this only takes the album out of scope, so "I don't want this synced any
     /// more" can never be the click that removes a wedding from the server.
     pub fn untrack_album(&self, album_path: String) -> Result<()> {
-        self.with(|lib| lib.untrack_album(&album_path))
+        self.untrack_album_on(album_path, None)
+    }
+
+    /// [`Self::untrack_album`], on a chosen remote (`None` = default).
+    pub fn untrack_album_on(&self, album_path: String, remote_id: Option<i64>) -> Result<()> {
+        self.with(|lib| match remote_id {
+            Some(id) => lib.untrack_album_for(&album_path, id),
+            None => lib.untrack_album(&album_path),
+        })
     }
 
     /// Preview one album's sync without moving anything.
@@ -628,10 +826,22 @@ impl Session {
         album_path: String,
         direction: crate::sync::SyncDirection,
     ) -> Result<crate::sync::SyncPlan> {
-        let transport = self.transport()?;
+        self.plan_album_sync_on(album_path, direction, None)
+    }
+
+    /// [`Self::plan_album_sync`], against a chosen remote (`None` = default).
+    pub fn plan_album_sync_on(
+        &self,
+        album_path: String,
+        direction: crate::sync::SyncDirection,
+        remote_id: Option<i64>,
+    ) -> Result<crate::sync::SyncPlan> {
+        let (id, transport) = self.transport_on(remote_id)?;
         let transport = transport.as_ref();
         let root = self.published_root()?;
-        self.with(|lib| crate::remote::plan_album_sync(lib, transport, &album_path, direction, &root))
+        self.with(|lib| {
+            crate::remote::plan_album_sync_for(lib, id, transport, &album_path, direction, &root)
+        })
     }
 
     /// Adopt a path from the remote: the folders above it, the album or
@@ -644,10 +854,22 @@ impl Session {
     /// refused to write come back in `rejected`; both are warnings a UI should
     /// show, because a well-behaved server produces neither.
     pub fn pull_album(&self, album_path: String) -> Result<crate::remote::PullOutcome> {
-        let transport = self.transport()?;
+        self.pull_album_on(album_path, None)
+    }
+
+    /// [`Self::pull_album`], from a chosen remote (`None` = default). The
+    /// subscription's scope decides how much arrives: a `full`-tracked album
+    /// also pulls its originals and metadata.
+    pub fn pull_album_on(
+        &self,
+        album_path: String,
+        remote_id: Option<i64>,
+    ) -> Result<crate::remote::PullOutcome> {
+        let (id, transport) = self.transport_on(remote_id)?;
         let transport = transport.as_ref();
         let root = self.published_root()?;
-        self.with(|lib| crate::remote::pull_path(lib, transport, &album_path, &root))
+        let scope = self.scope_of(id, &album_path)?;
+        self.with(|lib| crate::remote::pull_path_for(lib, id, transport, &album_path, &root, scope))
     }
 
     /// Contribute a path to the remote: its folders, itself, everything under
@@ -659,12 +881,52 @@ impl Session {
     /// [`crate::remote::PushOutcome::withheld_deletes`] and left alone, for the
     /// UI to name and ask about before a second run.
     pub fn push_album(&self, album_path: String, allow_deletes: bool) -> Result<crate::remote::PushOutcome> {
-        let transport = self.transport()?;
+        self.push_album_on(album_path, allow_deletes, None)
+    }
+
+    /// [`Self::push_album`], to a chosen remote (`None` = default). The
+    /// subscription's scope decides how much goes up: a `full`-tracked album
+    /// also pushes its originals and metadata.
+    pub fn push_album_on(
+        &self,
+        album_path: String,
+        allow_deletes: bool,
+        remote_id: Option<i64>,
+    ) -> Result<crate::remote::PushOutcome> {
+        let (id, transport) = self.transport_on(remote_id)?;
+        let transport = transport.as_ref();
+        let root = self.published_root()?;
+        let opts = self.publish_options()?;
+        let scope = self.scope_of(id, &album_path)?;
+        self.with(|lib| {
+            crate::remote::push_path_for(
+                lib, id, transport, &album_path, &root, &opts, allow_deletes, scope,
+            )
+        })
+    }
+
+    /// Push a path to a remote that belongs to another library (or to any bare
+    /// target/token pair): a **stateless** push. No local baselines exist for
+    /// a foreign remote, so files that are new or differ from the remote's
+    /// manifest are uploaded, nothing is ever deleted (there is no
+    /// `allow_deletes` here at all), and every overwrite of a differing remote
+    /// file is named in the outcome for the caller's UI to warn about. The
+    /// outcome carries this library's id and name for provenance labeling.
+    pub fn push_album_to(
+        &self,
+        album_path: String,
+        target: String,
+        token: Option<String>,
+        scope: Option<SyncScopeKind>,
+    ) -> Result<crate::remote::ForeignPushOutcome> {
+        let transport = Self::build_transport(&target, token)?;
         let transport = transport.as_ref();
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
-            crate::remote::push_path(lib, transport, &album_path, &root, &opts, allow_deletes)
+            crate::remote::push_album_to(
+                lib, transport, &album_path, &root, &opts, scope.unwrap_or_default(),
+            )
         })
     }
 
@@ -675,13 +937,26 @@ impl Session {
         direction: crate::sync::SyncDirection,
         allow_deletes: bool,
     ) -> Result<crate::sync::SyncOutcome> {
-        let transport = self.transport()?;
+        self.sync_album_on(album_path, direction, allow_deletes, None)
+    }
+
+    /// [`Self::sync_album`], against a chosen remote (`None` = default), in
+    /// the subscription's scope.
+    pub fn sync_album_on(
+        &self,
+        album_path: String,
+        direction: crate::sync::SyncDirection,
+        allow_deletes: bool,
+        remote_id: Option<i64>,
+    ) -> Result<crate::sync::SyncOutcome> {
+        let (id, transport) = self.transport_on(remote_id)?;
         let transport = transport.as_ref();
         let root = self.published_root()?;
         let opts = self.publish_options()?;
+        let scope = self.scope_of(id, &album_path)?;
         self.with(|lib| {
-            crate::remote::sync_path(
-                lib, transport, &album_path, direction, &root, &opts, allow_deletes,
+            crate::remote::sync_path_for(
+                lib, id, transport, &album_path, direction, &root, &opts, allow_deletes, scope,
             )
         })
     }
@@ -694,13 +969,33 @@ impl Session {
     /// photographer had no way to see which one was at fault, or that nothing
     /// else had gone up either.
     pub fn sync_all_tracked(&self, allow_deletes: bool) -> Result<Vec<(String, crate::sync::SyncOutcome)>> {
-        let transport = self.transport()?;
+        self.sync_all_tracked_on(allow_deletes, None)
+    }
+
+    /// [`Self::sync_all_tracked`], against a chosen remote (`None` = default)
+    /// — each subscribed album in its own direction and its own scope.
+    pub fn sync_all_tracked_on(
+        &self,
+        allow_deletes: bool,
+        remote_id: Option<i64>,
+    ) -> Result<Vec<(String, crate::sync::SyncOutcome)>> {
+        let (id, transport) = self.transport_on(remote_id)?;
         let transport = transport.as_ref();
         let root = self.published_root()?;
         let opts = self.publish_options()?;
         self.with(|lib| {
-            crate::remote::sync_tracked_albums(lib, transport, &root, &opts, allow_deletes)
+            crate::remote::sync_tracked_albums_for(lib, id, transport, &root, &opts, allow_deletes)
         })
+    }
+
+    /// Write (or refresh) XMP sidecars for one album's photos, or for the
+    /// whole catalog when `album_path` is `None` — the interchange half of
+    /// "the catalog is the source of truth". Standard fields (`xmp:Rating`,
+    /// `xmp:Label`, `dc:subject`, `tiff:Orientation`) plus the develop stack
+    /// under the versioned `gpp:` namespace. Never touches the image file;
+    /// never overwrites a sidecar another tool wrote.
+    pub fn export_xmp(&self, album_path: Option<String>) -> Result<crate::xmp::XmpExportOutcome> {
+        self.with(|lib| lib.export_xmp(album_path.as_deref()))
     }
 
     fn publish_options(&self) -> Result<PublishOptions> {

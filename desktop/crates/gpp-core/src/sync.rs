@@ -263,6 +263,44 @@ impl SyncDirection {
     }
 }
 
+/// How much of an album a subscription moves.
+///
+/// `Web` is what has always synced: the *published* tree — developed pixels,
+/// JPEG for HEIF, RAW excluded, `index.md` frontmatter. `Full` additionally
+/// moves the catalogued originals (RAW included, byte-identical) plus a
+/// per-album metadata document, under the reserved `__gpp_full__/` namespace —
+/// see [`crate::full`]. The web-scope layout on a remote is byte-for-byte what
+/// it was before scopes existed, so every existing remote keeps working.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncScopeKind {
+    /// The published tree only — today's behaviour, and the default.
+    #[default]
+    Web,
+    /// The published tree plus originals and metadata.
+    Full,
+}
+
+impl SyncScopeKind {
+    /// The value stored in `album_sync.scope`. Stable, like
+    /// [`SyncDirection::as_str`]: it lives in catalogs on disk.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncScopeKind::Web => "web",
+            SyncScopeKind::Full => "full",
+        }
+    }
+
+    /// Total, like [`SyncDirection::parse`]: an unknown value reads as `Web`,
+    /// which moves less rather than more.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "full" => SyncScopeKind::Full,
+            _ => SyncScopeKind::Web,
+        }
+    }
+}
+
 /// Apply a direction to the neutral three-way decision.
 ///
 /// The one semantic addition: under `Pull` or `Both`, a file the server has and
@@ -360,6 +398,10 @@ pub fn plan_scoped(
 pub fn albums_in_manifest(manifest: &Manifest) -> Vec<String> {
     let mut out: Vec<String> = manifest
         .keys()
+        // The full-scope namespace is not an album tree: it holds originals
+        // and metadata for albums the *web* half of the manifest already
+        // names. A web client walking albums must never see it.
+        .filter(|k| !crate::full::is_full_key(k))
         .filter_map(|k| k.strip_suffix("/index.md"))
         .map(|s| s.to_string())
         .collect();
@@ -421,14 +463,26 @@ impl SyncScope {
 const ENTITY_FILE: &str = "file";
 
 impl Library {
-    /// The manifest of what we last agreed on with the server.
+    /// The manifest of what we last agreed on with the **default** remote.
+    /// Empty when no remote exists yet — there is nothing to have agreed with.
     pub fn synced_manifest(&self) -> Result<Manifest> {
+        match self.default_remote_id()? {
+            Some(id) => self.synced_manifest_for(id),
+            None => Ok(Manifest::new()),
+        }
+    }
+
+    /// The manifest of what we last agreed on with one remote. Baselines are
+    /// per-remote (schema v5): the same album can be clean against the studio
+    /// server and divergent against the drive, and neither answer contaminates
+    /// the other.
+    pub fn synced_manifest_for(&self, remote_id: i64) -> Result<Manifest> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT entity_key, synced_hash FROM sync_state \
-                 WHERE entity_kind = ?1 AND synced_hash IS NOT NULL",
+                 WHERE remote_id = ?1 AND entity_kind = ?2 AND synced_hash IS NOT NULL",
             )?;
-            let rows = stmt.query_map(params![ENTITY_FILE], |r| {
+            let rows = stmt.query_map(params![remote_id, ENTITY_FILE], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
             let mut out = Manifest::new();
@@ -440,33 +494,46 @@ impl Library {
         })
     }
 
-    /// Record agreement on a path at a given hash.
+    /// Record agreement on a path at a given hash, against the default remote.
     pub fn record_synced(&self, path: &str, hash: &str) -> Result<()> {
+        let id = self.ensure_default_remote()?;
+        self.record_synced_for(id, path, hash)
+    }
+
+    /// Record agreement on a path at a given hash, against one remote.
+    pub fn record_synced_for(&self, remote_id: i64, path: &str, hash: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO sync_state(entity_kind, entity_key, synced_hash, last_synced_at) \
-                 VALUES(?1, ?2, ?3, ?4) \
-                 ON CONFLICT(entity_kind, entity_key) DO UPDATE SET \
+                "INSERT INTO sync_state(remote_id, entity_kind, entity_key, synced_hash, \
+                   last_synced_at) VALUES(?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(remote_id, entity_kind, entity_key) DO UPDATE SET \
                    synced_hash = excluded.synced_hash, \
                    last_synced_at = excluded.last_synced_at",
-                params![ENTITY_FILE, path, hash, now],
+                params![remote_id, ENTITY_FILE, path, hash, now],
             )?;
             Ok(())
         })
     }
 
-    /// Drop the bookkeeping row for a path.
+    /// Drop the bookkeeping row for a path, against the default remote.
     ///
     /// It deletes nothing but the memory of an agreement. Keeping a row past
     /// the file's life is the more dangerous mistake: the day another machine
     /// republishes those bytes, a stale baseline reads as "deleted here on
     /// purpose" and the file comes off the server again.
     pub fn forget_synced(&self, path: &str) -> Result<()> {
+        let id = self.ensure_default_remote()?;
+        self.forget_synced_for(id, path)
+    }
+
+    /// Drop the bookkeeping row for a path, against one remote.
+    pub fn forget_synced_for(&self, remote_id: i64, path: &str) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "DELETE FROM sync_state WHERE entity_kind = ?1 AND entity_key = ?2",
-                params![ENTITY_FILE, path],
+                "DELETE FROM sync_state WHERE remote_id = ?1 AND entity_kind = ?2 \
+                 AND entity_key = ?3",
+                params![remote_id, ENTITY_FILE, path],
             )?;
             Ok(())
         })
@@ -541,6 +608,19 @@ pub fn apply(
     local_root: &std::path::Path,
     allow_deletes: bool,
 ) -> Result<SyncOutcome> {
+    let remote_id = lib.ensure_default_remote()?;
+    apply_for(lib, remote_id, transport, plan, local_root, allow_deletes)
+}
+
+/// [`apply`], with the baseline writes going to one remote's own rows.
+pub fn apply_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    plan: &SyncPlan,
+    local_root: &std::path::Path,
+    allow_deletes: bool,
+) -> Result<SyncOutcome> {
     use rayon::prelude::*;
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -551,7 +631,7 @@ pub fn apply(
     let applied: Vec<Applied> = pool.install(|| {
         plan.changes
             .par_iter()
-            .map(|change| apply_one(lib, transport, change, local_root, allow_deletes))
+            .map(|change| apply_one(lib, remote_id, transport, change, local_root, allow_deletes))
             .collect()
     });
 
@@ -640,6 +720,7 @@ pub(crate) fn accepts_remote_path(rel: &str) -> bool {
 /// reported and the rest of the transfer continues.
 fn apply_one(
     lib: &Library,
+    remote_id: i64,
     transport: &dyn RemoteTransport,
     change: &PlannedChange,
     local_root: &std::path::Path,
@@ -660,7 +741,7 @@ fn apply_one(
                 return failed(e);
             }
             let hash = blake3::hash(&bytes).to_hex().to_string();
-            match lib.record_synced(&change.path, &hash) {
+            match lib.record_synced_for(remote_id, &change.path, &hash) {
                 Ok(()) => Applied::Pushed,
                 Err(e) => failed(e),
             }
@@ -677,7 +758,7 @@ fn apply_one(
                 return Applied::Failed(change.path.clone(), e.to_string());
             }
             let hash = blake3::hash(&bytes).to_hex().to_string();
-            match lib.record_synced(&change.path, &hash) {
+            match lib.record_synced_for(remote_id, &change.path, &hash) {
                 Ok(()) => Applied::Pulled,
                 Err(e) => failed(e),
             }
@@ -689,7 +770,7 @@ fn apply_one(
             if let Err(e) = transport.delete(&change.path) {
                 return failed(e);
             }
-            match lib.forget_synced(&change.path) {
+            match lib.forget_synced_for(remote_id, &change.path) {
                 Ok(()) => Applied::Deleted,
                 Err(e) => failed(e),
             }
@@ -708,12 +789,12 @@ fn apply_one(
         Action::ForgetState => match std::fs::read(&local_path) {
             Ok(bytes) => {
                 let hash = blake3::hash(&bytes).to_hex().to_string();
-                match lib.record_synced(&change.path, &hash) {
+                match lib.record_synced_for(remote_id, &change.path, &hash) {
                     Ok(()) => Applied::Nothing,
                     Err(e) => failed(e),
                 }
             }
-            Err(_) => match lib.forget_synced(&change.path) {
+            Err(_) => match lib.forget_synced_for(remote_id, &change.path) {
                 Ok(()) => Applied::Nothing,
                 Err(e) => failed(e),
             },
@@ -1200,22 +1281,40 @@ pub struct AlbumSubscription {
     /// When a sync of this album last completed, RFC 3339. `None` until one
     /// does — subscribing records an interest, not a transfer.
     pub last_synced_at: Option<String>,
+    /// How much of the album this subscription moves. Defaults to [`Web`] —
+    /// today's behaviour — including when read back from a catalog written
+    /// before scopes existed.
+    ///
+    /// [`Web`]: SyncScopeKind::Web
+    #[serde(default)]
+    pub scope: SyncScopeKind,
 }
 
 impl Library {
-    /// Albums this machine syncs. Anything not listed is out of scope: never
-    /// pushed, never pulled, never deleted.
+    /// Albums this machine syncs with the **default** remote. Anything not
+    /// listed is out of scope: never pushed, never pulled, never deleted.
     pub fn album_subscriptions(&self) -> Result<Vec<AlbumSubscription>> {
+        match self.default_remote_id()? {
+            Some(id) => self.album_subscriptions_for(id),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Albums this machine syncs with one remote. Subscriptions are
+    /// per-(album, remote): tracking an album on the studio server says
+    /// nothing about the backup drive.
+    pub fn album_subscriptions_for(&self, remote_id: i64) -> Result<Vec<AlbumSubscription>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT album_path, direction, last_synced_at FROM album_sync \
-                 ORDER BY album_path",
+                "SELECT album_path, direction, last_synced_at, scope FROM album_sync \
+                 WHERE remote_id = ?1 ORDER BY album_path",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(params![remote_id], |r| {
                 Ok(AlbumSubscription {
                     album_path: r.get(0)?,
                     direction: SyncDirection::parse(&r.get::<_, String>(1)?),
                     last_synced_at: r.get(2)?,
+                    scope: SyncScopeKind::parse(&r.get::<_, String>(3)?),
                 })
             })?;
             let mut out = Vec::new();
@@ -1226,9 +1325,9 @@ impl Library {
         })
     }
 
-    /// One album's subscription, or `None` when this machine does not track it.
-    /// `None` is the answer for most of the library on most machines, and it is
-    /// what keeps the rest of it out of every plan.
+    /// One album's subscription on the default remote, or `None` when this
+    /// machine does not track it. `None` is the answer for most of the library
+    /// on most machines, and it is what keeps the rest of it out of every plan.
     pub fn album_subscription(&self, album_path: &str) -> Result<Option<AlbumSubscription>> {
         Ok(self
             .album_subscriptions()?
@@ -1236,36 +1335,81 @@ impl Library {
             .find(|s| s.album_path == album_path))
     }
 
-    /// Start syncing an album (or change its direction).
+    /// One album's subscription on one remote.
+    pub fn album_subscription_for(
+        &self,
+        remote_id: i64,
+        album_path: &str,
+    ) -> Result<Option<AlbumSubscription>> {
+        Ok(self
+            .album_subscriptions_for(remote_id)?
+            .into_iter()
+            .find(|s| s.album_path == album_path))
+    }
+
+    /// Start syncing an album with the default remote (or change its
+    /// direction). The scope it already has, if any, is kept.
     pub fn track_album(&self, album_path: &str, direction: SyncDirection) -> Result<()> {
+        let id = self.ensure_default_remote()?;
+        self.track_album_for(album_path, direction, None, id)
+    }
+
+    /// Start syncing an album with one remote, or change its direction —
+    /// and its scope, when one is given. `None` keeps whatever scope the
+    /// subscription already carries (a fresh one starts at [`SyncScopeKind::Web`]),
+    /// so a one-off direction change cannot quietly stop moving originals.
+    pub fn track_album_for(
+        &self,
+        album_path: &str,
+        direction: SyncDirection,
+        scope: Option<SyncScopeKind>,
+        remote_id: i64,
+    ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO album_sync(album_path, direction) VALUES(?1, ?2) \
-                 ON CONFLICT(album_path) DO UPDATE SET direction = excluded.direction",
-                params![album_path, direction.as_str()],
+                "INSERT INTO album_sync(album_path, remote_id, direction, scope) \
+                 VALUES(?1, ?2, ?3, COALESCE(?4, 'web')) \
+                 ON CONFLICT(album_path, remote_id) DO UPDATE SET \
+                   direction = excluded.direction, \
+                   scope = COALESCE(?4, album_sync.scope)",
+                params![
+                    album_path,
+                    remote_id,
+                    direction.as_str(),
+                    scope.map(|s| s.as_str())
+                ],
             )?;
             Ok(())
         })
     }
 
-    /// Stop syncing an album. Files stay where they are on both sides — this
-    /// only removes it from scope.
+    /// Stop syncing an album with the default remote. Files stay where they
+    /// are on both sides — this only removes it from scope.
     pub fn untrack_album(&self, album_path: &str) -> Result<()> {
+        match self.default_remote_id()? {
+            Some(id) => self.untrack_album_for(album_path, id),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop syncing an album with one remote.
+    pub fn untrack_album_for(&self, album_path: &str, remote_id: i64) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "DELETE FROM album_sync WHERE album_path = ?1",
-                params![album_path],
+                "DELETE FROM album_sync WHERE album_path = ?1 AND remote_id = ?2",
+                params![album_path, remote_id],
             )?;
             Ok(())
         })
     }
 
-    pub(crate) fn mark_album_synced(&self, album_path: &str) -> Result<()> {
+    pub(crate) fn mark_album_synced_for(&self, remote_id: i64, album_path: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.with_conn(|c| {
             c.execute(
-                "UPDATE album_sync SET last_synced_at = ?1 WHERE album_path = ?2",
-                params![now, album_path],
+                "UPDATE album_sync SET last_synced_at = ?1 \
+                 WHERE album_path = ?2 AND remote_id = ?3",
+                params![now, album_path, remote_id],
             )?;
             Ok(())
         })

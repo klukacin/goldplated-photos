@@ -204,6 +204,223 @@ fn local_name(qname: &[u8]) -> &str {
     std::str::from_utf8(local).unwrap_or("")
 }
 
+// ---------------------------------------------------------------- exporting
+
+/// The `gpp:` namespace URI. Its presence in a sidecar is the marker that the
+/// file is ours to overwrite; a sidecar without it belongs to another tool
+/// and is left strictly alone.
+pub const GPP_NS: &str = "https://goldplated.photos/ns/gpp/1.0/";
+
+/// Version of the exported develop-stack payload — the stack's own
+/// `version` field travels inside the JSON; this one versions the envelope.
+pub const GPP_XMP_VERSION: u32 = 1;
+
+/// What one photo's export did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportedSidecar {
+    /// A sidecar was written (created, or an earlier gpp one replaced).
+    Written(PathBuf),
+    /// A sidecar from another tool sits where ours would go. Untouched.
+    ForeignKept(PathBuf),
+}
+
+/// Outcome of exporting sidecars for a set of photos.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct XmpExportOutcome {
+    /// Sidecars written.
+    pub written: usize,
+    /// Sidecars another tool wrote, left exactly as they were — the
+    /// photographer decides what happens to those, not an export.
+    pub skipped_foreign: Vec<String>,
+    /// Photos whose original is gone from disk, so there is nowhere sensible
+    /// to put a sidecar.
+    pub missing: Vec<String>,
+}
+
+/// Render one sidecar packet.
+///
+/// Standard fields ride in the vocabularies every serious tool reads —
+/// `xmp:Rating`, `xmp:Label`, `dc:subject`, `tiff:Orientation`, written the
+/// attribute-plus-bag way Lightroom writes them (and [`parse_xmp`] reads
+/// back). The develop stack has no public vocabulary, so it travels under the
+/// `gpp:` namespace as the stack JSON verbatim: readable by us on any
+/// machine, harmlessly opaque to everyone else.
+pub fn render_sidecar(
+    rating: u8,
+    label: Option<&str>,
+    keywords: &[String],
+    orientation: Option<u16>,
+    stack_json: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n");
+    out.push_str("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n");
+    out.push_str(" <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
+    out.push_str("  <rdf:Description rdf:about=\"\"\n");
+    out.push_str("    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n");
+    out.push_str("    xmlns:dc=\"http://purl.org/dc/elements/1.1/\"\n");
+    out.push_str("    xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\"\n");
+    out.push_str(&format!("    xmlns:gpp=\"{GPP_NS}\"\n"));
+    out.push_str(&format!("    gpp:Version=\"{GPP_XMP_VERSION}\"\n"));
+    if rating > 0 {
+        out.push_str(&format!("    xmp:Rating=\"{rating}\"\n"));
+    }
+    if let Some(label) = label.map(str::trim).filter(|l| !l.is_empty()) {
+        out.push_str(&format!("    xmp:Label=\"{}\"\n", xml_escape(label)));
+    }
+    if let Some(o) = orientation.filter(|o| (1..=8).contains(o)) {
+        out.push_str(&format!("    tiff:Orientation=\"{o}\"\n"));
+    }
+    out.push_str("    >\n");
+    if !keywords.is_empty() {
+        out.push_str("   <dc:subject>\n    <rdf:Bag>\n");
+        for k in keywords {
+            out.push_str(&format!("     <rdf:li>{}</rdf:li>\n", xml_escape(k)));
+        }
+        out.push_str("    </rdf:Bag>\n   </dc:subject>\n");
+    }
+    if let Some(stack) = stack_json {
+        out.push_str(&format!(
+            "   <gpp:DevelopStack>{}</gpp:DevelopStack>\n",
+            xml_escape(stack)
+        ));
+    }
+    out.push_str("  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n");
+    out.push_str("<?xpacket end=\"w\"?>");
+    out
+}
+
+/// Whether a sidecar's text carries the gpp marker — i.e. whether we wrote it.
+pub fn is_gpp_sidecar(text: &str) -> bool {
+    text.contains(GPP_NS)
+}
+
+/// Read the develop stack JSON back out of a sidecar's `gpp:DevelopStack`
+/// element. `None` when the packet has none — a foreign sidecar, or an
+/// untouched frame's.
+pub fn read_gpp_stack(text: &str) -> Option<String> {
+    let mut reader = Reader::from_str(text);
+    let mut capturing = false;
+    let mut captured = String::new();
+    loop {
+        match reader.read_event() {
+            Err(_) | Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                if local_name(e.name().as_ref()) == "DevelopStack" {
+                    capturing = true;
+                }
+            }
+            Ok(Event::Text(t)) if capturing => {
+                if let Ok(text) = t.unescape() {
+                    captured.push_str(&text);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local_name(e.name().as_ref()) == "DevelopStack" && capturing {
+                    let trimmed = captured.trim().to_string();
+                    return (!trimmed.is_empty()).then_some(trimmed);
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    None
+}
+
+/// Where an export writes a photo's sidecar, honouring what already exists.
+///
+/// A sidecar already found beside the photo (either naming convention) is the
+/// authority: ours is overwritten in place, a foreign one is kept and
+/// reported. With none, the Lightroom convention — extension replaced — is
+/// used, so other tools find it where they expect it.
+pub fn export_sidecar_for(photo_path: &Path) -> std::result::Result<PathBuf, PathBuf> {
+    if let Some(existing) = sidecar_for(photo_path) {
+        let ours = std::fs::read_to_string(&existing)
+            .map(|t| is_gpp_sidecar(&t))
+            .unwrap_or(false);
+        return if ours { Ok(existing) } else { Err(existing) };
+    }
+    let replaced = photo_path.with_extension("xmp");
+    if replaced == photo_path {
+        // An extensionless photo: append instead of replacing nothing.
+        let mut appended = photo_path.as_os_str().to_owned();
+        appended.push(".xmp");
+        return Ok(PathBuf::from(appended));
+    }
+    Ok(replaced)
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+impl crate::catalog::Library {
+    /// Write (or refresh) XMP sidecars for one album's photos, or for the
+    /// whole catalog when `album_path` is `None`.
+    ///
+    /// The catalog stays the source of truth; sidecars are regenerated from
+    /// it so triage work survives a move to any other tool, and a `full`-scope
+    /// sync carries them along with the originals. The image file itself is
+    /// never touched, and a sidecar another tool wrote — anything without the
+    /// `gpp:` namespace marker — is left alone and named in the outcome.
+    pub fn export_xmp(&self, album_path: Option<&str>) -> crate::error::Result<XmpExportOutcome> {
+        let photos = match album_path {
+            Some(path) => {
+                // Refuse a path that names nothing, rather than exporting an
+                // empty success.
+                if self.album_by_path(path)?.is_none() {
+                    return Err(crate::error::Error::AlbumNotFound(path.to_string()));
+                }
+                self.album_photos(path)?
+            }
+            None => self.photos(&crate::model::PhotoFilter::default())?,
+        };
+
+        let mut out = XmpExportOutcome::default();
+        for photo in &photos {
+            let original = self.resolve(&photo.rel_path)?;
+            if !original.exists() {
+                out.missing.push(photo.rel_path.clone());
+                continue;
+            }
+            let dest = match export_sidecar_for(&original) {
+                Ok(dest) => dest,
+                Err(foreign) => {
+                    out.skipped_foreign.push(foreign.display().to_string());
+                    continue;
+                }
+            };
+            let stack = self.edits(photo.id)?;
+            let stack_json = if stack.is_empty() {
+                None
+            } else {
+                Some(stack.to_json()?)
+            };
+            let packet = render_sidecar(
+                photo.rating,
+                photo.color_label.as_deref(),
+                &self.photo_tags(photo.id)?,
+                photo.orientation,
+                stack_json.as_deref(),
+            );
+            std::fs::write(&dest, packet).map_err(|e| crate::error::Error::io(&dest, e))?;
+            out.written += 1;
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +535,116 @@ mod tests {
         let replaced = dir.path().join("IMG_0001.xmp");
         std::fs::write(&replaced, b"<x/>").unwrap();
         assert_eq!(sidecar_for(&photo), Some(replaced));
+    }
+
+    /// The written packet has to be one [`parse_xmp`] — this module's own
+    /// reader, and the shape Lightroom reads — gets everything back out of.
+    #[test]
+    fn an_exported_sidecar_round_trips_through_the_reader() {
+        let stack = r#"{"version":1,"ops":[{"kind":"exposure","ev":0.5}]}"#;
+        let packet = render_sidecar(
+            4,
+            Some("Red & \"loud\""),
+            &["Wedding".to_string(), "Bride <3".to_string()],
+            Some(6),
+            Some(stack),
+        );
+
+        let parsed = parse_xmp(&packet);
+        assert_eq!(parsed.rating, Some(4));
+        assert_eq!(parsed.label.as_deref(), Some("Red & \"loud\""));
+        assert_eq!(parsed.keywords, vec!["Wedding", "Bride <3"]);
+        assert_eq!(parsed.orientation, Some(6));
+
+        assert!(is_gpp_sidecar(&packet));
+        assert_eq!(read_gpp_stack(&packet).as_deref(), Some(stack));
+
+        // Untouched frame: no rating, no stack — still a valid marked packet.
+        let bare = render_sidecar(0, None, &[], None, None);
+        assert!(parse_xmp(&bare).is_empty());
+        assert!(is_gpp_sidecar(&bare));
+        assert_eq!(read_gpp_stack(&bare), None);
+    }
+
+    /// A sidecar without our namespace belongs to another tool. Ours may
+    /// never overwrite it — that file can hold develop work this app cannot
+    /// even represent.
+    #[test]
+    fn a_foreign_sidecar_is_kept_and_a_gpp_one_is_replaced_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("IMG_0001.jpg");
+        std::fs::write(&photo, b"jpeg").unwrap();
+
+        // Nothing there yet: Lightroom's replaced-extension convention.
+        assert_eq!(
+            export_sidecar_for(&photo),
+            Ok(dir.path().join("IMG_0001.xmp"))
+        );
+
+        // A foreign sidecar sits there: refused, named.
+        let foreign = dir.path().join("IMG_0001.xmp");
+        std::fs::write(&foreign, "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>").unwrap();
+        assert_eq!(export_sidecar_for(&photo), Err(foreign.clone()));
+
+        // One of ours: overwritten in place.
+        std::fs::write(&foreign, render_sidecar(3, None, &[], None, None)).unwrap();
+        assert_eq!(export_sidecar_for(&photo), Ok(foreign));
+    }
+
+    /// End to end through the catalog: fields land in the sidecar, a foreign
+    /// sidecar survives untouched and is reported, and the image file itself
+    /// is byte-identical afterwards.
+    #[test]
+    fn export_xmp_writes_fields_and_never_touches_foreign_files_or_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(24, 16)
+                .write_to(&mut buf, image::ImageFormat::Jpeg)
+                .unwrap();
+            std::fs::write(dir.path().join(name), buf.into_inner()).unwrap();
+        }
+        let lib = crate::catalog::Library::open(dir.path()).unwrap();
+        crate::import::import_dir(&lib, dir.path(), &Default::default(), None, None).unwrap();
+
+        let a = lib.photo_by_rel_path("a.jpg").unwrap().unwrap();
+        let b = lib.photo_by_rel_path("b.jpg").unwrap().unwrap();
+        lib.set_rating(a.id, 5).unwrap();
+        lib.set_color_label(a.id, Some("Red")).unwrap();
+        lib.set_photo_tags(a.id, &["wedding".to_string(), "bride".to_string()]).unwrap();
+        let mut stack = lib.edits(a.id).unwrap();
+        stack.set(crate::develop::EditOp::Exposure { ev: 0.3 });
+        lib.set_edits(a.id, &stack).unwrap();
+
+        // b already has a sidecar from another tool.
+        std::fs::write(dir.path().join("b.xmp"), "<foreign/>").unwrap();
+        let original_bytes = std::fs::read(dir.path().join("a.jpg")).unwrap();
+
+        let out = lib.export_xmp(None).unwrap();
+        assert_eq!(out.written, 1);
+        assert_eq!(out.skipped_foreign.len(), 1);
+        assert!(out.skipped_foreign[0].ends_with("b.xmp"));
+
+        assert_eq!(
+            std::fs::read(dir.path().join("a.jpg")).unwrap(),
+            original_bytes,
+            "the image file itself was touched"
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.xmp")).unwrap(), "<foreign/>");
+
+        let sidecar = read_sidecar(&dir.path().join("a.xmp")).unwrap();
+        assert_eq!(sidecar.rating, Some(5));
+        assert_eq!(sidecar.label.as_deref(), Some("Red"));
+        assert_eq!(sidecar.keywords, vec!["bride", "wedding"]);
+        let text = std::fs::read_to_string(dir.path().join("a.xmp")).unwrap();
+        assert_eq!(
+            read_gpp_stack(&text).as_deref(),
+            Some(lib.edits(a.id).unwrap().to_json().unwrap().as_str()),
+            "the develop stack rides verbatim under the gpp namespace"
+        );
+
+        // An album path that names nothing is refused, not an empty success.
+        assert!(lib.export_xmp(Some("no/such/album")).is_err());
+        let _ = b;
     }
 }

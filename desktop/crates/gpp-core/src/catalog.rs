@@ -12,7 +12,11 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::{Error, Result};
 use crate::model::{Album, Flag, Photo, PhotoFilter, PhotoKind, PhotoSort};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+
+/// The schema version, visible to the crate — `remotes::read_library_remotes`
+/// refuses a foreign catalog from a newer build by name, same as [`migrate`].
+pub(crate) const SCHEMA_VERSION_PUBLIC: i64 = SCHEMA_VERSION;
 
 /// Directory (relative to the library root) holding all derived data.
 pub const GPP_DIR: &str = ".gpp";
@@ -42,6 +46,7 @@ impl Library {
         let conn = Connection::open(gpp.join("catalog.db"))?;
         Self::configure(&conn)?;
         migrate(&conn)?;
+        ensure_library_id(&conn)?;
 
         Ok(Self {
             root,
@@ -54,10 +59,21 @@ impl Library {
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         migrate(&conn)?;
+        ensure_library_id(&conn)?;
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             conn: Mutex::new(conn),
         })
+    }
+
+    /// This library's stable identity: 16 random bytes, hex, generated once at
+    /// the first open on a v5 catalog and never changed. Outcomes and manifests
+    /// carry it so an aggregator (the future master catalog) can attribute
+    /// state to a library without guessing from paths.
+    pub fn library_id(&self) -> Result<String> {
+        Ok(self
+            .get_setting(SETTING_LIBRARY_ID)?
+            .unwrap_or_default())
     }
 
     fn configure(conn: &Connection) -> Result<()> {
@@ -506,6 +522,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V2)?;
             tx.execute_batch(SCHEMA_V3)?;
             tx.execute_batch(SCHEMA_V4)?;
+            apply_v5(&tx)?;
             tx.execute(
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
@@ -535,6 +552,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
             if v < 4 {
                 tx.execute_batch(SCHEMA_V4)?;
+            }
+            if v < 5 {
+                apply_v5(&tx)?;
             }
             if v < SCHEMA_VERSION {
                 tx.execute(
@@ -703,6 +723,213 @@ CREATE TABLE IF NOT EXISTS lr_album_links (
   PRIMARY KEY (lrcat_id, lr_collection)
 );
 "#;
+
+/// v5 — multiple remotes and publish targets.
+///
+/// `remotes` and `publish_targets` are new; `album_sync`, `sync_state` and
+/// `published_files` are *rebuilt* so their primary keys carry the remote or
+/// target they belong to — per-(album, remote) state is what makes a second
+/// remote possible at all, and what a future master catalog reads.
+///
+/// The data migration ([`apply_v5`]) folds today's single remote
+/// (`remote.dir` / `remote.token` settings) into remotes row #1 named "Main",
+/// and `publish.dest` / `publish.min_rating` into publish_targets row #1, then
+/// re-keys every existing subscription, baseline and publish record to those
+/// ids. A library that never configured a remote gets empty tables, and the
+/// first remote added becomes the default.
+const SCHEMA_V5_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS remotes (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  target     TEXT NOT NULL,      -- folder path, or http(s) URL of a sync API
+  token      TEXT,               -- bearer secret for an HTTP target
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS publish_targets (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  dest_root  TEXT NOT NULL,      -- the gallery's src/content/albums
+  min_rating INTEGER
+);
+"#;
+
+/// Does `table` have a column called `column`? The v5 rebuilds are guarded by
+/// this so the migration is idempotent: a catalog wedged half-way by the old
+/// non-atomic migrator is carried across rather than left unopenable.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn v5_has_rows(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
+fn v5_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+        .optional()?
+        .filter(|v: &String| !v.is_empty()))
+}
+
+/// The v5 migration: create the new tables, then rebuild the three per-remote
+/// tables around them, folding the single configured remote/destination into
+/// row #1 of each. Runs inside the caller's transaction.
+fn apply_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_V5_TABLES)?;
+
+    // --- album_sync + sync_state: keyed by remote --------------------------
+    let old_album_sync = !table_has_column(conn, "album_sync", "remote_id")?;
+    let old_sync_state = !table_has_column(conn, "sync_state", "remote_id")?;
+
+    if old_album_sync || old_sync_state {
+        // Today's remote, if one was ever configured — or a placeholder when
+        // rows exist without one, because dropping a baseline reads later as
+        // "deleted on purpose" and takes files off the server.
+        let need_remote = v5_setting(conn, "remote.dir")?.is_some()
+            || (old_album_sync && v5_has_rows(conn, "album_sync")?)
+            || (old_sync_state && v5_has_rows(conn, "sync_state")?);
+        let remote_id: Option<i64> = if need_remote {
+            let target = v5_setting(conn, "remote.dir")?.unwrap_or_default();
+            let token: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'remote.token'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            conn.execute(
+                "INSERT INTO remotes(name, target, token, created_at) VALUES('Main', ?1, ?2, ?3)",
+                params![target, token, chrono::Utc::now().to_rfc3339()],
+            )?;
+            Some(conn.last_insert_rowid())
+        } else {
+            None
+        };
+
+        if old_album_sync {
+            conn.execute_batch(
+                "CREATE TABLE album_sync_v5 (
+                   album_path     TEXT    NOT NULL,
+                   remote_id      INTEGER NOT NULL REFERENCES remotes(id) ON DELETE CASCADE,
+                   direction      TEXT    NOT NULL DEFAULT 'both',
+                   scope          TEXT    NOT NULL DEFAULT 'web',
+                   last_synced_at TEXT,
+                   PRIMARY KEY (album_path, remote_id)
+                 );",
+            )?;
+            if let Some(id) = remote_id {
+                conn.execute(
+                    "INSERT INTO album_sync_v5(album_path, remote_id, direction, scope, last_synced_at) \
+                     SELECT album_path, ?1, direction, 'web', last_synced_at FROM album_sync",
+                    params![id],
+                )?;
+            }
+            conn.execute_batch(
+                "DROP TABLE album_sync; ALTER TABLE album_sync_v5 RENAME TO album_sync;",
+            )?;
+        }
+
+        if old_sync_state {
+            conn.execute_batch(
+                "CREATE TABLE sync_state_v5 (
+                   remote_id      INTEGER NOT NULL REFERENCES remotes(id) ON DELETE CASCADE,
+                   entity_kind    TEXT NOT NULL,
+                   entity_key     TEXT NOT NULL,
+                   local_hash     TEXT,
+                   synced_hash    TEXT,
+                   remote_hash    TEXT,
+                   last_synced_at TEXT,
+                   PRIMARY KEY (remote_id, entity_kind, entity_key)
+                 );",
+            )?;
+            if let Some(id) = remote_id {
+                conn.execute(
+                    "INSERT INTO sync_state_v5(remote_id, entity_kind, entity_key, local_hash, \
+                       synced_hash, remote_hash, last_synced_at) \
+                     SELECT ?1, entity_kind, entity_key, local_hash, synced_hash, remote_hash, \
+                       last_synced_at FROM sync_state",
+                    params![id],
+                )?;
+            }
+            conn.execute_batch(
+                "DROP TABLE sync_state; ALTER TABLE sync_state_v5 RENAME TO sync_state;",
+            )?;
+        }
+    }
+
+    // --- published_files: keyed by publish target --------------------------
+    if !table_has_column(conn, "published_files", "target_id")? {
+        let need_target = v5_setting(conn, "publish.dest")?.is_some()
+            || v5_has_rows(conn, "published_files")?;
+        let target_id: Option<i64> = if need_target {
+            let dest = v5_setting(conn, "publish.dest")?.unwrap_or_default();
+            let min_rating: Option<i64> =
+                v5_setting(conn, "publish.min_rating")?.and_then(|v| v.parse().ok());
+            conn.execute(
+                "INSERT INTO publish_targets(name, dest_root, min_rating) VALUES('Main', ?1, ?2)",
+                params![dest, min_rating],
+            )?;
+            Some(conn.last_insert_rowid())
+        } else {
+            None
+        };
+
+        conn.execute_batch(
+            "CREATE TABLE published_files_v5 (
+               target_id  INTEGER NOT NULL REFERENCES publish_targets(id) ON DELETE CASCADE,
+               album_path TEXT NOT NULL,
+               filename   TEXT NOT NULL,
+               PRIMARY KEY (target_id, album_path, filename)
+             );",
+        )?;
+        if let Some(id) = target_id {
+            conn.execute(
+                "INSERT INTO published_files_v5(target_id, album_path, filename) \
+                 SELECT ?1, album_path, filename FROM published_files",
+                params![id],
+            )?;
+        }
+        conn.execute_batch(
+            "DROP TABLE published_files; ALTER TABLE published_files_v5 RENAME TO published_files;",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Settings key holding this library's stable identity.
+pub(crate) const SETTING_LIBRARY_ID: &str = "library_id";
+
+/// Generate the library id once, at open, if it is absent.
+fn ensure_library_id(conn: &Connection) -> Result<()> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![SETTING_LIBRARY_ID],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.map(|v| !v.is_empty()).unwrap_or(false) {
+        return Ok(());
+    }
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().gen();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES(?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SETTING_LIBRARY_ID, hex],
+    )?;
+    Ok(())
+}
 
 // ------------------------------------------------------------------ row glue
 
@@ -957,6 +1184,120 @@ mod tests {
         // And the escape character itself is a legal byte in a Unix filename.
         insert_photo(&lib, "back\\slash.jpg");
         assert_eq!(search(&lib, "back\\slash"), vec!["back\\slash.jpg"]);
+    }
+
+    /// Build a genuine v4 catalog on disk — the schema constants are the ones
+    /// v4 builds ran, so this is the real thing, not a simulation.
+    fn write_v4_catalog(dir: &Path) -> Connection {
+        let gpp = dir.join(GPP_DIR);
+        std::fs::create_dir_all(&gpp).unwrap();
+        let conn = Connection::open(gpp.join("catalog.db")).unwrap();
+        conn.execute_batch("CREATE TABLE schema_version(version INTEGER NOT NULL);").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute("INSERT INTO schema_version(version) VALUES(4)", []).unwrap();
+        conn
+    }
+
+    /// The v5 migration folds today's single remote and destination into row
+    /// #1 of the new tables, carries every subscription, baseline and publish
+    /// record onto those ids — and the un-suffixed APIs then behave exactly
+    /// as they did on v4.
+    #[test]
+    fn v4_with_a_configured_remote_migrates_to_row_one_of_each() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = write_v4_catalog(dir.path());
+            for (k, v) in [
+                ("remote.dir", "https://gallery.example/api/sync"),
+                ("remote.token", "sync-token-16-chars!"),
+                ("publish.dest", "/srv/gallery/albums"),
+                ("publish.min_rating", "3"),
+            ] {
+                conn.execute("INSERT INTO settings(key, value) VALUES(?1, ?2)", params![k, v])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO album_sync(album_path, direction, last_synced_at) \
+                 VALUES('2026/ana', 'push', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_state(entity_kind, entity_key, synced_hash) \
+                 VALUES('file', '2026/ana/a.jpg', 'hash-a')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO published_files(album_path, filename) VALUES('2026/ana', 'a.jpg')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let lib = Library::open(dir.path()).expect("the migration must open a v4 catalog");
+
+        // The single remote became remotes row #1 named "Main", and it is the
+        // default the compatibility APIs act on.
+        let remotes = lib.remotes().unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "Main");
+        assert_eq!(remotes[0].target, "https://gallery.example/api/sync");
+        assert_eq!(remotes[0].token.as_deref(), Some("sync-token-16-chars!"));
+        assert!(remotes[0].is_default);
+
+        let targets = lib.publish_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "Main");
+        assert_eq!(targets[0].dest_root, "/srv/gallery/albums");
+        assert_eq!(targets[0].min_rating, Some(3));
+
+        // Subscriptions, baselines and publish records survived, re-keyed —
+        // and read back identically through the old entry points.
+        let subs = lib.album_subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].album_path, "2026/ana");
+        assert_eq!(subs[0].direction, crate::sync::SyncDirection::Push);
+        assert_eq!(subs[0].scope, crate::sync::SyncScopeKind::Web);
+        assert_eq!(subs[0].last_synced_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+
+        let synced = lib.synced_manifest().unwrap();
+        assert_eq!(synced.get("2026/ana/a.jpg").map(String::as_str), Some("hash-a"));
+
+        assert_eq!(
+            lib.published_files("2026/ana").unwrap(),
+            ["a.jpg".to_string()].into_iter().collect()
+        );
+
+        // The catalog now carries a stable identity.
+        let id = lib.library_id().unwrap();
+        assert_eq!(id.len(), 32, "16 random bytes, hex: {id:?}");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // …and it survives a re-open unchanged, as does everything above.
+        drop(lib);
+        let again = Library::open(dir.path()).unwrap();
+        assert_eq!(again.library_id().unwrap(), id);
+        assert_eq!(again.remotes().unwrap().len(), 1);
+    }
+
+    /// A library that never configured a remote migrates to empty tables, and
+    /// the first remote added becomes the default.
+    #[test]
+    fn v4_without_a_remote_migrates_to_empty_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(write_v4_catalog(dir.path()));
+
+        let lib = Library::open(dir.path()).unwrap();
+        assert!(lib.remotes().unwrap().is_empty());
+        assert!(lib.publish_targets().unwrap().is_empty());
+        assert_eq!(lib.default_remote_id().unwrap(), None);
+
+        let id = lib.add_remote("Studio", "/srv/studio", None).unwrap();
+        assert_eq!(lib.default_remote_id().unwrap(), Some(id), "the first add is the default");
     }
 
     #[test]

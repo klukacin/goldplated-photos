@@ -47,28 +47,53 @@ use crate::error::{Error, Result};
 use crate::model::{Album, Photo};
 
 impl Library {
-    /// Filenames this library last published into `album_path`.
+    /// Filenames this library last published into `album_path`, in the
+    /// **default** publish target's tree.
     pub fn published_files(&self, album_path: &str) -> Result<BTreeSet<String>> {
+        match self.default_target_id()? {
+            Some(id) => self.published_files_for(id, album_path),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// Filenames this library last published into `album_path`, per target —
+    /// two publish destinations keep separate books (schema v5), so pruning
+    /// one tree cannot be driven by what was written into the other.
+    pub fn published_files_for(&self, target_id: i64, album_path: &str) -> Result<BTreeSet<String>> {
         self.with_conn(|c| {
-            let mut stmt =
-                c.prepare("SELECT filename FROM published_files WHERE album_path = ?1")?;
-            let rows = stmt.query_map(params![album_path], |r| r.get::<_, String>(0))?;
+            let mut stmt = c.prepare(
+                "SELECT filename FROM published_files WHERE target_id = ?1 AND album_path = ?2",
+            )?;
+            let rows = stmt.query_map(params![target_id, album_path], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<rusqlite::Result<BTreeSet<String>>>()?)
         })
     }
 
-    /// Replace the record of what an album's published folder contains.
+    /// Replace the record of what an album's published folder contains, in
+    /// the default target's books.
     pub fn record_published_files(&self, album_path: &str, files: &BTreeSet<String>) -> Result<()> {
+        let id = self.ensure_default_target()?;
+        self.record_published_files_for(id, album_path, files)
+    }
+
+    /// Replace the record of what an album's published folder contains, per
+    /// target.
+    pub fn record_published_files_for(
+        &self,
+        target_id: i64,
+        album_path: &str,
+        files: &BTreeSet<String>,
+    ) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute(
-                "DELETE FROM published_files WHERE album_path = ?1",
-                params![album_path],
+                "DELETE FROM published_files WHERE target_id = ?1 AND album_path = ?2",
+                params![target_id, album_path],
             )?;
             let mut stmt = tx.prepare(
-                "INSERT INTO published_files(album_path, filename) VALUES(?1, ?2)",
+                "INSERT INTO published_files(target_id, album_path, filename) VALUES(?1, ?2, ?3)",
             )?;
             for f in files {
-                stmt.execute(params![album_path, f])?;
+                stmt.execute(params![target_id, album_path, f])?;
             }
             Ok(())
         })
@@ -200,9 +225,22 @@ pub fn published_filename(photo: &Photo) -> String {
     format!("{stem}.jpg")
 }
 
-/// Publish one album into `dest_root` (the gallery's `src/content/albums`).
+/// Publish one album into `dest_root` (the gallery's `src/content/albums`),
+/// keeping the books under the **default** publish target.
 pub fn publish_album(
     lib: &Library,
+    album_path: &str,
+    dest_root: &Path,
+    opts: &PublishOptions,
+) -> Result<PublishResult> {
+    let target_id = lib.ensure_default_target()?;
+    publish_album_for(lib, target_id, album_path, dest_root, opts)
+}
+
+/// [`publish_album`], with the publish records kept under one specific target.
+pub fn publish_album_for(
+    lib: &Library,
+    target_id: i64,
     album_path: &str,
     dest_root: &Path,
     opts: &PublishOptions,
@@ -336,7 +374,7 @@ pub fn publish_album(
             result.written.push(format!("{album_path}/{published}"));
         }
 
-        prune_published(lib, album_path, &album_dir, &photos, &mut result)?;
+        prune_published(lib, target_id, album_path, &album_dir, &photos, &mut result)?;
     }
 
     Ok(result)
@@ -350,6 +388,7 @@ pub fn publish_album(
 /// not even looked at.
 fn prune_published(
     lib: &Library,
+    target_id: i64,
     album_path: &str,
     album_dir: &Path,
     photos: &[Photo],
@@ -357,7 +396,7 @@ fn prune_published(
 ) -> Result<()> {
     let current: BTreeSet<String> = photos.iter().map(published_filename).collect();
 
-    for stale in lib.published_files(album_path)?.difference(&current) {
+    for stale in lib.published_files_for(target_id, album_path)?.difference(&current) {
         // A photo whose original vanished keeps its published copy: that is a
         // broken drive, not a decision to unpublish. Matched on the filename
         // itself — as a suffix, `my-gone.jpg` going missing also spared an
@@ -383,7 +422,7 @@ fn prune_published(
             recorded.insert(name.to_string());
         }
     }
-    lib.record_published_files(album_path, &recorded)
+    lib.record_published_files_for(target_id, album_path, &recorded)
 }
 
 /// Which photos make it into the published album.

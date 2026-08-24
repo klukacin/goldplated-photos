@@ -350,9 +350,46 @@ particular op.
 | `sync_album` | `album_path`, `direction`, `allow_deletes` *(optional)* | `SyncOutcome` |
 | `sync_all_tracked` | `allow_deletes` *(optional)* | `[[album_path, SyncOutcome]]` |
 
+Every call in this table also accepts an **optional `remote_id`** (schema v5:
+a library can know several remotes). Omitted, the default remote is used —
+which is exactly the single remote a pre-v5 catalog migrated into, so every
+old call keeps working unchanged. `track_album` additionally accepts an
+optional `scope`: `"web"` (default — the published tree, today's behaviour) or
+`"full"` (originals and per-album metadata as well, under the reserved
+`__gpp_full__/` namespace). `publish` accepts an optional `target_id` the same
+way.
+
 Deletions on the server are withheld unless `allow_deletes` is passed. What was
 withheld comes back in `withheld_deletes` so you can name the files, ask, and
 run again — see `dev-docs/sync.md`.
+
+### Remotes and publish targets (schema v5)
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `remotes` | — | `[RemoteInfo]` (`id`, `name`, `target`, `token`, `is_default`, …) |
+| `add_remote` | `name`, `target`, `token` *(optional)* | `id` — the first added becomes the default |
+| `update_remote` | `id`, `update` (`name?`, `target?`, `token?` — `null` clears) | `null` |
+| `remove_remote` | `id` | `null` — drops its subscriptions and baselines **locally**; the server is untouched |
+| `set_default_remote` | `id` | `null` |
+| `publish_targets` | — | `[PublishTargetInfo]` |
+| `add_publish_target` | `name`, `dest_root`, `min_rating` *(optional)* | `id` |
+| `update_publish_target` | `id`, `update` (`name?`, `dest_root?`, `min_rating?` — `null` clears) | `null` |
+| `remove_publish_target` | `id` | `null` |
+| `set_default_publish_target` | `id` | `null` |
+| `read_library_remotes` | `library_root` | `[RemoteInfo]` of **another** library, read-only — its catalog is never migrated |
+| `push_album_to` | `album_path`, `target`, `token` *(optional)*, `scope` *(optional)* | `ForeignPushOutcome` — a stateless push: no baselines, never deletes, names every overwrite, carries this library's `library_id`/`library_name` for provenance |
+
+### Interchange
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `export_xmp` | `album_path` *(optional; omit for the whole catalog)* | `XmpExportOutcome` (`written`, `skipped_foreign`, `missing`) |
+
+Sidecars carry `xmp:Rating`, `xmp:Label`, `dc:subject`, `tiff:Orientation` —
+the fields every serious tool reads — plus the develop stack verbatim under
+the versioned `gpp:` namespace. A sidecar without that namespace belongs to
+another tool and is never overwritten.
 
 The Rust-side list is `gpp_ffi::METHODS`, and a test asserts that every name in
 it dispatches.
@@ -372,10 +409,13 @@ client needs a progress bar badly enough, the right shape is a separate
 `gpp_call_with_progress` taking `void (*)(const char *json, void *user)` — not a
 callback smuggled through the JSON.
 
-**`Session::remote_token`.** Settable, never readable: `has_remote_token`
-reports only whether one is on file. This is the line the Tauri shell already
-draws, and there is no reason for a secret that has been written into the
-catalog to travel back out to a caller that already had it.
+**`Session::remote_token`.** Settable, never readable through
+`has_remote_token`, which reports only whether one is on file — the line the
+Tauri shell draws for the single-remote panel. Note that `remotes` and
+`read_library_remotes` *do* include each remote's `token`: a cross-library
+push exists precisely to carry a credential out of a catalog and into a
+transport the caller builds, and the catalog stores it in plain text anyway.
+Treat those results accordingly.
 
 **Everything else on `Session` is reachable.** The table above is the whole of
 it.

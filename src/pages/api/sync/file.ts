@@ -9,22 +9,28 @@
 import type { APIRoute } from 'astro';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { checkSyncAuth, safeRelPath } from '../../../lib/sync-auth';
+import { checkSyncAuth, safeRelPath, splitSyncPath } from '../../../lib/sync-auth';
 import { flushHashCache, forgetHash, rememberHash } from './_hash-cache';
-import { blake3HexOf, CONTENT_ROOT, jsonError } from './_shared';
+import { blake3HexOf, CONTENT_ROOT, FULL_SYNC_ROOT, jsonError } from './_shared';
 
 export const prerender = false;
 
 /** 512 MB: far above any photo, far below anything that could exhaust the box. */
 const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 
-function resolve(url: URL): { full: string; rel: string } | null {
+function resolve(url: URL): { full: string; rel: string; root: string } | null {
   const rel = safeRelPath(url.searchParams.get('path'));
   if (!rel) return null;
-  const full = path.join(CONTENT_ROOT, rel);
+  // A `__gpp_full__/` path is full-scope sync payload — originals, metadata —
+  // and is stored under a private root the gallery never serves. Nothing with
+  // that prefix may ever land under src/content/albums.
+  const routed = splitSyncPath(rel);
+  if (!routed) return null;
+  const root = routed.tree === 'full' ? FULL_SYNC_ROOT : CONTENT_ROOT;
+  const full = path.join(root, routed.rest);
   // Belt and braces: even with the path rules above, never act outside the root.
-  if (!full.startsWith(CONTENT_ROOT + path.sep)) return null;
-  return { full, rel };
+  if (!full.startsWith(root + path.sep)) return null;
+  return { full, rel, root };
 }
 
 export const GET: APIRoute = async ({ request, url }) => {
@@ -109,7 +115,7 @@ export const DELETE: APIRoute = async ({ request, url }) => {
 
   const target = resolve(url);
   if (!target) return jsonError('Invalid path', 400);
-  const { full, rel } = target;
+  const { full, rel, root } = target;
 
   // A path may name a directory — `2026/weddings` is a perfectly well-formed
   // request — and `rm` without `recursive` raises EISDIR. Sync deletes files;
@@ -128,11 +134,12 @@ export const DELETE: APIRoute = async ({ request, url }) => {
   await flushHashCache();
 
   // Tidy up a directory the deletion emptied, but never complain if it is not
-  // empty — another album's files may share the parent. The content root is
-  // not a directory to tidy: deleting the last top-level file would otherwise
-  // remove the tree the gallery's content collection reads from.
+  // empty — another album's files may share the parent. Neither root is a
+  // directory to tidy: deleting the last top-level file would otherwise
+  // remove the tree the gallery's content collection reads from (or the
+  // private full-sync store).
   const parent = path.dirname(full);
-  if (parent !== CONTENT_ROOT) {
+  if (parent !== root) {
     await fs.rmdir(parent).catch(() => {});
   }
   return new Response(null, { status: 204 });
