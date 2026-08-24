@@ -184,6 +184,25 @@ if (watched.length) {
   ok('build.rs watches the UI files');
 }
 
+// --------------------------------------------------------- library registry
+
+// The known-libraries registry (libraries.json in the app config dir) is read
+// and written from several places in lib.rs. Its filename must be one literal
+// behind one constant: a second literal is how a rename drifts — "Forget"
+// then edits a file the menu never reads, both commands still "work", and no
+// build or test notices.
+if (libRs.includes('libraries.json')) {
+  const literals = (libRs.match(/"libraries\.json"/g) || []).length;
+  if (literals !== 1) {
+    fail(
+      'the registry filename appears as more than one literal',
+      `"libraries.json" occurs ${literals} times in lib.rs — route every use through the one constant`,
+    );
+  } else {
+    ok('the registry filename is a single literal behind a constant');
+  }
+}
+
 // -------------------------------------------------------------------- done
 
 for (const n of notes) console.log(`  ok  ${n}`);

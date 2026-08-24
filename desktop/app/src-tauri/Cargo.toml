@@ -25,6 +25,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 gpp-core = { path = "../../crates/gpp-core", default-features = false }
+# The known-libraries registry (libraries.json in the app config dir) is the
+# one piece of state that is the shell's own — it is about this machine's app,
+# not any one library, so it cannot live in a catalog.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # protocol-asset backs `convertFileSrc`, which is how every thumbnail and
 # preview in the grid is loaded from disk. It must match the assetProtocol
 # block in tauri.conf.json or the build refuses to start.

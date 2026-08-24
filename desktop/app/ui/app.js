@@ -25,6 +25,9 @@ const state = {
   filter: { minRating: null, flag: null, text: '' },
   editingAlbum: null,
   remoteAlbums: [],
+  /// Canonical root of the open library, as the core reports it — what the
+  /// switcher menu compares against to mark the current entry.
+  libraryRoot: '',
 };
 
 const $ = (id) => document.getElementById(id);
@@ -65,9 +68,11 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  // A dialog is in front of everything, so it goes first; only once nothing is
-  // open does Escape mean "stop framing".
-  if (modalIsOpen()) {
+  // The switcher menu floats over everything, so it goes first; then a dialog;
+  // only once nothing is open does Escape mean "stop framing".
+  if (!$('library-menu').hidden) {
+    $('library-menu').hidden = true;
+  } else if (modalIsOpen()) {
     document.querySelectorAll('.modal:not([hidden])').forEach((m) => (m.hidden = true));
   } else if (cropMode.active) {
     cancelCrop();
@@ -101,20 +106,46 @@ async function boot() {
   $('welcome').hidden = false;
 }
 
-$('open-library-btn').addEventListener('click', async () => {
+/// The folder-picker flow — the welcome button and the switcher menu's "Open
+/// other library…" both land here, so there is one boot path, not two.
+async function pickAndOpenLibrary() {
   const dir = await openDialog({ directory: true, title: 'Choose a photo folder' });
   if (!dir) return;
   try {
     await openLibrary(dir);
   } catch (err) {
-    showError('welcome-error', String(err));
+    // Report where the user is: the welcome card's error line before a library
+    // is open, the status bar once one is — a failed switch leaves the current
+    // library on screen, and the welcome card is not.
+    if ($('app').hidden) showError('welcome-error', String(err));
+    else status(`Could not open library: ${err}`);
   }
-});
+}
+
+$('open-library-btn').addEventListener('click', pickAndOpenLibrary);
 
 async function openLibrary(path) {
   const info = await invoke('open_library', { path });
   localStorage.setItem(LIBRARY_KEY, path);
+  // Everything below here may be a *switch* from another library, so state
+  // pointing into the old one — the album filter, the selection, the photo in
+  // the inspector — has to go before the new one's contents load.
+  resetLibraryState();
   await enterApp(info);
+}
+
+/// Clear per-library UI state. The rating/flag/text filters stay: their chips
+/// are on screen and still mean what they say against any library.
+function resetLibraryState() {
+  if (cropMode.active) closeCrop();
+  state.currentAlbum = '';
+  state.selected.clear();
+  state.cursor = -1;
+  state.editingAlbum = null;
+  state.remoteAlbums = [];
+  document.querySelectorAll('.nav-item').forEach((n) =>
+    n.classList.toggle('active', (n.dataset.album || '') === ''));
+  $('inspector').hidden = true;
 }
 
 /// Swap the welcome screen for the app and load its contents.
@@ -127,6 +158,7 @@ async function enterApp(info) {
 }
 
 function renderStatus(info) {
+  state.libraryRoot = info.root;
   const name = info.root.split('/').filter(Boolean).pop() || info.root;
   $('library-name').textContent = name;
   $('all-count').textContent = info.photo_count;
@@ -135,6 +167,112 @@ function renderStatus(info) {
   $('library-stats').innerHTML =
     `${info.photo_count} photos · ${info.album_count} albums` +
     (info.cameras.length ? `<br>${escapeHtml(info.cameras.join(', '))}` : '');
+}
+
+// -------------------------------------------------------- library switcher
+//
+// The titlebar title is a button; under it, a menu of every library this
+// machine has opened (the Rust side records each successful open in
+// libraries.json in the app config dir). Switching is nothing special: the
+// core persists everything to the catalog as it happens, so there is no save
+// prompt — just open the other library and reload, the same path the picker
+// takes. Forget edits the list and only the list.
+
+$('library-switcher-btn').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  const menu = $('library-menu');
+  if (!menu.hidden) {
+    menu.hidden = true;
+    return;
+  }
+  await renderLibraryMenu();
+  menu.hidden = false;
+});
+
+// A click anywhere else dismisses the menu, like any dropdown.
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.library-switcher')) $('library-menu').hidden = true;
+});
+
+async function renderLibraryMenu() {
+  const menu = $('library-menu');
+  menu.innerHTML = '';
+
+  let libraries = [];
+  try {
+    libraries = await invoke('known_libraries');
+  } catch {
+    // An unreadable registry degrades to just the picker entry below.
+  }
+
+  libraries.forEach((lib) => {
+    const row = document.createElement('div');
+    row.className = 'library-row' + (lib.path === state.libraryRoot ? ' current' : '');
+
+    const pick = document.createElement('button');
+    pick.className = 'library-pick';
+    pick.title = lib.path;
+    const name = document.createElement('strong');
+    name.textContent = lib.name;
+    const path = document.createElement('span');
+    path.className = 'muted';
+    path.textContent = lib.path;
+    pick.append(name, path);
+    pick.addEventListener('click', () => switchLibrary(lib));
+    row.appendChild(pick);
+
+    const forget = document.createElement('button');
+    forget.className = 'library-forget';
+    forget.textContent = '×';
+    forget.title = 'Forget — removes it from this list only; the library on disk is untouched';
+    forget.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        await invoke('forget_library', { path: lib.path });
+        await renderLibraryMenu();
+      } catch (err) {
+        status(`Could not forget ${lib.name}: ${err}`);
+      }
+    });
+    row.appendChild(forget);
+
+    menu.appendChild(row);
+  });
+
+  const other = document.createElement('button');
+  other.className = 'library-open-other';
+  other.textContent = 'Open other library…';
+  other.addEventListener('click', () => {
+    $('library-menu').hidden = true;
+    pickAndOpenLibrary();
+  });
+  menu.appendChild(other);
+}
+
+async function switchLibrary(lib) {
+  $('library-menu').hidden = true;
+  if (lib.path === state.libraryRoot) return;
+  status(`Opening ${lib.name}…`);
+  try {
+    await openLibrary(lib.path);
+    status(`Opened ${lib.name}`);
+  } catch (err) {
+    // The core only swaps libraries once the new one opened, so a failed
+    // switch — the external drive is unplugged, the folder was moved — leaves
+    // the current library on screen untouched. Name the failure and offer to
+    // drop the dead entry; declining keeps it for when the drive comes back.
+    const forget = await askConfirm(
+      `${err}\n\nThe current library stays open. Forget "${lib.name}"? ` +
+      `This only removes it from the list — nothing on disk is touched.`,
+      { title: `Could not open ${lib.path}`, kind: 'warning', okLabel: 'Forget' }
+    );
+    if (forget) {
+      try {
+        await invoke('forget_library', { path: lib.path });
+      } catch { /* the entry stays; the menu still works */ }
+    }
+    status('Library unchanged');
+  }
 }
 
 // ------------------------------------------------------------------ import

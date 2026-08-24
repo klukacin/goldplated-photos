@@ -21,7 +21,15 @@
   <!-- Main application -->
   <div id="app" class="app" hidden>
     <header class="titlebar" data-tauri-drag-region>
-      <div class="titlebar-title" id="library-name">Library</div>
+      <!-- Library switcher: the title is the button; the menu underneath lists
+           every library this machine has opened. -->
+      <div class="library-switcher">
+        <button id="library-switcher-btn" class="titlebar-title library-btn"
+                title="Switch library">
+          <span id="library-name">Library</span><span class="caret" aria-hidden="true">▾</span>
+        </button>
+        <div id="library-menu" class="library-menu" hidden></div>
+      </div>
       <div class="titlebar-actions">
         <button id="import-btn" class="btn">Import…</button>
         <button id="sync-btn" class="btn">Sync…</button>

@@ -102,6 +102,81 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .titlebar-title { font-weight: 600; }
 .titlebar-actions { margin-left: auto; display: flex; gap: 0.5rem; }
 
+/* -------------------------------------------------------- library switcher */
+
+.library-switcher { position: relative; }
+.library-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: none;
+  border: none;
+  padding: 0.25rem 0.45rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.library-btn:hover { background: #2c2c34; }
+.library-btn .caret { color: var(--text-dim); font-size: 0.7em; }
+.library-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60; /* over the app chrome; the modals (z-index 100) stay above */
+  min-width: 280px;
+  max-width: 420px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 0.3rem;
+}
+.library-row { display: flex; align-items: center; gap: 0.2rem; }
+.library-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.library-pick:hover { background: #2c2c34; }
+.library-pick .muted {
+  font-size: 0.78em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.library-row.current .library-pick strong::after { content: " ✓"; color: var(--accent); }
+.library-forget {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-sm);
+  font-size: 1.05em;
+}
+.library-forget:hover { color: var(--danger); background: rgba(229, 72, 77, 0.12); }
+.library-open-other {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  margin-top: 0.3rem;
+  padding: 0.5rem;
+  cursor: pointer;
+}
+.library-open-other:hover { background: #2c2c34; }
+
 .body { flex: 1; display: flex; min-height: 0; }
 
 /* ---------------------------------------------------------------- sidebar */

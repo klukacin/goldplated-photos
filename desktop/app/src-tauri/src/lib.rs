@@ -26,7 +26,101 @@ fn to_msg(e: gpp_core::Error) -> String {
 fn open_library(app: tauri::AppHandle, path: String) -> CmdResult<LibraryStatus> {
     let status = app.state::<Session>().open_library(&path).map_err(to_msg)?;
     allow_reading_library(&app);
+    record_library_opened(&app, &status.root);
     Ok(status)
+}
+
+// ------------------------------------------------------- known libraries
+//
+// A small registry of every library this machine has opened, so the titlebar
+// can offer them back as a menu. It is the shell's own state — about the app
+// on this machine, not about any one library — so it lives in the app config
+// directory, not in a catalog. Forgetting an entry edits this file and
+// nothing else; the library on disk is never touched.
+
+/// One remembered library. Written to and read from `libraries.json`; the
+/// struct only ever travels *out* to the webview, so there is no unknown-field
+/// trap here, and reads stay tolerant so a field added later cannot make an
+/// older build throw the whole list away.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct KnownLibrary {
+    /// Folder basename — what the menu shows.
+    name: String,
+    /// The canonical root the core reported, not whatever was typed.
+    path: String,
+    /// Seconds since the Unix epoch; the list is kept newest-first.
+    last_opened_at: u64,
+}
+
+/// The registry file, named in exactly one place (check-shell.mjs holds it to
+/// that): every reader and writer below goes through this constant.
+const LIBRARIES_REGISTRY: &str = "libraries.json";
+
+fn registry_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    Ok(dir.join(LIBRARIES_REGISTRY))
+}
+
+/// A missing or unreadable registry is an empty one, never an error: the menu
+/// degrades to "Open other library…" instead of blocking the app.
+fn read_registry(app: &tauri::AppHandle) -> Vec<KnownLibrary> {
+    let Ok(path) = registry_path(app) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(&path) else { return Vec::new() };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Write through a temp file and rename, so a crash mid-write leaves the old
+/// list rather than half a JSON document that then reads as an empty one.
+fn write_registry(app: &tauri::AppHandle, list: &[KnownLibrary]) -> Result<(), String> {
+    let path = registry_path(app)?;
+    let dir = path.parent().ok_or("registry path has no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Called on every successful open — picker, menu, remembered, or command
+/// line — so the very first open is already in the list. Failure to record is
+/// only logged: the library did open, and that must not be reported as an error.
+fn record_library_opened(app: &tauri::AppHandle, root: &str) {
+    let name = std::path::Path::new(root)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut list = read_registry(app);
+    list.retain(|e| e.path != root);
+    list.insert(
+        0,
+        KnownLibrary { name, path: root.to_string(), last_opened_at: now },
+    );
+    list.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+    if let Err(e) = write_registry(app, &list) {
+        eprintln!("could not record library {root} in the registry: {e}");
+    }
+}
+
+/// The registry, newest-first. Read fresh on every call — the file is tiny and
+/// a stale in-memory copy would show a forgotten library back in the menu.
+#[tauri::command]
+fn known_libraries(app: tauri::AppHandle) -> CmdResult<Vec<KnownLibrary>> {
+    Ok(read_registry(&app))
+}
+
+/// Remove one entry from the registry and return what is left. Only the list
+/// changes; the library on disk is never touched.
+#[tauri::command]
+fn forget_library(app: tauri::AppHandle, path: String) -> CmdResult<Vec<KnownLibrary>> {
+    let mut list = read_registry(&app);
+    list.retain(|e| e.path != path);
+    write_registry(&app, &list)?;
+    Ok(list)
 }
 
 /// Let the webview load images out of this library.
@@ -428,7 +522,11 @@ pub fn run() {
                 // A bad path is not fatal: the window still opens on the
                 // welcome screen, which is where the user can pick another.
                 match app.state::<Session>().open_library(&path) {
-                    Ok(_) => allow_reading_library(app.handle()),
+                    Ok(status) => {
+                        allow_reading_library(app.handle());
+                        // The first open of a fresh install can be this one.
+                        record_library_opened(app.handle(), &status.root);
+                    }
                     Err(e) => eprintln!("could not open library {path}: {e}"),
                 }
             }
@@ -436,6 +534,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_library,
+            known_libraries,
+            forget_library,
             library_status,
             is_library_open,
             import_photos,
