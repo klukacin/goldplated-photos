@@ -545,6 +545,79 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   font-weight: 600;
 }
 
+/* ---------------------------------------------------------------- servers */
+
+.servers-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+.servers-header h3, .modal-card h3 {
+  margin: 0.4rem 0;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.servers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.9rem;
+}
+
+/* Per-server tracking chips on an album row: name, direction glyph, scope. */
+.sync-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
+.sync-chip {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sync-chip:hover { border-color: var(--accent); }
+.sync-chip.add { color: var(--text-dim); }
+.sync-chip.add:hover { color: var(--text); }
+
+/* The direction/scope popover. Above the modals (z-index 100): it is opened
+   from inside one and has to float over its card. */
+.chip-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 230px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 0.5rem;
+}
+.chip-menu-head {
+  margin-bottom: 0.4rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-menu-row { display: flex; gap: 2px; margin-top: 0.3rem; flex-wrap: wrap; }
+
+/* Wide rows in the sync modal can carry chips plus several buttons. */
+.remote-row { flex-wrap: wrap; }
+
+/* -------------------------------------------------------- lightroom wizard */
+
+.lr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-bottom: 0.75rem;
+}
+.lr-coll { font-size: 0.85rem; }
+.lr-coll .muted { font-size: 0.78em; }
+
 /* ---------------------------------------------------------------- develop */
 
 .develop {

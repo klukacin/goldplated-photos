@@ -32,6 +32,7 @@
       </div>
       <div class="titlebar-actions">
         <button id="import-btn" class="btn">Import…</button>
+        <button id="lr-import-btn" class="btn" title="Import a Lightroom Classic catalog">Lightroom…</button>
         <button id="sync-btn" class="btn">Sync…</button>
         <button id="publish-btn" class="btn btn-primary">Publish</button>
       </div>
@@ -56,6 +57,10 @@
 
         <div class="sidebar-footer">
           <div id="library-stats" class="stats"></div>
+          <button id="export-xmp-all-btn" class="btn btn-sm" style="margin-top:0.5rem"
+                  title="Write XMP sidecars for every photo in the library. Sidecars written by other tools are left alone.">
+            Export XMP sidecars
+          </button>
         </div>
       </aside>
 
@@ -216,6 +221,13 @@
         <button id="share-link-btn" class="btn btn-sm">Generate share link</button>
         <input type="text" id="share-link" readonly placeholder="No share link">
       </div>
+      <div class="share-row">
+        <button id="export-xmp-btn" class="btn btn-sm"
+                title="Write XMP sidecars for this album's photos. Sidecars written by other tools are left alone.">
+          Export XMP sidecars
+        </button>
+        <span id="export-xmp-result" class="muted"></span>
+      </div>
       <p class="error" id="settings-error" hidden></p>
       <div class="modal-actions">
         <button class="btn btn-danger" id="album-delete-btn">Delete album</button>
@@ -260,28 +272,35 @@
     </div>
   </div>
 
-  <!-- Sync / remote -->
+  <!-- Sync / remotes -->
   <div id="sync-modal" class="modal" hidden>
     <div class="modal-card">
       <h2>Sync albums</h2>
-      <p class="muted">Each album syncs on its own, in its own direction. Albums
-         you don't track are never touched — on either side.</p>
-      <label>Remote <small>a folder — network share, external drive — or the gallery's sync URL</small>
-        <div class="row">
-          <input type="text" id="remote-dir" placeholder="/Volumes/gallery or https://gallery.example/api/sync">
-          <button id="pick-remote-btn" class="btn btn-sm">Choose folder…</button>
-        </div>
-      </label>
-      <!-- Only a URL remote needs one; a folder is reached through the file system. -->
-      <label id="remote-token-row" hidden>Access token <small>from the server's SYNC_TOKEN</small>
-        <input type="password" id="remote-token" placeholder="paste once — it is kept in the catalog"
-               autocomplete="off">
-      </label>
+      <p class="muted">Each album syncs on its own, in its own direction, per
+         server. Albums you don't track are never touched — on either side.</p>
+
+      <!-- Servers this library knows: folders or sync URLs, each with its own
+           subscriptions and baselines. -->
+      <div class="servers-header">
+        <h3>Servers</h3>
+        <button id="server-add-btn" class="btn btn-sm">+ Add server</button>
+      </div>
+      <div id="servers-list" class="servers-list"></div>
+
       <div class="row" style="margin-bottom:0.75rem">
+        <label style="margin-bottom:0">Browse
+          <select id="sync-remote-select"></select>
+        </label>
         <button id="remote-refresh-btn" class="btn btn-sm">Refresh list</button>
         <div class="spacer"></div>
+        <label style="margin-bottom:0">Sync all on
+          <select id="sync-all-scope">
+            <option value="one">this server</option>
+            <option value="all">all servers</option>
+          </select>
+        </label>
         <button id="sync-all-btn" class="btn btn-sm"
-                title="Sync every tracked album in its own direction. Never deletes anything on the server — use an album's own Push for that.">Sync all tracked</button>
+                title="Sync every tracked album in its own direction and scope. Never deletes anything on the server — use an album's own Push for that.">Sync all tracked</button>
       </div>
       <div id="remote-list" class="remote-list"></div>
       <p class="error" id="sync-error" hidden></p>
@@ -291,6 +310,101 @@
       </div>
     </div>
   </div>
+
+  <!-- One remote's settings (add or edit) -->
+  <div id="server-modal" class="modal" hidden>
+    <div class="modal-card modal-sm">
+      <h2 id="server-modal-title">Add server</h2>
+      <label>Name <small>how the chips and menus refer to it</small>
+        <input type="text" id="server-name" placeholder="Studio">
+      </label>
+      <label>Target <small>a folder — network share, external drive — or the gallery's sync URL</small>
+        <div class="row">
+          <input type="text" id="server-target" placeholder="/Volumes/gallery or https://gallery.example/api/sync">
+          <button id="server-pick-btn" class="btn btn-sm">Choose folder…</button>
+        </div>
+      </label>
+      <!-- Only a URL remote needs one; a folder is reached through the file system. -->
+      <label id="server-token-row" hidden>Access token <small>from the server's SYNC_TOKEN</small>
+        <input type="password" id="server-token" placeholder="paste once — it is kept in the catalog"
+               autocomplete="off">
+      </label>
+      <p class="error" id="server-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn" data-close>Cancel</button>
+        <button id="server-save-btn" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Push an album to any destination: this library's servers, or a remote
+       another known library holds the credentials for. -->
+  <div id="push-to-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Push album to…</h2>
+      <p class="muted" id="push-to-album"></p>
+      <label>Scope
+        <select id="push-to-scope">
+          <option value="web">Web — the published tree</option>
+          <option value="full">Full — published tree plus originals and metadata</option>
+        </select>
+      </label>
+      <div id="push-to-list" class="remote-list"></div>
+      <p class="error" id="push-to-error" hidden></p>
+      <pre id="push-to-output" class="output" hidden></pre>
+      <div class="modal-actions">
+        <button class="btn" data-close>Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Lightroom import wizard -->
+  <div id="lr-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Import from Lightroom</h2>
+      <p class="muted">The catalog is only read — never opened in place, never
+         written. Re-running with the same catalog syncs rather than duplicates.</p>
+      <div class="row" style="margin-bottom:0.75rem">
+        <input type="text" id="lr-path" readonly placeholder="No catalog chosen">
+        <button id="lr-pick-btn" class="btn btn-sm">Choose .lrcat…</button>
+      </div>
+      <div id="lr-report" hidden>
+        <p class="muted" id="lr-summary"></p>
+        <h3>Folders</h3>
+        <div id="lr-roots" class="lr-list"></div>
+        <h3>Collections <small class="muted">untick one to leave it out — its photos still import</small></h3>
+        <div class="row" style="margin-bottom:0.4rem">
+          <button id="lr-coll-all-btn" class="btn btn-sm">All</button>
+          <button id="lr-coll-none-btn" class="btn btn-sm">None</button>
+        </div>
+        <div id="lr-collections" class="lr-list"></div>
+        <label>Copy files into <small>subfolder of the library; folders already inside it stay put</small>
+          <input type="text" id="lr-dest-subdir" placeholder="lr">
+        </label>
+        <label>Album prefix <small>optional — prepended to every created album path</small>
+          <input type="text" id="lr-album-prefix" placeholder="lightroom">
+        </label>
+        <label>If an album path is already taken
+          <select id="lr-collision">
+            <option value="auto">Decide per album (merge unless another catalog owns it)</option>
+            <option value="merge">Merge into the existing album</option>
+            <option value="suffix">Create a "-lr" sibling</option>
+          </select>
+        </label>
+      </div>
+      <p class="error" id="lr-error" hidden></p>
+      <pre id="lr-output" class="output" hidden></pre>
+      <div class="modal-actions">
+        <button class="btn" data-close>Close</button>
+        <button id="lr-dry-run-btn" class="btn" disabled>Dry run</button>
+        <button id="lr-run-btn" class="btn btn-primary" disabled>Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Popover for one album's per-server tracking: direction and scope.
+       Filled and positioned by JS next to the chip that was clicked. -->
+  <div id="chip-menu" class="chip-menu" hidden></div>
 
   <!-- Add to album -->
   <div id="add-modal" class="modal" hidden>
