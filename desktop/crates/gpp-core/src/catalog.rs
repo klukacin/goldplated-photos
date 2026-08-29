@@ -1161,16 +1161,21 @@ pub(crate) fn root_display_name(root: &Path) -> String {
 /// it (the primary always resolves against `Library::root`), so refreshing it
 /// costs one write and keeps the listing honest.
 fn refresh_primary_source(conn: &Connection, root: &Path) -> Result<()> {
-    let stored: Option<String> = conn
-        .query_row("SELECT path FROM sources WHERE is_primary = 1", [], |r| r.get(0))
+    let stored: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT path, volume_hint FROM sources WHERE is_primary = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .optional()?;
     let now = root.display().to_string();
     match stored {
-        Some(p) if p == now => Ok(()),
+        // Nothing to say: the spelling is current and the volume is known.
+        Some((p, Some(_))) if p == now => Ok(()),
         Some(_) => {
             conn.execute(
-                "UPDATE sources SET path = ?1 WHERE is_primary = 1",
-                params![now],
+                "UPDATE sources SET path = ?1, volume_hint = ?2 WHERE is_primary = 1",
+                params![now, crate::sources::volume_hint(root)],
             )?;
             Ok(())
         }
@@ -1178,11 +1183,12 @@ fn refresh_primary_source(conn: &Connection, root: &Path) -> Result<()> {
         // from under the schema's index; put one back rather than fail to open.
         None => {
             conn.execute(
-                "INSERT INTO sources(name, path, kind, is_primary, added_at) \
-                 VALUES(?1, ?2, 'primary', 1, ?3)",
+                "INSERT INTO sources(name, path, kind, volume_hint, is_primary, added_at) \
+                 VALUES(?1, ?2, 'primary', ?3, 1, ?4)",
                 params![
                     root_display_name(root),
                     now,
+                    crate::sources::volume_hint(root),
                     chrono::Utc::now().to_rfc3339()
                 ],
             )?;

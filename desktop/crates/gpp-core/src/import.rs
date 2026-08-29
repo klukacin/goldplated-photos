@@ -163,12 +163,25 @@ pub fn import_dir(
 
     let candidates = scan(lib, dir, opts.recursive)?;
     if candidates.is_empty() {
-        return Ok(ImportSummary {
+        let mut summary = ImportSummary {
             copied_in: copied.map(|c| c.files).unwrap_or(0),
             copied_into: copied_into.clone(),
             cancelled: stop(),
             ..Default::default()
-        });
+        };
+        // A folder inside a source that is not on this machine right now. It
+        // scans as empty, which reads exactly like "nothing new here" — so say
+        // which drive is missing instead of reporting a clean run over nothing.
+        if !dir.exists() {
+            if let Some(source) = lib.source_containing(dir)? {
+                summary.notes.push(format!(
+                    "source '{}' ({}) is not available — nothing was scanned",
+                    source.name,
+                    source.path.display()
+                ));
+            }
+        }
+        return Ok(summary);
     }
 
     // What the catalog already knows, so unchanged files can be skipped

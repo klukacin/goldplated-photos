@@ -102,8 +102,11 @@ pub struct SourceInfo {
     pub path: String,
     pub kind: SourceKind,
     /// Best-effort volume identifier, filled where the platform offers one
-    /// cheaply (on unix, the device id). Advisory only: nothing resolves a path
-    /// through it.
+    /// cheaply (on unix, the device id) and `None` everywhere else.
+    ///
+    /// Advisory only: **nothing resolves a path through it.** It answers "are
+    /// these two roots on the same drive", which is a question a UI asks and a
+    /// file operation must not.
     pub volume_hint: Option<String>,
     pub is_primary: bool,
     /// Whether the root is a readable directory **right now** — probed at the
@@ -480,7 +483,7 @@ impl Library {
 /// contract forbids the second while the licence policy narrows the first. It
 /// is advisory in any case — nothing resolves a path through it — so `None` is
 /// a perfectly good answer.
-fn volume_hint(path: &Path) -> Option<String> {
+pub(crate) fn volume_hint(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -518,6 +521,8 @@ mod tests {
         assert!(sources[0].online, "the library's own folder is there");
         assert_eq!(sources[0].photo_count, 0);
         assert_eq!(lib.primary_source_id().unwrap(), sources[0].id);
+        #[cfg(unix)]
+        assert!(sources[0].volume_hint.is_some(), "the library sits on a volume too");
     }
 
     /// Sources may not nest, in either direction, and none may be added twice.
