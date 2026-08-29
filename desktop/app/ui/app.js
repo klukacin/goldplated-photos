@@ -156,6 +156,9 @@ function resetLibraryState() {
   state.remotes = [];
   state.syncRemoteId = null;
   state.subsByRemote = new Map();
+  // A scan describes where photos would land in the library that was open when
+  // it ran. Left standing, the wizard would offer to import it into the new one.
+  resetLrWizard();
   document.querySelectorAll('.nav-item').forEach((n) =>
     n.classList.toggle('active', (n.dataset.album || '') === ''));
   $('inspector').hidden = true;
@@ -2327,6 +2330,19 @@ function reportForeignPush(o) {
 // import uses — the core emits the same event and honours the same flag.
 
 const lrState = { path: null, report: null };
+
+/// Put the wizard back to "no catalog chosen". Called on a library switch:
+/// a scan is only meaningful against the library it was read for.
+function resetLrWizard() {
+  lrState.path = null;
+  lrState.report = null;
+  $('lr-path').value = '';
+  $('lr-report').hidden = true;
+  $('lr-output').hidden = true;
+  $('lr-dry-run-btn').disabled = true;
+  $('lr-run-btn').disabled = true;
+  showError('lr-error', '');
+}
 
 $('lr-import-btn').addEventListener('click', () => {
   showError('lr-error', '');
