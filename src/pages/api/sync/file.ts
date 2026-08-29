@@ -11,7 +11,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { checkSyncAuth, safeRelPath, splitSyncPath } from '../../../lib/sync-auth';
 import { flushHashCache, forgetHash, rememberHash } from './_hash-cache';
-import { blake3HexOf, CONTENT_ROOT, FULL_SYNC_ROOT, jsonError } from './_shared';
+import {
+  blake3HexOf,
+  CONTENT_ROOT,
+  FULL_SYNC_ROOT,
+  jsonError,
+  sealPrivateStore,
+} from './_shared';
 
 export const prerender = false;
 
@@ -58,7 +64,7 @@ export const PUT: APIRoute = async ({ request, url }) => {
 
   const target = resolve(url);
   if (!target) return jsonError('Invalid path', 400);
-  const { full, rel } = target;
+  const { full, rel, root } = target;
 
   // Integrity is not optional. Every client we have computes this hash anyway,
   // and without it a truncated upload is published as a photo.
@@ -88,6 +94,11 @@ export const PUT: APIRoute = async ({ request, url }) => {
     return jsonError(`Hash mismatch: declared ${declared}, received ${actual}`, 422);
   }
   const verified = actual;
+
+  // Originals land here; if the store sits under a web root despite the
+  // warning on FULL_SYNC_ROOT, the guard file is what stops Apache handing
+  // them out. Written before the first byte of the first upload.
+  if (root === FULL_SYNC_ROOT) await sealPrivateStore(root);
 
   await fs.mkdir(path.dirname(full), { recursive: true });
   // Write beside the target and rename: rename is atomic within a filesystem,

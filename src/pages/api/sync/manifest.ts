@@ -10,7 +10,12 @@ import type { APIRoute } from 'astro';
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { checkSyncAuth, safeScope, splitSyncPath } from '../../../lib/sync-auth';
+import {
+  checkSyncAuth,
+  FULL_SYNC_PREFIX,
+  safeScope,
+  splitSyncPath,
+} from '../../../lib/sync-auth';
 import { cachedHash, flushHashCache } from './_hash-cache';
 import { CONTENT_ROOT, FULL_SYNC_ROOT, jsonError } from './_shared';
 
@@ -72,6 +77,16 @@ async function walk(
     // Dotfiles stay server-owned and invisible to sync — `.meta/proofing` above
     // all, which the client must never overwrite or delete.
     if (entry.name.startsWith('.')) continue;
+
+    // A top-level `__gpp_full__` in the content tree would be advertised under
+    // the key that `splitSyncPath` routes to the private store: the client
+    // would then GET a file the router looks for in the other tree, and PUT
+    // into a shadow copy while the advertised original stayed put. The name is
+    // reserved at the root of the content tree; deeper down it is an ordinary
+    // album name and stays visible.
+    if (root === CONTENT_ROOT && dir === root && entry.name === FULL_SYNC_PREFIX) {
+      continue;
+    }
 
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {

@@ -334,6 +334,22 @@ describe('sync manifest', () => {
     expect((await manifest()).map((f) => f.path)).toEqual(['2025/wedding/a.jpg']);
   });
 
+  it('never advertises a content-tree album named __gpp_full__', async () => {
+    // `splitSyncPath` routes that key to the private store, so listing it from
+    // the content tree would have the client GET a file the router looks for
+    // in the other tree, and PUT into a shadow copy while the advertised
+    // original sat untouched — the two halves disagreeing about which tree a
+    // key names. Reserved at the root only; deeper down it is a normal name.
+    await mkdir(join(CONTENT_ROOT, '__gpp_full__'), { recursive: true });
+    await writeFile(join(CONTENT_ROOT, '__gpp_full__/decoy.jpg'), 'decoy');
+    await mkdir(join(CONTENT_ROOT, '2025/__gpp_full__'), { recursive: true });
+    await writeFile(join(CONTENT_ROOT, '2025/__gpp_full__/ok.jpg'), 'fine');
+
+    const listed = (await manifest()).map((f) => f.path);
+    expect(listed).not.toContain('__gpp_full__/decoy.jpg');
+    expect(listed).toContain('2025/__gpp_full__/ok.jpg');
+  });
+
   it('rejects an unsafe scope with 400 rather than walking it', async () => {
     const url = manifestUrl('../../etc');
     const response = await call(manifestGET, new Request(url, { headers: authorized() }), url);
@@ -673,6 +689,20 @@ describe('full-scope sync storage', () => {
     expect(await exists(join(FULL_SYNC_ROOT, '2025/w/a.nef'))).toBe(false);
     // The private root itself survives an emptying delete.
     expect(await exists(FULL_SYNC_ROOT)).toBe(true);
+  });
+
+  it('seals the private store against being served, wherever it was put', async () => {
+    // The store holds camera originals. If the operator leaves it under a web
+    // root, Apache would serve them directly — it denies only `.ht*` — with no
+    // token and no album password. The guard file is written before the first
+    // upload lands, so there is no window where originals sit there unguarded.
+    await fullUpload('__gpp_full__/2025/w/a.nef', 'raw bytes');
+
+    const guard = await readFile(join(FULL_SYNC_ROOT, '.htaccess'), 'utf8');
+    expect(guard).toContain('Require all denied');
+    expect(guard).toContain('Deny from all');
+    // And it stays out of every manifest, being a dotfile.
+    expect((await manifest()).map((f) => f.path)).not.toContain('__gpp_full__/.htaccess');
   });
 
   it('verifies full-scope uploads against the declared hash like any other', async () => {
