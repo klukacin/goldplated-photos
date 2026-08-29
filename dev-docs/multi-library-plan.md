@@ -73,8 +73,14 @@ pulling `web` scope for review, or fully for management).
 What present-day schema work must therefore keep:
 
 - **Stable ids**: every library gets a `library_id` (random, in settings)
-  and every remote a stable `remote_id`; outcomes and manifests carry them
-  so an aggregator can attribute state without guessing.
+  and every remote a stable `remote_id`, so an aggregator can attribute
+  state without guessing. Provenance rides in **outcomes**
+  (`ForeignPushOutcome` names the pushing library) and never inside synced
+  content: a manifest is content-addressed, so putting a per-machine id in
+  a synced document makes the same album hash differently on every machine
+  and the two sides re-upload it to each other forever. That defect shipped
+  in `album.gpp.json` and was removed; the master catalog must read
+  identity from the report of an operation, not from the bytes it moved.
 - **Per-(album, remote) state**, never global: subscriptions, baselines and
   publish records are keyed by remote/target — already required for
   multiple remotes, and exactly what a master catalog will read.
