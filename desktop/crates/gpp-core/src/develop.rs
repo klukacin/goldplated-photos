@@ -814,10 +814,15 @@ impl Library {
 pub fn render_derived(lib: &Library, photo: &Photo, stack: &EditStack) -> Result<()> {
     let thumb_root = lib.thumb_dir();
     let key = render_key(&photo.content_hash, stack);
-    let original = lib.resolve(&photo.rel_path)?;
-
-    // A missing original is not fatal here: the catalog is an index of files
-    // that may be on a drive that is not plugged in right now.
+    // A missing original is not fatal here, and neither is an unplugged
+    // source: the catalog is an index of files that may be on a drive that is
+    // not in the room. The stack is already recorded either way, and the next
+    // request with the drive attached renders it.
+    let original = match lib.photo_path(photo) {
+        Ok(p) => p,
+        Err(crate::error::Error::SourceOffline { .. }) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     if !original.exists() {
         return Ok(());
     }

@@ -183,6 +183,9 @@ pub fn album_metadata_bytes(lib: &Library, album_path: &str) -> Result<Vec<u8>> 
 enum Source {
     /// A catalogued original — absolute path of the file to read.
     Original(std::path::PathBuf),
+    /// A catalogued original whose source is not plugged in; carries the
+    /// source's name so the failure says what to do about it.
+    Offline(String),
     /// The metadata document, generated in memory.
     Metadata(Vec<u8>),
 }
@@ -215,8 +218,21 @@ fn local_full_side(
                 ));
                 continue;
             }
+            // A photograph on a drive that is not plugged in still belongs to
+            // the album, so it stays in the manifest — with the hash the
+            // catalog already holds, which is what the manifest is made of.
+            // Dropping the key would read to the planner as "this file is gone
+            // locally", and a push with deletions allowed would then take the
+            // client's original off the server because a cable was loose. The
+            // absence surfaces where it is real: at the read, as a named
+            // per-file failure.
+            let backing = match lib.photo_path(&photo) {
+                Ok(p) => Source::Original(p),
+                Err(Error::SourceOffline { name, .. }) => Source::Offline(name),
+                Err(e) => return Err(e),
+            };
             manifest.insert(key.clone(), photo.content_hash.clone());
-            sources.insert(key, Source::Original(lib.resolve(&photo.rel_path)?));
+            sources.insert(key, backing);
         }
         let bytes = album_metadata_bytes(lib, album)?;
         let key = full_key(album, METADATA_FILENAME);
@@ -263,6 +279,12 @@ pub(crate) fn push_full(
                         }
                     },
                     Some(Source::Metadata(b)) => b.clone(),
+                    Some(Source::Offline(name)) => {
+                        outcome
+                            .failed
+                            .push((key.clone(), format!("source '{name}' is not available")));
+                        continue;
+                    }
                     // A plan can only say Push for a key the local manifest
                     // holds, and every local key has a source.
                     None => continue,
@@ -334,6 +356,11 @@ pub(crate) fn foreign_push_full(
                         }
                     },
                     Some(Source::Metadata(b)) => b.clone(),
+                    Some(Source::Offline(name)) => {
+                        out.failed
+                            .push((key.clone(), format!("source '{name}' is not available")));
+                        continue;
+                    }
                     None => continue,
                 };
                 match transport.put(&key, &bytes) {
@@ -514,10 +541,15 @@ pub(crate) fn pull_full(
             .into_iter()
             .map(|p| p.filename)
             .collect();
+        // Only the primary source's rows. A pull writes into the library root,
+        // so that is where a newly arrived original is; a referenced photo on
+        // another drive may carry a rel_path that happens to look like this
+        // album's folder and is nothing of the kind.
+        let primary = lib.primary_source_id()?;
         let missing: Vec<i64> = lib
             .photos(&crate::model::PhotoFilter::default())?
             .into_iter()
-            .filter(|p| is_direct_child_of(album, &p.rel_path))
+            .filter(|p| p.source_id == primary && is_direct_child_of(album, &p.rel_path))
             .filter(|p| !members.contains(&p.filename))
             .map(|p| p.id)
             .collect();

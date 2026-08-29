@@ -235,6 +235,10 @@ pub struct XmpExportOutcome {
     /// Photos whose original is gone from disk, so there is nowhere sensible
     /// to put a sidecar.
     pub missing: Vec<String>,
+    /// Photos on a source that is not reachable right now. Nothing is wrong
+    /// with them; the drive is elsewhere, and the next export writes their
+    /// sidecars beside them. Each entry names the source.
+    pub offline: Vec<String>,
 }
 
 /// Render one sidecar packet.
@@ -389,7 +393,22 @@ impl crate::catalog::Library {
 
         let mut out = XmpExportOutcome::default();
         for photo in &photos {
-            let original = self.resolve(&photo.rel_path)?;
+            // A sidecar goes beside the original, wherever the original is —
+            // so a referenced photo's sidecar is written on its own drive, not
+            // gathered into the library. A drive that is not attached is named
+            // and skipped: one unplugged source must not abandon the export of
+            // everything else.
+            let original = match self.photo_path(photo) {
+                Ok(p) => p,
+                Err(crate::error::Error::SourceOffline { name, .. }) => {
+                    out.offline.push(format!(
+                        "{} (source '{name}' is not available)",
+                        photo.rel_path
+                    ));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if !original.exists() {
                 out.missing.push(photo.rel_path.clone());
                 continue;

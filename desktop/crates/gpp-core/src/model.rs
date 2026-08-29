@@ -116,12 +116,22 @@ pub struct Photo {
     /// another photograph used to hold. Nothing outside the catalog should
     /// persist an id — across runs, address a photo by `rel_path`.
     pub id: i64,
-    /// Path relative to the library root, always '/'-separated.
+    /// Path relative to **this photo's source**, always '/'-separated.
     ///
-    /// Unique in the catalog, and the reason importing a folder from outside the
-    /// library copies it in first: there is no way to express a photo that lives
-    /// somewhere else.
+    /// Unique within that source, not across the catalog: two cards registered
+    /// as two sources may both hold `DCIM/DSC_0001.jpg`, and they are two
+    /// photographs. Never join this onto the library root by hand — resolve it
+    /// with [`Library::photo_path`](crate::Library::photo_path), which knows
+    /// which root it belongs to and refuses when that root is not plugged in.
     pub rel_path: String,
+    /// Which registered source `rel_path` is relative to (schema v6).
+    ///
+    /// The library root is the *primary* source, and a library that has never
+    /// registered another has every row on it — which is why this defaults to
+    /// the primary's id when a `Photo` is deserialized from JSON written before
+    /// sources existed.
+    #[serde(default = "primary_source")]
+    pub source_id: i64,
     /// Last segment of `rel_path`. Duplicated out of it because it is what the
     /// gallery publishes as the file's name and what free-text search matches.
     pub filename: String,
@@ -187,6 +197,18 @@ pub struct Photo {
     /// changed file updates every other field and leaves this one, so it dates
     /// when the photograph entered the library, not when it was last touched.
     pub imported_at: String,
+}
+
+/// The primary source's id.
+///
+/// A constant rather than a lookup because it genuinely is one: `sources` is
+/// created empty by the v6 migration and the library root is the first row
+/// inserted into it, and the primary can never be removed — so the primary is
+/// row #1 in every catalog there is. It is used only as a serde default, for
+/// `Photo` JSON written before sources existed; the core itself always asks the
+/// catalog which row carries `is_primary`.
+fn primary_source() -> i64 {
+    1
 }
 
 impl Photo {
@@ -478,6 +500,15 @@ pub struct ImportSummary {
     /// other count is then a partial tally, so a caller that ignores this flag
     /// would announce a finished import that never finished.
     pub cancelled: bool,
+    /// Things worth saying that are not failures — above all, a registered
+    /// source that was not reachable and so was skipped.
+    ///
+    /// An unplugged drive is not an error: refusing to import the *rest* of the
+    /// library because one external source is out of the room would be the
+    /// wrong answer, and silently importing less than was asked for would be a
+    /// worse one. So the run carries on and says which sources it could not
+    /// see.
+    pub notes: Vec<String>,
 }
 
 #[cfg(test)]

@@ -481,9 +481,14 @@ fn pull_one(
         text: None,
         ..Default::default()
     })?;
+    // The primary source only: a pull lays its files down under the library
+    // root, and a referenced photo on another drive could carry a rel_path
+    // that reads like this album's folder while being an entirely different
+    // shoot on an entirely different disk.
+    let primary = lib.primary_source_id()?;
     let own: Vec<&crate::model::Photo> = photos
         .iter()
-        .filter(|p| is_direct_child(album_path, &p.rel_path))
+        .filter(|p| p.source_id == primary && is_direct_child(album_path, &p.rel_path))
         .collect();
 
     // A folder in the chain has no photos of its own, and asking to add none

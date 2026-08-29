@@ -52,6 +52,7 @@ fn run(args: &[String]) -> Result<()> {
         "sync" => cmd_sync(rest),
         "remote" => cmd_remote(rest),
         "remotes" => cmd_remotes(rest),
+        "sources" => cmd_sources(rest),
         "pull" => cmd_pull(rest),
         "push" => cmd_push(rest),
         "push-to" => cmd_push_to(rest),
@@ -92,7 +93,7 @@ fn positional(args: &[String]) -> Option<&str> {
                     | "--share-link" | "--no-share-link" | "--proofing" | "--no-proofing"
                     | "--allow-download" | "--metadata-only" | "--include-rejected"
                     | "--no-recursive" | "--bw" | "--no-bw" | "--flip-h" | "--flip-v"
-                    | "--reset" | "--show" | "--dry-run"
+                    | "--reset" | "--show" | "--dry-run" | "--drop-photos"
             );
             skip_next = takes_value;
             continue;
@@ -180,6 +181,12 @@ fn cmd_import(args: &[String]) -> Result<()> {
     );
     for (path, err) in &summary.failed {
         eprintln!("  failed: {path}: {err}");
+    }
+    // A registered source that is not attached is skipped, not failed — and a
+    // run that says nothing about it looks exactly like one that found nothing
+    // new there.
+    for note in &summary.notes {
+        eprintln!("  note: {note}");
     }
 
     // Catalogued but with no readable pixels — a corrupt file, or a RAW format
@@ -514,9 +521,13 @@ fn cmd_lr(args: &[String]) -> Result<()> {
                     r.file_count,
                     r.missing_files,
                     if r.in_place {
-                        "inside this library (imports in place)"
+                        "inside a source (imports in place)".to_string()
+                    } else if r.can_reference {
+                        "outside every source (copies in, or --mode reference \
+                         to catalogue it where it is)"
+                            .to_string()
                     } else {
-                        "outside this library (imports by copy)"
+                        "outside every source, and not a readable folder".to_string()
                     }
                 );
             }
@@ -550,6 +561,11 @@ fn cmd_lr(args: &[String]) -> Result<()> {
                     }
                     None => gpp_core::lightroom::MergePolicy::Auto,
                 },
+                mode: placement_from(rest)?,
+                // Per-root placement is a UI affordance (tick a box per root
+                // folder); on the command line `--mode` covers every root, and
+                // a root-by-root list would be unreadable as a flag.
+                roots: None,
                 dry_run: has(rest, "--dry-run"),
             };
 
@@ -570,13 +586,21 @@ fn cmd_lr(args: &[String]) -> Result<()> {
                 println!("dry run — nothing was written; this is what an import would do:");
             }
             println!(
-                "photos: {} copied ({} bytes) · {} in place · {} linked to existing · {} missing",
+                "photos: {} copied ({} bytes) · {} in place ({} referenced) · \
+                 {} linked to existing · {} missing",
                 report.photos_copied,
                 report.bytes_copied,
                 report.photos_in_place,
+                report.photos_referenced,
                 report.photos_linked_existing,
                 report.skipped_missing_files
             );
+            // Registering a source is a lasting change to the library — it is
+            // what makes those files findable next time — so never let it pass
+            // unremarked.
+            for s in &report.sources_registered {
+                println!("  registered as a source (nothing copied): {s}");
+            }
             println!(
                 "albums: {} created · {} updated · {} memberships · {} tag links",
                 report.albums_created,
@@ -642,6 +666,12 @@ fn cmd_publish(args: &[String]) -> Result<()> {
         );
         for m in &r.missing {
             println!("    missing: {m}");
+        }
+
+        // Not missing — on a drive that is not plugged in. The album is short
+        // until it is, and the next publish ships them.
+        for o in &r.offline {
+            eprintln!("    not published, source unavailable: {o}");
         }
 
         // A frame the developer could not render is left out of the album, and
@@ -888,6 +918,91 @@ fn cmd_remotes(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Chosen Lightroom placement: `--mode auto|in-place|copy|reference`.
+fn placement_from(args: &[String]) -> Result<gpp_core::lightroom::LrPlacement> {
+    use gpp_core::lightroom::LrPlacement;
+    match opt(args, "--mode") {
+        None | Some("auto") => Ok(LrPlacement::Auto),
+        Some("in-place") => Ok(LrPlacement::InPlace),
+        Some("copy") => Ok(LrPlacement::Copy),
+        Some("reference") => Ok(LrPlacement::Reference),
+        Some(other) => Err(gpp_core::Error::other(format!(
+            "--mode wants auto, in-place, copy or reference, not '{other}'"
+        ))),
+    }
+}
+
+/// `gpp sources` — the roots photographs may live under.
+///
+/// Registering one is what makes "import without moving my files" possible:
+/// afterwards an import of that folder catalogues it where it lies. Nothing
+/// here ever writes to, moves or deletes a photograph.
+fn cmd_sources(args: &[String]) -> Result<()> {
+    let lib = open_library(args)?;
+    let rest = if args.is_empty() { args } else { &args[1..] };
+
+    match args.first().map(|s| s.as_str()) {
+        Some("add") => {
+            let path = opt(args, "--path")
+                .or_else(|| positional(rest))
+                .ok_or_else(|| {
+                    gpp_core::Error::other(
+                        "usage: gpp sources add <folder> [--name N] [--kind internal|external|network]",
+                    )
+                })?;
+            let kind = match opt(args, "--kind") {
+                None => None,
+                Some("internal") => Some(gpp_core::SourceKind::Internal),
+                Some("external") => Some(gpp_core::SourceKind::External),
+                Some("network") => Some(gpp_core::SourceKind::Network),
+                Some(other) => {
+                    return Err(gpp_core::Error::other(format!(
+                        "--kind wants internal, external or network, not '{other}'"
+                    )))
+                }
+            };
+            let id = lib.add_source(Path::new(path), opt(args, "--name"), kind)?;
+            println!("added source #{id} -> {path}");
+            println!("nothing was catalogued — run:  gpp import {path}");
+        }
+        Some("rm") => {
+            let id: i64 = positional(rest)
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| {
+                    gpp_core::Error::other("usage: gpp sources rm <id> [--drop-photos]")
+                })?;
+            let dropped = lib.remove_source(id, has(args, "--drop-photos"))?;
+            println!("removed source #{id} — {dropped} catalog row(s) dropped, no files touched");
+        }
+        Some("relocate") => {
+            let id: i64 = positional(rest)
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| {
+                    gpp_core::Error::other("usage: gpp sources relocate <id> --to <folder>")
+                })?;
+            let to = opt(args, "--to")
+                .ok_or_else(|| gpp_core::Error::other("--to <folder> is required"))?;
+            lib.relocate_source(id, Path::new(to))?;
+            println!("source #{id} now at {to}");
+        }
+        _ => {
+            for s in lib.sources()? {
+                println!(
+                    "{:>3}  {:<20} {:<10} {:>6} photos  {:<8} {}",
+                    s.id,
+                    s.name,
+                    if s.is_primary { "primary" } else { "referenced" },
+                    s.photo_count,
+                    if s.online { "online" } else { "OFFLINE" },
+                    s.path,
+                );
+            }
+            println!("\nAdd one with:  gpp sources add <folder> --name N");
+        }
+    }
+    Ok(())
+}
+
 /// `gpp push-to` — stateless push to an arbitrary remote (typically another
 /// library's, listed with `gpp remotes --of <root>`). Never deletes; names
 /// every overwrite.
@@ -962,6 +1077,9 @@ fn cmd_xmp(args: &[String]) -> Result<()> {
     }
     for m in &outcome.missing {
         println!("  original missing, no sidecar written: {m}");
+    }
+    for o in &outcome.offline {
+        println!("  source unavailable, no sidecar written: {o}");
     }
     Ok(())
 }
@@ -1153,6 +1271,18 @@ COMMANDS
   init [path]                     Create/open a library
   import [dir] [--force]          Scan, hash, extract metadata, build thumbnails
                                   [--no-thumbs] [--no-recursive]
+                                  A dir inside a registered source is catalogued
+                                  where it lies; one outside every source is
+                                  copied in. With no dir: every source in turn.
+
+  sources                         Roots photographs may live under
+  sources add <folder> [--name N] [--kind internal|external|network]
+                                  Register a folder: its photographs are
+                                  catalogued where they are, never copied
+  sources rm <id> [--drop-photos] Forget a source (never deletes a file)
+  sources relocate <id> --to <folder>
+                                  The drive moved. Validated by re-hashing a
+                                  few of that source's own files at the new path
   ls [filters]                    List photos
                                   [--min-rating N] [--flag pick|reject]
                                   [--album PATH] [--camera NAME] [--search TEXT]
@@ -1184,10 +1314,16 @@ COMMANDS
   lr scan <catalog.lrcat>         Look inside a Lightroom Classic catalog:
                                   root folders (copy vs in-place), collections,
                                   keywords, missing files. Writes nothing.
-  lr import <catalog.lrcat>       Import it: photos copied in (or catalogued in
-                                  place when already under the library root),
-                                  collections -> albums, keywords -> tags.
-                                  Idempotent: re-running syncs, never duplicates.
+  lr import <catalog.lrcat>       Import it: collections -> albums, keywords ->
+                                  tags. Idempotent: re-running syncs, never
+                                  duplicates.
+                                  [--mode auto|in-place|copy|reference]
+                                    auto      (default) in place where the root
+                                              already sits in a source, else copy
+                                    reference register each outside root as a
+                                              source and catalogue it where it
+                                              is — nothing copied, nothing moved
+                                    copy      always copy into the library
                                   [--dry-run] [--collections a,b/*] [--prefix p]
                                   [--dest-subdir d] [--collision merge|suffix]
 

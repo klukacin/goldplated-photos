@@ -45,7 +45,12 @@ shipped app switches on:
 
 | from the core | from this boundary |
 |---|---|
-| `database`, `io`, `image`, `serde`, `invalid-path`, `album-not-found`, `photo-not-found`, `album-exists`, `unsupported`, `sync-conflict`, `other` | `null-pointer`, `invalid-utf8`, `bad-arguments`, `unknown-method`, `panic` |
+| `database`, `io`, `image`, `serde`, `invalid-path`, `album-not-found`, `photo-not-found`, `album-exists`, `unsupported`, `source-offline`, `source-mismatch`, `sync-conflict`, `other` | `null-pointer`, `invalid-utf8`, `bad-arguments`, `unknown-method`, `panic` |
+
+`source-offline` is the one worth branching on rather than only showing: it
+means a registered drive is not attached, nothing is wrong with the library, and
+the remedy — plug it in — is something the person reading can act on. Its
+message names the source.
 
 ---
 
@@ -228,9 +233,19 @@ omitted; a call with no arguments accepts `NULL`, `""` or `"{}"`.
 
 | Method | Arguments | Returns |
 |---|---|---|
-| `import` | `dir` *(optional; defaults to the library root)* | `ImportSummary` |
+| `import` | `dir` *(optional; omit to walk every registered source)* | `ImportSummary` |
 | `cancel_import` | — | `null` |
 | `prune` | — | `int` — catalog rows dropped because the file is gone |
+
+A `dir` inside a registered source (see below) is catalogued **where it lies**;
+one outside every source is copied into the library first, because a catalog row
+has no way to name a file no source reaches. Omit `dir` and the run walks the
+primary and every referenced source in turn, skipping any whose drive is not
+attached — those are named in `ImportSummary.notes`, never raised as errors.
+
+`prune` only examines sources that are online. A photograph on an unplugged
+drive is exactly as present as it was yesterday, and dropping its row would take
+its rating, flags, album memberships and adjustments with it.
 
 `import` blocks for as long as the card takes. `cancel_import` is the one call
 worth making while another is still running: it raises a flag the import reads
@@ -242,19 +257,78 @@ had already landed stays landed, and importing the same folder again finishes
 the job. Calling it when nothing is running is harmless: the next `import`
 clears the flag before it reads a file.
 
+### Sources (schema v6)
+
+A **source** is a root a catalogued photograph may live under. The library root
+is one — the *primary* — and any folder registered here is another; files there
+are **referenced**: read, hashed, thumbnailed, developed and published, never
+copied, never moved, never written to. That is what makes a Lightroom library
+importable without migrating a terabyte.
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `sources` | — | `[SourceInfo]` (`id`, `name`, `path`, `kind`, `volume_hint`, `is_primary`, `online`, `photo_count`) |
+| `add_source` | `path`, `name` *(optional; defaults to the folder's own name)*, `kind` *(optional: `"internal"` \| `"external"` (default) \| `"network"`)* | `id` |
+| `remove_source` | `id`, `drop_photos` *(optional, default `false`)* | `int` — catalog rows dropped. **Never deletes a file.** |
+| `relocate_source` | `id`, `new_path` | `null` |
+
+`online` is probed at the moment of the call, never cached — that is the whole
+question a drive that comes and goes asks. Offline, listing and thumbnails keep
+working (thumbnails are content-addressed and live on the primary), while
+anything that must open an original fails with the `source-offline` tag and a
+message naming the source; batch operations report those per item instead
+(`PublishResult.offline`, `XmpExportOutcome.offline`, `PushOutcome.failed`).
+
+`add_source` refuses a folder that overlaps one already registered, in either
+direction — including the library root. Two roots over one file would give it
+two identities, and then a prune, a publish and a sync each disagree about what
+the library holds.
+
+`remove_source` refuses a source that still holds catalog rows unless
+`drop_photos` says so in as many words: those rows carry ratings, flags, album
+memberships and develop stacks that exist nowhere else. The primary cannot be
+removed or relocated — it is where the catalog and every thumbnail live.
+
+`relocate_source` is for a drive that mounted somewhere else. It re-hashes a
+handful of that source's own catalogued files at the new path and refuses, with
+the `source-mismatch` tag and the offending filename, if they are not there or
+differ. Pointing a source at last year's backup would otherwise re-attach every
+row to the wrong negatives, quietly.
+
 ### Lightroom
 
 | Method | Arguments | Returns |
 |---|---|---|
-| `lr_scan` | `lrcat_path` | `LrScanReport` — root folders (with per-folder in-place/copy verdicts and missing-file counts), collections, keyword count, catalog id. Writes nothing. |
+| `lr_scan` | `lrcat_path` | `LrScanReport` — root folders (with per-folder `in_place` / `can_reference` verdicts and missing-file counts), collections, keyword count, catalog id. Writes nothing. |
 | `lr_import` | `lrcat_path`, `options` *(optional `LrImportOptions`)* | `LrImportReport` |
 
 `LrImportOptions` is snake_case like the rest of this door: `dest_subdir`
 (where copied files land, default `"lr"`), `collections` (paths or `*` globs
 narrowing which collections map to albums; photos import regardless),
 `album_prefix`, `collision` (`"auto"` \| `"merge"` \| `"suffix"` — what to do
-when a collection's album path is already taken by an unlinked album), and
-`dry_run` (compute the full report, write nothing).
+when a collection's album path is already taken by an unlinked album),
+`dry_run` (compute the full report, write nothing), and the placement pair
+below.
+
+**Placement.** `mode` says where each root folder's files end up:
+
+| `mode` | Meaning |
+|---|---|
+| `"auto"` (default) | In place where the root already lies inside a source; copy in otherwise. What every import did before referencing existed. |
+| `"reference"` | Register the root folder as a source (named after it) and catalogue its files where they lie. **Nothing is copied.** |
+| `"in-place"` | Catalogue where the files are; on a root outside every source this registers one and says so in `conflicts`. |
+| `"copy"` | Always copy into the library under `dest_subdir`. |
+
+`roots` overrides `mode` per root folder: `[{"root_id": 2, "mode": "copy"}]`,
+where `root_id` is the `AgLibraryRootFolder` id `lr_scan` reports. A
+photographer keeps this year on the laptop and eight years on a NAS; those are
+two answers, not one.
+
+`LrImportReport` gains `photos_referenced` (the subset of `photos_in_place`
+that landed on a source other than the library root — the number that answers
+"how much did I import without copying a byte") and `sources_registered`. A
+root that cannot become a source (it contains the library, or another source)
+falls back to copying, with the reason in `conflicts`.
 
 The `.lrcat` is copied under the library's `.gpp` directory and only the copy
 is read — Lightroom can stay open, and the original is never touched. Both
@@ -384,12 +458,15 @@ run again — see `dev-docs/sync.md`.
 
 | Method | Arguments | Returns |
 |---|---|---|
-| `export_xmp` | `album_path` *(optional; omit for the whole catalog)* | `XmpExportOutcome` (`written`, `skipped_foreign`, `missing`) |
+| `export_xmp` | `album_path` *(optional; omit for the whole catalog)* | `XmpExportOutcome` (`written`, `skipped_foreign`, `missing`, `offline`) |
 
 Sidecars carry `xmp:Rating`, `xmp:Label`, `dc:subject`, `tiff:Orientation` —
 the fields every serious tool reads — plus the develop stack verbatim under
 the versioned `gpp:` namespace. A sidecar without that namespace belongs to
-another tool and is never overwritten.
+another tool and is never overwritten. Each one is written **beside its own
+original**, so a referenced photograph's sidecar lands on its own drive rather
+than being gathered into the library; a source that is not attached is named in
+`offline` and nothing is written for it.
 
 The Rust-side list is `gpp_ffi::METHODS`, and a test asserts that every name in
 it dispatches.

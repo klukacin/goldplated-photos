@@ -178,6 +178,13 @@ pub struct PublishResult {
     /// Catalogued photos no decoder could read, so they were not shipped: on
     /// the site they would be broken images.
     pub unrenderable: Vec<String>,
+    /// Catalogued photos whose *source* is not reachable — a referenced drive
+    /// that is not plugged in. Kept apart from
+    /// [`missing`](Self::missing) deliberately: nothing is lost, the album is
+    /// simply short until the drive is attached, and the next publish ships
+    /// them. Each entry names the source, because that is the whole of the
+    /// remedy.
+    pub offline: Vec<String>,
     /// Files removed from the published folder because this album no longer
     /// publishes them. Only ever files this library put there itself.
     pub removed: Vec<String>,
@@ -296,7 +303,22 @@ pub fn publish_album_for(
 
             // What ships is the developed photo. With no adjustments this is the
             // original file itself — no copy, no render, nothing cached.
-            let original = lib.resolve(&photo.rel_path)?;
+            //
+            // A photograph on a source that is not plugged in is named and
+            // stepped over, exactly as a missing original is: one unplugged
+            // drive must not stop an album of four hundred, and calling it
+            // "missing" would send the photographer looking for a file that is
+            // perfectly safe on a disk in the other room.
+            let original = match lib.photo_path(photo) {
+                Ok(p) => p,
+                Err(Error::SourceOffline { name, .. }) => {
+                    result
+                        .offline
+                        .push(format!("{} (source '{name}' is not available)", photo.rel_path));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let src = match crate::develop::ensure_rendered(
                 &original,
                 &lib.thumb_dir(),
@@ -1446,7 +1468,7 @@ mod parse_tests {
         };
         let photos = vec![
             Photo {
-                id: 1, rel_path: "x/a.jpg".into(), filename: "a.jpg".into(),
+                id: 1, source_id: 1, rel_path: "x/a.jpg".into(), filename: "a.jpg".into(),
                 content_hash: "h".into(), file_size: 1, mtime_ms: 0,
                 kind: crate::model::PhotoKind::Photo, width: None, height: None,
                 orientation: None, captured_at: None, camera_make: None,

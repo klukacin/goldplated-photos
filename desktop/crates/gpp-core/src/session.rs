@@ -143,7 +143,12 @@ impl Session {
 
     // ------------------------------------------------------------- import
 
-    /// Import a folder, or the whole library when `dir` is `None`.
+    /// Import a folder, or every registered source when `dir` is `None`.
+    ///
+    /// A folder inside a source is catalogued where it lies; one outside every
+    /// source is copied into the library first. With no folder named, this
+    /// walks the primary and every referenced source in turn — skipping, with a
+    /// note in [`ImportSummary::notes`], any whose drive is not attached.
     ///
     /// Stoppable: [`Session::cancel_import`] ends the run at the next file and
     /// sets `cancelled` on the summary.
@@ -158,18 +163,75 @@ impl Session {
         self.import_cancel.store(false, Ordering::SeqCst);
 
         self.with(|lib| {
-            let target = match &dir {
-                Some(d) => PathBuf::from(d),
-                None => lib.root().to_path_buf(),
-            };
-            import_dir(
-                lib,
-                &target,
-                &ImportOptions::default(),
-                on_progress,
-                Some(&|| self.import_cancel.load(Ordering::SeqCst)),
-            )
+            match &dir {
+                Some(d) => import_dir(
+                    lib,
+                    &PathBuf::from(d),
+                    &ImportOptions::default(),
+                    on_progress,
+                    Some(&|| self.import_cancel.load(Ordering::SeqCst)),
+                ),
+                None => crate::import::import_all_sources(
+                    lib,
+                    &ImportOptions::default(),
+                    on_progress,
+                    Some(&|| self.import_cancel.load(Ordering::SeqCst)),
+                ),
+            }
         })
+    }
+
+    // ------------------------------------------------------------- sources
+
+    /// Every root photographs may live under: the library itself, plus any
+    /// folder registered with [`add_source`](Self::add_source).
+    ///
+    /// `online` is probed at the moment of the call — that is the whole
+    /// question a drive that comes and goes asks — and `photo_count` is what
+    /// the catalog holds on each, so a UI can say "1 842 photographs on
+    /// Archive 2019, not available" rather than showing an empty grid.
+    pub fn sources(&self) -> Result<Vec<crate::sources::SourceInfo>> {
+        self.with(|lib| lib.sources())
+    }
+
+    /// Register a folder as a source: photographs there are catalogued where
+    /// they lie, never copied and never moved.
+    ///
+    /// This is what makes a Lightroom library importable without migrating a
+    /// terabyte. Nothing is catalogued by registering — run an import on the
+    /// folder afterwards, and it will be taken in place.
+    ///
+    /// Refused when the folder overlaps a source that already exists, in either
+    /// direction: two roots over one file give it two identities, and then a
+    /// prune, a publish and a sync each disagree about what the library holds.
+    pub fn add_source(
+        &self,
+        path: String,
+        name: Option<String>,
+        kind: Option<crate::sources::SourceKind>,
+    ) -> Result<i64> {
+        self.with(|lib| lib.add_source(Path::new(&path), name.as_deref(), kind))
+    }
+
+    /// Forget a source. **Never deletes a file.**
+    ///
+    /// `drop_photos` has to be answered: with `false`, a source that still
+    /// holds catalog rows is refused rather than silently taking their ratings,
+    /// flags, album memberships and adjustments with it. Returns how many rows
+    /// were dropped.
+    pub fn remove_source(&self, id: i64, drop_photos: bool) -> Result<usize> {
+        self.with(|lib| lib.remove_source(id, drop_photos))
+    }
+
+    /// Point a source at the folder it lives in now — a drive that mounted
+    /// somewhere else, a share that moved.
+    ///
+    /// Validated by re-hashing a handful of that source's own catalogued files
+    /// at the new path: a folder that does not hold them is refused by name,
+    /// and nothing changes. Pointing a source at last year's backup would
+    /// otherwise re-attach every row to the wrong negatives, quietly.
+    pub fn relocate_source(&self, id: i64, new_path: String) -> Result<()> {
+        self.with(|lib| lib.relocate_source(id, Path::new(&new_path)))
     }
 
     /// Ask the running import to stop. Harmless when none is running: the next
@@ -233,10 +295,15 @@ impl Session {
     }
 
     /// Absolute path of a photo — the shell turns this into an asset URL.
+    ///
+    /// Resolved through the photo's source, so a referenced frame answers with
+    /// its own drive's path. A source that is not attached fails with
+    /// [`Error::SourceOffline`] naming it, rather than handing back a path that
+    /// is not there for a reason nobody can see.
     pub fn photo_path(&self, id: i64) -> Result<String> {
         self.with(|lib| {
             let photo = lib.photo_by_id(id)?;
-            Ok(lib.resolve(&photo.rel_path)?.display().to_string())
+            Ok(lib.photo_path(&photo)?.display().to_string())
         })
     }
 
@@ -251,15 +318,19 @@ impl Session {
         })
     }
 
-    /// Directories the shell must let the webview read images from: the library
-    /// itself and its thumbnail cache. The cache is separate because it lives in
-    /// a dot-directory, which path globs skip.
+    /// Directories the shell must let the webview read images from: every
+    /// source's root and the thumbnail cache. The cache is separate because it
+    /// lives in a dot-directory, which path globs skip.
+    ///
+    /// Referenced sources are in the list because their originals are real
+    /// files the lightbox opens at full size; leaving one out shows a
+    /// photographer a blank frame with no error anywhere.
     pub fn image_dirs(&self) -> Result<Vec<String>> {
         self.with(|lib| {
-            Ok(vec![
-                lib.root().display().to_string(),
-                lib.thumb_dir().display().to_string(),
-            ])
+            let mut dirs: Vec<String> =
+                lib.sources()?.into_iter().map(|s| s.path).collect();
+            dirs.push(lib.thumb_dir().display().to_string());
+            Ok(dirs)
         })
     }
 

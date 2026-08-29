@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::{Error, Result};
 use crate::model::{Album, Flag, Photo, PhotoFilter, PhotoKind, PhotoSort};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The schema version, visible to the crate — `remotes::read_library_remotes`
 /// refuses a foreign catalog from a newer build by name, same as [`migrate`].
@@ -45,8 +45,9 @@ impl Library {
 
         let conn = Connection::open(gpp.join("catalog.db"))?;
         Self::configure(&conn)?;
-        migrate(&conn)?;
+        migrate(&conn, &root)?;
         ensure_library_id(&conn)?;
+        refresh_primary_source(&conn, &root)?;
 
         Ok(Self {
             root,
@@ -56,12 +57,14 @@ impl Library {
 
     /// Open an in-memory catalog rooted at `root` — used by tests.
     pub fn open_in_memory(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
-        migrate(&conn)?;
+        migrate(&conn, &root)?;
         ensure_library_id(&conn)?;
+        refresh_primary_source(&conn, &root)?;
         Ok(Self {
-            root: root.as_ref().to_path_buf(),
+            root,
             conn: Mutex::new(conn),
         })
     }
@@ -110,26 +113,45 @@ impl Library {
         self.gpp_dir().join("thumbs")
     }
 
-    /// Resolve a library-relative path, refusing anything that escapes the root.
+    /// Resolve a path relative to the **primary** source — the library root.
+    ///
+    /// This is where albums live: a pulled album's folder, a copy-in
+    /// destination, anything the library itself lays out. A *photo* is not
+    /// necessarily here — since schema v6 a catalog row carries the source it
+    /// belongs to — so resolve one with [`photo_path`](Self::photo_path)
+    /// rather than by handing its `rel_path` to this.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf> {
-        if rel.is_empty() {
-            return Ok(self.root.clone());
+        resolve_under(&self.root, rel)
+    }
+
+    /// Resolve a path relative to one registered source.
+    ///
+    /// Pure path arithmetic plus the same escape refusal `resolve` applies —
+    /// a `rel_path` may not climb out of *its own* source — and it answers
+    /// whether the source is plugged in or not, because a path is still a
+    /// path. Use [`photo_path`](Self::photo_path) when the answer is going to
+    /// be opened.
+    pub fn resolve_in_source(&self, source_id: i64, rel: &str) -> Result<PathBuf> {
+        resolve_under(&self.source_root(source_id)?, rel)
+    }
+
+    /// Absolute path of one catalogued photo, through the source it belongs to.
+    ///
+    /// **The single accessor**: every part of the app that opens, copies,
+    /// renders or publishes a photograph goes through this, so a referenced
+    /// file on an external drive is reached exactly the way a file under the
+    /// library root is. A source that is not currently reachable fails with
+    /// [`Error::SourceOffline`] rather than handing back a path that is
+    /// missing for a reason nobody can see.
+    pub fn photo_path(&self, photo: &Photo) -> Result<PathBuf> {
+        let source = self.source_row(photo.source_id)?;
+        if !source.is_online() {
+            return Err(Error::SourceOffline {
+                name: source.name,
+                path: source.path.display().to_string(),
+            });
         }
-        if rel.contains('\0') || rel.starts_with('/') || rel.starts_with('\\') {
-            return Err(Error::InvalidPath(rel.to_string()));
-        }
-        let mut out = self.root.clone();
-        for segment in rel.split('/') {
-            match segment {
-                "" | "." => continue,
-                ".." => return Err(Error::InvalidPath(rel.to_string())),
-                s => out.push(s),
-            }
-        }
-        if !out.starts_with(&self.root) {
-            return Err(Error::InvalidPath(rel.to_string()));
-        }
-        Ok(out)
+        resolve_under(&source.path, &photo.rel_path)
     }
 
     /// Run a closure with the connection. Kept crate-visible so other modules
@@ -183,19 +205,37 @@ impl Library {
         })
     }
 
-    /// Look a photo up by its library-relative path. `Ok(None)` is an answer,
-    /// not a failure: this is how callers ask whether the library knows a file
-    /// at all.
+    /// Look a photo up by its path under the **primary** source — the library
+    /// root. `Ok(None)` is an answer, not a failure: this is how callers ask
+    /// whether the library knows a file at all.
     ///
     /// The path must be exactly as stored — '/'-separated, relative to the root,
     /// no normalisation is done here — so a Windows caller holding a `\`-path has
     /// to convert before asking or it will be told, wrongly, that the photograph
     /// is not in the library.
+    ///
+    /// Scoped to the primary because that is what every caller means: a pulled
+    /// album's folder, an album directory, a file this machine laid down. The
+    /// same relative path may name a different photograph under another source,
+    /// so ask for that one with
+    /// [`photo_by_source_rel_path`](Self::photo_by_source_rel_path).
     pub fn photo_by_rel_path(&self, rel_path: &str) -> Result<Option<Photo>> {
+        self.photo_by_source_rel_path(self.primary_source_id()?, rel_path)
+    }
+
+    /// Look a photo up by source and path — the general form of
+    /// [`photo_by_rel_path`](Self::photo_by_rel_path).
+    pub fn photo_by_source_rel_path(
+        &self,
+        source_id: i64,
+        rel_path: &str,
+    ) -> Result<Option<Photo>> {
         self.with_conn(|c| {
             Ok(c.query_row(
-                &format!("SELECT {PHOTO_COLS} FROM photos WHERE rel_path = ?1"),
-                params![rel_path],
+                &format!(
+                    "SELECT {PHOTO_COLS} FROM photos WHERE source_id = ?1 AND rel_path = ?2"
+                ),
+                params![source_id, rel_path],
                 photo_from_row,
             )
             .optional()?)
@@ -391,10 +431,19 @@ impl Library {
     }
 
     /// Remove catalog entries whose files no longer exist on disk.
+    ///
+    /// **An offline source is not a missing file.** A photo on an external
+    /// drive that is not plugged in is exactly as present as it was yesterday;
+    /// pruning it would throw away its rating, its flags, its album
+    /// memberships and its develop stack because a cable was loose. So only
+    /// sources that are reachable right now are examined, and a row whose
+    /// source cannot be identified at all is left alone too — this deletes,
+    /// and a delete needs a reason it is sure of.
     pub fn prune_missing(&self) -> Result<usize> {
-        let all: Vec<(i64, String)> = self.with_conn(|c| {
-            let mut stmt = c.prepare("SELECT id, rel_path FROM photos")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let roots = self.source_roots()?;
+        let all: Vec<(i64, i64, String)> = self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT id, source_id, rel_path FROM photos")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -404,11 +453,19 @@ impl Library {
 
         let missing: Vec<i64> = all
             .into_iter()
-            .filter(|(_, rel)| match self.resolve(rel) {
-                Ok(abs) => !abs.exists(),
-                Err(_) => true,
+            .filter(|(_, source_id, rel)| {
+                let Some(root) = roots.get(source_id) else {
+                    return false; // unknown source: not our row to delete
+                };
+                if !root.is_dir() {
+                    return false; // offline: absent from this machine, not gone
+                }
+                match resolve_under(root, rel) {
+                    Ok(abs) => !abs.exists(),
+                    Err(_) => true,
+                }
             })
-            .map(|(id, _)| id)
+            .map(|(id, _, _)| id)
             .collect();
 
         if missing.is_empty() {
@@ -478,6 +535,33 @@ impl Library {
     }
 }
 
+/// Join `rel` onto `root`, refusing anything that escapes it.
+///
+/// The refusal is the security boundary: `..`, an absolute path, a NUL or a
+/// backslash never become a file operation, whichever root they were offered
+/// against. Extracted from `Library::resolve` when sources arrived, so that
+/// every source enforces the same rule rather than only the library root.
+pub(crate) fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    if rel.contains('\0') || rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(Error::InvalidPath(rel.to_string()));
+    }
+    let mut out = root.to_path_buf();
+    for segment in rel.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return Err(Error::InvalidPath(rel.to_string())),
+            s => out.push(s),
+        }
+    }
+    if !out.starts_with(root) {
+        return Err(Error::InvalidPath(rel.to_string()));
+    }
+    Ok(out)
+}
+
 /// Quote the LIKE wildcards out of a free-text search term.
 ///
 /// `_` matches any single character and `%` any run of them, and `_` is in the
@@ -499,7 +583,23 @@ fn like_literal(text: &str) -> String {
 
 // -------------------------------------------------------------------- schema
 
-fn migrate(conn: &Connection) -> Result<()> {
+fn migrate(conn: &Connection, root: &Path) -> Result<()> {
+    // Foreign keys off for the duration, and only for it.
+    //
+    // v6 rebuilds `photos` — the one table half the schema points at — and
+    // with foreign keys on, `DROP TABLE photos` runs an implicit DELETE that
+    // cascades every album membership and every edit stack into oblivion
+    // before the new table is renamed into place. The pragma is a no-op inside
+    // a transaction, so it is set around the whole thing here and restored
+    // before anything else can touch the catalog. This is SQLite's own
+    // documented procedure for altering a referenced table.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = migrate_inner(conn, root);
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result
+}
+
+fn migrate_inner(conn: &Connection, root: &Path) -> Result<()> {
     // One transaction for the whole thing. SQLite makes DDL transactional, so a
     // catalog either arrives at the new schema or stays exactly where it was.
     // Run step by step in autocommit — which is what this did — a laptop closed
@@ -523,6 +623,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V3)?;
             tx.execute_batch(SCHEMA_V4)?;
             apply_v5(&tx)?;
+            apply_v6(&tx, root)?;
             tx.execute(
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
@@ -555,6 +656,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
             if v < 5 {
                 apply_v5(&tx)?;
+            }
+            if v < 6 {
+                apply_v6(&tx, root)?;
             }
             if v < SCHEMA_VERSION {
                 tx.execute(
@@ -905,6 +1009,188 @@ fn apply_v5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6 — sources: photos that live outside the library root.
+///
+/// Until now a `rel_path` was relative to the one folder the photographer
+/// chose, and importing anything from elsewhere had to copy it in. A **source**
+/// is a root a photo may live under; the library root becomes source #1, the
+/// *primary*, and `photos.rel_path` becomes relative to whichever source its
+/// row names. That is what makes a Lightroom import without file migration
+/// possible: the LR root folder is registered as a source and its files are
+/// catalogued where they lie.
+///
+/// `.gpp/` — catalog, thumbnails, render cache — stays on the primary, and
+/// only the primary receives copy-in imports and pulls: a referenced source is
+/// a place photographs *are*, never a place this app puts things.
+const SCHEMA_V6_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS sources (
+  id          INTEGER PRIMARY KEY,
+  name        TEXT    NOT NULL,
+  path        TEXT    NOT NULL UNIQUE,
+  kind        TEXT    NOT NULL
+              CHECK (kind IN ('primary','internal','external','network')),
+  volume_hint TEXT,
+  is_primary  INTEGER NOT NULL DEFAULT 0,
+  added_at    TEXT
+);
+-- Exactly one primary, enforced by the schema rather than by everyone
+-- remembering: the primary is where .gpp lives, and two of them is a library
+-- with two catalogs' worth of derived data and no way to say which is real.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_one_primary
+  ON sources(is_primary) WHERE is_primary = 1;
+"#;
+
+/// The `photos` table as v6 shapes it: a `source_id`, and a `rel_path` that is
+/// unique only *within* its source. Two cards can hold `DCIM/DSC_0001.jpg`
+/// under two different roots and both belong in the catalog.
+const SCHEMA_V6_PHOTOS: &str = r#"
+CREATE TABLE photos_v6 (
+  id            INTEGER PRIMARY KEY,
+  source_id     INTEGER NOT NULL DEFAULT 1 REFERENCES sources(id),
+  rel_path      TEXT    NOT NULL,
+  filename      TEXT    NOT NULL,
+  content_hash  TEXT    NOT NULL,
+  file_size     INTEGER NOT NULL,
+  mtime_ms      INTEGER NOT NULL,
+  kind          TEXT    NOT NULL DEFAULT 'photo',
+  width         INTEGER,
+  height        INTEGER,
+  orientation   INTEGER,
+  captured_at   TEXT,
+  camera_make   TEXT,
+  camera_model  TEXT,
+  lens          TEXT,
+  iso           INTEGER,
+  aperture      REAL,
+  shutter       REAL,
+  focal_length  REAL,
+  rating        INTEGER NOT NULL DEFAULT 0,
+  flag          TEXT    NOT NULL DEFAULT 'none',
+  color_label   TEXT,
+  blur_lqip     TEXT,
+  imported_at   TEXT    NOT NULL,
+  UNIQUE(source_id, rel_path)
+);
+"#;
+
+/// Rebuild the photo indexes the v1 schema declared inline.
+const SCHEMA_V6_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_photos_hash     ON photos(content_hash);
+CREATE INDEX IF NOT EXISTS idx_photos_rating   ON photos(rating);
+CREATE INDEX IF NOT EXISTS idx_photos_captured ON photos(captured_at);
+CREATE INDEX IF NOT EXISTS idx_photos_camera   ON photos(camera_model);
+CREATE INDEX IF NOT EXISTS idx_photos_kind     ON photos(kind);
+CREATE INDEX IF NOT EXISTS idx_photos_source   ON photos(source_id);
+"#;
+
+/// The v6 migration: register the library root as the primary source, then
+/// re-key every existing photo onto it.
+///
+/// Every row keeps its `rel_path` **verbatim** — the primary source's root is
+/// the library root, so the paths already mean what they meant. A single-source
+/// library therefore behaves after this migration exactly as it did before,
+/// which is what the existing test suite is the proof of.
+///
+/// Runs inside the caller's transaction, with foreign keys off (see
+/// [`migrate`]): `photos` is rebuilt to drop the old `UNIQUE(rel_path)`, and
+/// half the schema references it.
+fn apply_v6(conn: &Connection, root: &Path) -> Result<()> {
+    conn.execute_batch(SCHEMA_V6_TABLES)?;
+
+    // The library root becomes source #1. Named after its folder, because that
+    // is the word the photographer already uses for it.
+    let primary: Option<i64> = conn
+        .query_row("SELECT id FROM sources WHERE is_primary = 1", [], |r| r.get(0))
+        .optional()?;
+    let primary = match primary {
+        Some(id) => id,
+        None => {
+            conn.execute(
+                "INSERT INTO sources(name, path, kind, is_primary, added_at) \
+                 VALUES(?1, ?2, 'primary', 1, ?3)",
+                params![
+                    root_display_name(root),
+                    root.display().to_string(),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    if table_has_column(conn, "photos", "source_id")? {
+        return Ok(());
+    }
+
+    conn.execute_batch(SCHEMA_V6_PHOTOS)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO photos_v6(source_id, {V5_PHOTO_COLS}) SELECT ?1, {V5_PHOTO_COLS} FROM photos"
+        ),
+        params![primary],
+    )?;
+    conn.execute_batch("DROP TABLE photos; ALTER TABLE photos_v6 RENAME TO photos;")?;
+    conn.execute_batch(SCHEMA_V6_INDEXES)?;
+    Ok(())
+}
+
+/// The v5 photo columns, in order — what the v6 rebuild carries across. Spelled
+/// out rather than derived from [`PHOTO_COLS`], which now has `source_id` in it
+/// and would make the copy select a column the old table does not have.
+const V5_PHOTO_COLS: &str = "id, rel_path, filename, content_hash, file_size, mtime_ms, kind, \
+     width, height, orientation, captured_at, camera_make, camera_model, lens, iso, \
+     aperture, shutter, focal_length, rating, flag, color_label, blur_lqip, imported_at";
+
+/// A display name for a root folder: its last segment, or the whole path when
+/// it has none (a drive root, `/`).
+pub(crate) fn root_display_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// Keep the primary source row pointing at the root this library was opened
+/// from.
+///
+/// The stored path is what `sources()` shows and what a person recognises; the
+/// root itself is whatever the caller opened, canonicalized. A library carried
+/// to another machine — a different mount point, a different drive letter — has
+/// a stale spelling written in it, and resolution deliberately does not consult
+/// it (the primary always resolves against `Library::root`), so refreshing it
+/// costs one write and keeps the listing honest.
+fn refresh_primary_source(conn: &Connection, root: &Path) -> Result<()> {
+    let stored: Option<String> = conn
+        .query_row("SELECT path FROM sources WHERE is_primary = 1", [], |r| r.get(0))
+        .optional()?;
+    let now = root.display().to_string();
+    match stored {
+        Some(p) if p == now => Ok(()),
+        Some(_) => {
+            conn.execute(
+                "UPDATE sources SET path = ?1 WHERE is_primary = 1",
+                params![now],
+            )?;
+            Ok(())
+        }
+        // No primary row at all is only reachable if something deleted it out
+        // from under the schema's index; put one back rather than fail to open.
+        None => {
+            conn.execute(
+                "INSERT INTO sources(name, path, kind, is_primary, added_at) \
+                 VALUES(?1, ?2, 'primary', 1, ?3)",
+                params![
+                    root_display_name(root),
+                    now,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        }
+    }
+}
+
 /// Settings key holding this library's stable identity.
 pub(crate) const SETTING_LIBRARY_ID: &str = "library_id";
 
@@ -933,9 +1219,12 @@ fn ensure_library_id(conn: &Connection) -> Result<()> {
 
 // ------------------------------------------------------------------ row glue
 
+/// `source_id` is appended rather than slotted in beside `rel_path` so the
+/// column indexes [`photo_from_row`] reads by did not all shift when v6 landed.
 const PHOTO_COLS: &str = "id, rel_path, filename, content_hash, file_size, mtime_ms, kind, \
      width, height, orientation, captured_at, camera_make, camera_model, lens, iso, \
-     aperture, shutter, focal_length, rating, flag, color_label, blur_lqip, imported_at";
+     aperture, shutter, focal_length, rating, flag, color_label, blur_lqip, imported_at, \
+     source_id";
 
 fn prefixed_photo_cols(prefix: &str) -> String {
     PHOTO_COLS
@@ -970,6 +1259,7 @@ pub(crate) fn photo_from_row(row: &Row<'_>) -> rusqlite::Result<Photo> {
         color_label: row.get(20)?,
         blur_lqip: row.get(21)?,
         imported_at: row.get(22)?,
+        source_id: row.get(23)?,
     })
 }
 
@@ -1199,6 +1489,167 @@ mod tests {
         conn.execute_batch(SCHEMA_V4).unwrap();
         conn.execute("INSERT INTO schema_version(version) VALUES(4)", []).unwrap();
         conn
+    }
+
+    /// …and a genuine v5 one: v4 plus the remotes/targets rebuild, stamped 5.
+    fn write_v5_catalog(dir: &Path) -> Connection {
+        let conn = write_v4_catalog(dir);
+        apply_v5(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 5", []).unwrap();
+        conn
+    }
+
+    /// The v6 migration puts every existing photo on source #1 — the library
+    /// root — with its `rel_path` untouched, and everything that hangs off a
+    /// photo comes across with it.
+    ///
+    /// `photos` is the one table half the schema points at, and v6 rebuilds it
+    /// to drop the old `UNIQUE(rel_path)`. With foreign keys left on, the
+    /// `DROP TABLE` in the middle of that runs an implicit DELETE and cascades
+    /// every album membership and every edit stack into oblivion — a migration
+    /// that opens cleanly and quietly empties the library. This is the test
+    /// that would have caught it.
+    #[test]
+    fn v5_photos_land_on_the_primary_source_with_everything_attached_to_them() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = write_v5_catalog(dir.path());
+            conn.execute(
+                "INSERT INTO photos(id, rel_path, filename, content_hash, file_size, \
+                 mtime_ms, rating, flag, color_label, imported_at) \
+                 VALUES(7, '2026/ana/a1.jpg', 'a1.jpg', 'hash-a1', 100, 0, 5, 'pick', \
+                 'Red', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO photos(id, rel_path, filename, content_hash, file_size, \
+                 mtime_ms, imported_at) \
+                 VALUES(8, '2026/ana/a2.jpg', 'a2.jpg', 'hash-a2', 100, 0, '')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO albums(id, path, title, token) VALUES(1, '2026/ana', 'Ana', 'tok')",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE albums SET cover_photo_id = 7 WHERE id = 1", []).unwrap();
+            conn.execute(
+                "INSERT INTO album_photos(album_id, photo_id, position) VALUES(1, 7, 0), (1, 8, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edits(photo_id, version, stack_json) \
+                 VALUES(7, 1, '{\"version\":1,\"ops\":[{\"op\":\"exposure\",\"ev\":0.5}]}')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO tags(id, name) VALUES(1, 'wedding')", []).unwrap();
+            conn.execute("INSERT INTO photo_tags(photo_id, tag_id) VALUES(7, 1)", []).unwrap();
+            conn.execute(
+                "INSERT INTO lr_links(lrcat_id, lr_image, photo_id) VALUES('cat', 1000, 7)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let lib = Library::open(dir.path()).expect("the migration must open a v5 catalog");
+
+        // One source: the library itself, named after its folder.
+        let sources = lib.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_primary);
+        assert_eq!(sources[0].path, lib.root().display().to_string());
+        assert_eq!(sources[0].photo_count, 2);
+
+        // Both photos are on it, at exactly the paths they had.
+        let primary = lib.primary_source_id().unwrap();
+        let a1 = lib.photo_by_rel_path("2026/ana/a1.jpg").unwrap().unwrap();
+        assert_eq!(a1.id, 7, "rowids are stable across the rebuild");
+        assert_eq!(a1.source_id, primary);
+        assert_eq!(a1.rating, 5);
+        assert_eq!(a1.flag, Flag::Pick);
+        assert_eq!(a1.color_label.as_deref(), Some("Red"));
+        assert_eq!(a1.content_hash, "hash-a1");
+        assert!(lib.photo_by_rel_path("2026/ana/a2.jpg").unwrap().is_some());
+        assert_eq!(lib.photo_count().unwrap(), 2);
+
+        // …and everything that hangs off a photo survived the table rebuild.
+        assert_eq!(
+            lib.album_photos("2026/ana")
+                .unwrap()
+                .into_iter()
+                .map(|p| p.filename)
+                .collect::<Vec<_>>(),
+            vec!["a1.jpg", "a2.jpg"],
+            "album memberships were cascaded away by the rebuild"
+        );
+        assert_eq!(
+            lib.album_by_path("2026/ana").unwrap().unwrap().cover_filename.as_deref(),
+            Some("a1.jpg")
+        );
+        assert!(!lib.edits(7).unwrap().is_empty(), "the develop stack was dropped");
+        assert_eq!(lib.photo_tags(7).unwrap(), vec!["wedding"]);
+        assert_eq!(lib.lr_photo_links("cat").unwrap().get(&1000), Some(&7));
+
+        // And re-opening changes nothing — the migration is not re-applied.
+        drop(lib);
+        let again = Library::open(dir.path()).unwrap();
+        assert_eq!(again.photo_count().unwrap(), 2);
+        assert_eq!(again.sources().unwrap().len(), 1);
+        assert_eq!(again.album_photos("2026/ana").unwrap().len(), 2);
+    }
+
+    /// The old uniqueness was on `rel_path` alone. It becomes
+    /// `(source_id, rel_path)`, which is the whole point: two registered cards
+    /// may each hold `DCIM/DSC_0001.jpg`, and they are two photographs.
+    #[test]
+    fn a_relative_path_is_unique_within_a_source_not_across_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let drive = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path()).unwrap();
+        let other = lib.add_source(drive.path(), Some("Card"), None).unwrap();
+        let primary = lib.primary_source_id().unwrap();
+
+        for source in [primary, other] {
+            lib.with_conn(|c| {
+                c.execute(
+                    "INSERT INTO photos(source_id, rel_path, filename, content_hash, \
+                     file_size, mtime_ms, imported_at) \
+                     VALUES(?1, 'DCIM/DSC_0001.jpg', 'DSC_0001.jpg', 'h', 0, 0, '')",
+                    params![source],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(lib.photo_count().unwrap(), 2);
+
+        // The same path twice under one source is still refused.
+        let again = lib.with_conn(|c| {
+            Ok(c.execute(
+                "INSERT INTO photos(source_id, rel_path, filename, content_hash, \
+                 file_size, mtime_ms, imported_at) \
+                 VALUES(?1, 'DCIM/DSC_0001.jpg', 'DSC_0001.jpg', 'h', 0, 0, '')",
+                params![primary],
+            )?)
+        });
+        assert!(again.is_err(), "one source cannot hold one path twice");
+
+        // And each lookup finds its own.
+        assert_eq!(
+            lib.photo_by_rel_path("DCIM/DSC_0001.jpg").unwrap().unwrap().source_id,
+            primary
+        );
+        assert_eq!(
+            lib.photo_by_source_rel_path(other, "DCIM/DSC_0001.jpg")
+                .unwrap()
+                .unwrap()
+                .source_id,
+            other
+        );
     }
 
     /// The v5 migration folds today's single remote and destination into row

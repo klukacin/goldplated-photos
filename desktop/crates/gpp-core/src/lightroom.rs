@@ -527,10 +527,16 @@ fn source_path(root: &LrRoot, image: &LrImage) -> PathBuf {
     p
 }
 
-/// Is this absolute path inside the library, and at which rel path?
-fn rel_inside(lib: &Library, abs: &Path) -> Option<String> {
+/// Is this absolute path inside `root`, and at which relative path?
+///
+/// Both sides are canonicalized before comparing: an LR catalog records the
+/// path the photographer's Finder showed, and on macOS `/tmp` and `/var` are
+/// symlinks, so the same folder has two spellings and only one of them is a
+/// prefix of the other.
+fn rel_in_source(root: &Path, abs: &Path) -> Option<String> {
     let abs = abs.canonicalize().ok()?;
-    let rel = abs.strip_prefix(lib.root()).ok()?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rel = abs.strip_prefix(&root).ok()?;
     let mut parts = Vec::new();
     for c in rel.components() {
         parts.push(c.as_os_str().to_str()?.to_string());
@@ -564,10 +570,20 @@ pub struct LrRootReport {
     pub file_count: usize,
     /// Files the catalog references that are not on disk at that path.
     pub missing_files: usize,
-    /// The root lies under the open library's root, so an import catalogues
-    /// its files where they are instead of copying. `false` means the files
-    /// live elsewhere and an import copies them in.
+    /// The root lies inside a registered source — the library root or one
+    /// added since — so an import catalogues its files where they are instead
+    /// of copying. `false` means the files live outside every source, and an
+    /// import copies them in unless it is told to reference them.
     pub in_place: bool,
+    /// The root can be registered as a source and imported **by reference**:
+    /// catalogued where it lies, nothing copied, nothing moved. True for any
+    /// path that is a readable folder — which is the whole condition, since
+    /// referencing is just "address the files where they already are".
+    ///
+    /// The one thing that can still refuse it is overlap: a root that contains
+    /// the library, or another source, cannot become a source of its own. The
+    /// import reports that per root when it happens and copies instead.
+    pub can_reference: bool,
 }
 
 /// One collection as the scan reports it, path within the LR hierarchy.
@@ -609,16 +625,15 @@ pub fn scan(lib: &Library, lrcat: &Path) -> Result<LrScanReport> {
                 missing += 1;
             }
         }
-        let in_place = PathBuf::from(root.absolute_path.trim_end_matches('/'))
-            .canonicalize()
-            .map(|p| p.starts_with(lib.root()))
-            .unwrap_or(false);
+        let abs = PathBuf::from(root.absolute_path.trim_end_matches('/'));
+        let in_place = lib.source_containing(&abs)?.is_some();
         root_folders.push(LrRootReport {
             path: root.absolute_path.clone(),
             name: root.name.clone(),
             file_count,
             missing_files: missing,
             in_place,
+            can_reference: abs.is_dir(),
         });
     }
 
@@ -685,6 +700,45 @@ pub enum MergePolicy {
     Suffix,
 }
 
+/// Where one Lightroom root folder's files should end up.
+///
+/// This is the choice the owner asked for as *bez migracije* — "without
+/// migration". A decade of work is terabytes, and copying it into a new folder
+/// to be able to catalogue it is a non-answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LrPlacement {
+    /// Catalogue in place where the root already lies inside a registered
+    /// source; copy in otherwise. The default, and what every import did
+    /// before referencing existed.
+    #[default]
+    Auto,
+    /// Catalogue where the files are. When the root is not inside any source
+    /// yet, this registers it as one — the only way to address those files —
+    /// and says so in the report.
+    InPlace,
+    /// Copy into the library under `dest_subdir`, whatever the root is.
+    Copy,
+    /// Register the root folder as a **source** (named after the LR root) and
+    /// catalogue its files where they lie. Nothing is copied and nothing is
+    /// moved. A root already inside a source needs no new one and is simply
+    /// catalogued in place.
+    Reference,
+}
+
+/// A placement chosen for one specific LR root folder, overriding the run's
+/// default `mode`.
+///
+/// `root_id` is `AgLibraryRootFolder.id_local` — the id
+/// [`LrScanReport`] hands the UI, so a panel that lists the roots can send back
+/// exactly what the photographer ticked.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LrRootPlacement {
+    pub root_id: i64,
+    pub mode: LrPlacement,
+}
+
 /// Options for one import run. Everything is optional; `{}` imports the whole
 /// catalog with the defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -707,8 +761,18 @@ pub struct LrImportOptions {
     /// this catalog has no link to.
     #[serde(default)]
     pub collision: MergePolicy,
+    /// Where files land, for every root that has no entry in
+    /// [`roots`](Self::roots). Defaults to [`LrPlacement::Auto`], which is what
+    /// every import did before referencing existed.
+    #[serde(default)]
+    pub mode: LrPlacement,
+    /// Per-root overrides, by `AgLibraryRootFolder.id_local`. A photographer
+    /// keeps the current year on the laptop and eight years on a NAS; those are
+    /// two answers, not one.
+    #[serde(default)]
+    pub roots: Option<Vec<LrRootPlacement>>,
     /// Compute the full report without writing anything — no copies, no
-    /// catalog rows, no links.
+    /// catalog rows, no links, and no source registered.
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -721,9 +785,20 @@ pub struct LrImportReport {
     /// LR images whose bytes were already in the catalog under some path —
     /// linked to the existing row, nothing copied.
     pub photos_linked_existing: usize,
-    /// Files catalogued where they lie, because their LR root folder is under
-    /// the library root.
+    /// Files catalogued where they lie — nothing copied. Covers both the root
+    /// that already sat under the library and the one referenced on its own
+    /// drive; [`photos_referenced`](Self::photos_referenced) is the second of
+    /// those two.
     pub photos_in_place: usize,
+    /// The subset of [`photos_in_place`](Self::photos_in_place) that lives on a
+    /// source other than the library root — referenced, never moved. This is
+    /// the number that answers "how much of my Lightroom library did I import
+    /// without copying a byte".
+    pub photos_referenced: usize,
+    /// Roots registered as sources by this run, `"<name> (<path>)"`. A source
+    /// is a lasting change to the library — it is what makes those files
+    /// findable again next time — so a run that adds one says so.
+    pub sources_registered: Vec<String>,
     /// LR images whose file is not on disk where the catalog says.
     pub skipped_missing_files: usize,
     pub albums_created: usize,
@@ -784,6 +859,9 @@ pub fn lr_import(
 
     let roots: HashMap<i64, &LrRoot> = data.roots.iter().map(|r| (r.id, r)).collect();
     let mut links = lib.lr_photo_links(&data.catalog_id)?;
+    // Where each root's files go — including any source this run registers.
+    let placements = plan_root_placements(lib, &data, opts, &mut report)?;
+    let primary = lib.primary_source_id()?;
 
     // ----------------------------------------------------------- photo pass
     //
@@ -838,14 +916,17 @@ pub fn lr_import(
             continue;
         }
 
-        // In place, or copy in — decided first, because the two treat
-        // duplicate bytes differently: a file already under the library root
-        // is catalogued at its own path even when another path holds the same
+        // In place, or copy in — decided per root, up front, because the two
+        // treat duplicate bytes differently: a file that stays where it is gets
+        // catalogued at its own path even when another path holds the same
         // bytes (a file the catalog forgets is worse than a duplicate row),
         // while a file that would need copying is linked to the existing row
         // instead of copied again.
-        let inside = rel_inside(lib, &source);
-        if inside.is_none() {
+        let placement = placements
+            .get(&image.root_id)
+            .copied()
+            .unwrap_or(Placement::CopyIn);
+        if placement == Placement::CopyIn {
             let hash = import::hash_file(&source)?;
             if let Some(existing) = lib.photo_id_by_hash(&hash)? {
                 report.photos_linked_existing += 1;
@@ -864,12 +945,29 @@ pub fn lr_import(
             }
         }
 
-        let (abs, rel) = match inside {
-            Some(rel) => {
+        let (abs, rel, source_id) = match placement {
+            Placement::InSource(id) => {
+                let root_path = lib.source_root(id)?;
+                let Some(rel) = rel_in_source(&root_path, &source) else {
+                    report.conflicts.push(format!(
+                        "{}: its file is not under the source it was placed in — skipped",
+                        image.rel_from_root
+                    ));
+                    continue;
+                };
                 report.photos_in_place += 1;
-                (source.clone(), rel)
+                if id != primary {
+                    report.photos_referenced += 1;
+                }
+                (source.clone(), rel, id)
             }
-            None => {
+            // Dry runs only; the `if dry` below is what it falls into.
+            Placement::WouldReference => {
+                report.photos_in_place += 1;
+                report.photos_referenced += 1;
+                (source.clone(), image.rel_from_root.clone(), primary)
+            }
+            Placement::CopyIn => {
                 let mut rel = format!("{dest_subdir}/{}", safe_segment(&root.name));
                 for seg in image.rel_from_root.split('/').filter(|s| !s.is_empty()) {
                     rel.push('/');
@@ -896,7 +994,7 @@ pub fn lr_import(
                         std::fs::copy(&source, &dest).map_err(|e| Error::io(&source, e))?;
                     }
                 }
-                (dest, rel)
+                (dest, rel, primary)
             }
         };
 
@@ -920,7 +1018,7 @@ pub fn lr_import(
             ));
             continue;
         };
-        let cand = import::candidate_for(&abs, &rel, kind)?;
+        let cand = import::candidate_for(&abs, &rel, source_id, kind)?;
         let processed = import::process_one(&cand, &thumb_root, kind == PhotoKind::Photo)?;
         let photo_id = lib.with_tx(|tx| Ok(import::upsert_processed(tx, &processed, &now)?.photo_id))?;
         lib.set_lr_photo_link(&data.catalog_id, image.id, photo_id)?;
@@ -947,6 +1045,96 @@ pub fn lr_import(
     import_collections(lib, &data, opts, &photo_of, &mut report)?;
 
     Ok(report)
+}
+
+/// Where one root's files are going, resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Placement {
+    /// Catalogue in place, under this registered source.
+    InSource(i64),
+    /// A dry run's answer for a root a real run would register as a source.
+    /// Only ever produced under `dry_run`.
+    WouldReference,
+    /// Copy into the primary under `dest_subdir`.
+    CopyIn,
+}
+
+/// Decide, per LR root folder, whether its files are catalogued where they lie
+/// or copied in — registering a source where that is what was asked for.
+///
+/// Done once, up front, rather than per image: registering a source is a
+/// library-level act, and a run that touched a thousand frames should have made
+/// that decision once, visibly, in the report.
+fn plan_root_placements(
+    lib: &Library,
+    data: &LrData,
+    opts: &LrImportOptions,
+    report: &mut LrImportReport,
+) -> Result<HashMap<i64, Placement>> {
+    let per_root: HashMap<i64, LrPlacement> = opts
+        .roots
+        .iter()
+        .flatten()
+        .map(|r| (r.root_id, r.mode))
+        .collect();
+
+    let mut out = HashMap::new();
+    for root in &data.roots {
+        let mode = per_root.get(&root.id).copied().unwrap_or(opts.mode);
+        let abs = PathBuf::from(root.absolute_path.trim_end_matches('/'));
+        let abs = abs.canonicalize().unwrap_or(abs);
+        let containing = lib.source_containing(&abs)?;
+
+        let placement = match (mode, containing) {
+            // Already reachable: nothing to register, nothing to copy.
+            (LrPlacement::Auto | LrPlacement::InPlace | LrPlacement::Reference, Some(source)) => {
+                Placement::InSource(source.id)
+            }
+            (LrPlacement::Copy, _) | (LrPlacement::Auto, None) => Placement::CopyIn,
+            (LrPlacement::InPlace | LrPlacement::Reference, None) => {
+                if opts.dry_run {
+                    report
+                        .sources_registered
+                        .push(format!("{} ({})", root.name, abs.display()));
+                    Placement::WouldReference
+                } else {
+                    let name = (!root.name.trim().is_empty()).then(|| root.name.clone());
+                    match lib.add_source(&abs, name.as_deref(), None) {
+                        Ok(id) => {
+                            report
+                                .sources_registered
+                                .push(format!("{} ({})", root.name, abs.display()));
+                            if mode == LrPlacement::InPlace {
+                                // In-place on an outside root can only be done
+                                // by referencing it, and a new source is a
+                                // lasting change to the library. Say so rather
+                                // than let it be discovered later.
+                                report.conflicts.push(format!(
+                                    "root folder \"{}\": it is outside the library, so \
+                                     importing in place registered {} as a source",
+                                    root.name,
+                                    abs.display()
+                                ));
+                            }
+                            Placement::InSource(id)
+                        }
+                        // Overlap, or a path that is not there. Copying is the
+                        // answer that still gets the photographs in.
+                        Err(e) => {
+                            report.conflicts.push(format!(
+                                "root folder \"{}\": could not be referenced ({e}) — \
+                                 its files were copied in instead",
+                                root.name
+                            ));
+                            Placement::CopyIn
+                        }
+                    }
+                }
+            }
+        };
+        out.insert(root.id, placement);
+    }
+    Ok(out)
 }
 
 /// Carry LR's rating, flag, colour label and keywords onto one photo row.
@@ -1489,7 +1677,12 @@ mod tests {
         assert!(a.in_place, "shoot-a lies under the library root");
         let b = report.root_folders.iter().find(|r| r.name == "shoot-b").unwrap();
         assert_eq!((b.file_count, b.missing_files), (3, 1), "gone.jpg is referenced, absent");
-        assert!(!b.in_place, "shoot-b needs copying");
+        assert!(!b.in_place, "shoot-b is outside every source");
+        // …but it is a folder that is there, so it can be catalogued where it
+        // lies instead of copied — which is the whole answer to "import my
+        // Lightroom library without migrating a terabyte".
+        assert!(b.can_reference);
+        assert!(a.can_reference, "an in-place root is referenceable by definition");
 
         let mut kinds: Vec<(String, String, usize)> = report
             .collections
@@ -1618,6 +1811,212 @@ mod tests {
             1,
             "the smart collection's snapshot member"
         );
+    }
+
+    /// Reference mode: the outside root becomes a source, and not one byte is
+    /// copied.
+    ///
+    /// This is the mode the whole feature exists for. A photographer with a
+    /// decade of Lightroom has terabytes on drives that are already organised;
+    /// asking them to duplicate all of it into a new folder before the app can
+    /// see it is a non-answer, and it was the only answer this importer had.
+    #[test]
+    fn reference_mode_registers_the_root_as_a_source_and_copies_nothing() {
+        let (lib, lib_dir, elsewhere, lrcat) = fixture();
+        let report = lr_import(
+            &lib,
+            &lrcat,
+            &LrImportOptions {
+                mode: LrPlacement::Reference,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.photos_copied, 0, "reference mode must copy nothing");
+        assert_eq!(report.bytes_copied, 0);
+        assert_eq!(report.photos_in_place, 5, "three inside, two referenced");
+        assert_eq!(report.photos_referenced, 2, "shoot-b's two readable frames");
+        assert_eq!(report.skipped_missing_files, 1, "gone.jpg is still not on disk");
+        assert!(
+            report.sources_registered.iter().any(|s| s.contains("shoot-b")),
+            "registering a source is a lasting change and must be reported: {:?}",
+            report.sources_registered
+        );
+        assert!(!lib_dir.path().join("lr").exists(), "nothing was copied in");
+
+        // The library now knows two roots: itself, and the LR root folder.
+        let sources = lib.sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        let referenced = sources.iter().find(|s| !s.is_primary).unwrap();
+        assert_eq!(referenced.name, "shoot-b", "named after the LR root folder");
+        assert_eq!(referenced.kind, crate::sources::SourceKind::External);
+        assert_eq!(referenced.photo_count, 2);
+        assert!(referenced.online);
+
+        // …and b1's row points at the file where it always was.
+        let photos = lib.photos(&PhotoFilter::default()).unwrap();
+        let b1 = photo_by_name(&photos, "b1.jpg");
+        assert_eq!(b1.source_id, referenced.id);
+        assert_eq!(b1.rel_path, "b1.jpg", "relative to its own source, not the library");
+        assert_eq!(
+            lib.photo_path(b1).unwrap(),
+            elsewhere.path().canonicalize().unwrap().join("shoot-b/b1.jpg")
+        );
+        // Everything else about the import is unchanged: the inside root is
+        // still in place, and the collections still became albums.
+        assert_eq!(photo_by_name(&photos, "a3.jpg").rel_path, "shoot-a/sub/a3.jpg");
+        assert_eq!(lib.album_photos("weddings/ana ivan").unwrap().len(), 3);
+    }
+
+    /// Re-running a referencing import syncs rather than registering a second
+    /// source or re-cataloguing anything.
+    #[test]
+    fn a_second_referencing_run_adds_no_second_source() {
+        let (lib, _lib_dir, _elsewhere, lrcat) = fixture();
+        let opts = LrImportOptions {
+            mode: LrPlacement::Reference,
+            ..Default::default()
+        };
+        lr_import(&lib, &lrcat, &opts, None, None).unwrap();
+
+        let again = lr_import(&lib, &lrcat, &opts, None, None).unwrap();
+        assert_eq!(again.photos_in_place, 0);
+        assert_eq!(again.photos_referenced, 0);
+        assert_eq!(again.photos_copied, 0);
+        assert!(
+            again.sources_registered.is_empty(),
+            "the root is already a source: {:?}",
+            again.sources_registered
+        );
+        assert_eq!(lib.sources().unwrap().len(), 2);
+        assert_eq!(lib.photo_count().unwrap(), 5);
+    }
+
+    /// A dry run in reference mode forecasts the source and registers nothing.
+    #[test]
+    fn a_dry_referencing_run_registers_no_source() {
+        let (lib, _lib_dir, _elsewhere, lrcat) = fixture();
+        let report = lr_import(
+            &lib,
+            &lrcat,
+            &LrImportOptions {
+                mode: LrPlacement::Reference,
+                dry_run: true,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.photos_referenced, 2);
+        assert_eq!(report.photos_copied, 0);
+        assert!(report.sources_registered.iter().any(|s| s.contains("shoot-b")));
+        assert_eq!(lib.sources().unwrap().len(), 1, "a dry run registered a source");
+        assert_eq!(lib.photo_count().unwrap(), 0);
+    }
+
+    /// The choice is per root folder: this year's shoot copied onto the laptop,
+    /// eight years on the NAS referenced where they are.
+    #[test]
+    fn a_per_root_placement_overrides_the_runs_default() {
+        let (lib, lib_dir, _elsewhere, lrcat) = fixture();
+        let report = lr_import(
+            &lib,
+            &lrcat,
+            &LrImportOptions {
+                mode: LrPlacement::Reference,
+                // Root 2 is shoot-b, the outside one — copy that one after all.
+                roots: Some(vec![LrRootPlacement {
+                    root_id: 2,
+                    mode: LrPlacement::Copy,
+                }]),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.photos_copied, 2, "the override won");
+        assert_eq!(report.photos_referenced, 0);
+        assert!(report.sources_registered.is_empty());
+        assert!(lib_dir.path().join("lr/shoot-b/b1.jpg").exists());
+        assert_eq!(lib.sources().unwrap().len(), 1);
+    }
+
+    /// Asking for in-place on a root that is outside the library can only be
+    /// honoured by referencing it — a lasting change to the library — so it is
+    /// done, and said out loud.
+    #[test]
+    fn in_place_on_an_outside_root_references_it_and_says_so() {
+        let (lib, _lib_dir, _elsewhere, lrcat) = fixture();
+        let report = lr_import(
+            &lib,
+            &lrcat,
+            &LrImportOptions {
+                mode: LrPlacement::InPlace,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.photos_copied, 0);
+        assert_eq!(report.photos_referenced, 2);
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.contains("shoot-b") && c.contains("registered")),
+            "the new source has to be named: {:?}",
+            report.conflicts
+        );
+    }
+
+    /// A root that cannot become a source — it holds the library itself — falls
+    /// back to copying rather than losing the photographs, and says why.
+    #[test]
+    fn a_root_that_cannot_be_referenced_copies_instead_and_names_the_reason() {
+        // The library lives *inside* the LR root folder, so registering that
+        // root would make one source contain another.
+        let outer = tempfile::tempdir().unwrap();
+        let root_b = outer.path().join("shoot-b");
+        let lib_dir = outer.path().join("gallery");
+        let root_a = lib_dir.join("shoot-a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let lrcat = outer.path().join("photos.lrcat");
+        // The catalog's second root is the folder that contains the library.
+        standard_fixture(&lrcat, &root_a, outer.path());
+        let lib = Library::open(&lib_dir).unwrap();
+
+        let report = lr_import(
+            &lib,
+            &lrcat,
+            &LrImportOptions {
+                mode: LrPlacement::Reference,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(lib.sources().unwrap().len(), 1, "no source was registered");
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.contains("could not be referenced")),
+            "the fallback has to explain itself: {:?}",
+            report.conflicts
+        );
+        assert!(report.photos_copied > 0, "the photographs still got in");
     }
 
     #[test]

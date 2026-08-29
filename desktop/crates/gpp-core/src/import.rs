@@ -48,17 +48,24 @@ impl Default for ImportOptions {
 pub(crate) struct Candidate {
     pub(crate) abs_path: PathBuf,
     pub(crate) rel_path: String,
+    /// The source `rel_path` is relative to.
+    pub(crate) source_id: i64,
     pub(crate) filename: String,
     pub(crate) kind: PhotoKind,
     pub(crate) file_size: i64,
     pub(crate) mtime_ms: i64,
 }
 
-/// Build a candidate for one file already inside the library.
+/// Build a candidate for one file already inside a registered source.
 ///
-/// `rel_path` must be the library-relative, '/'-separated spelling of
+/// `rel_path` must be the source-relative, '/'-separated spelling of
 /// `abs_path` — the caller has both in hand, so nothing is re-derived here.
-pub(crate) fn candidate_for(abs_path: &Path, rel_path: &str, kind: PhotoKind) -> Result<Candidate> {
+pub(crate) fn candidate_for(
+    abs_path: &Path,
+    rel_path: &str,
+    source_id: i64,
+    kind: PhotoKind,
+) -> Result<Candidate> {
     let meta = abs_path.metadata().map_err(|e| Error::io(abs_path, e))?;
     Ok(Candidate {
         filename: abs_path
@@ -67,6 +74,7 @@ pub(crate) fn candidate_for(abs_path: &Path, rel_path: &str, kind: PhotoKind) ->
             .unwrap_or_default()
             .to_string(),
         rel_path: rel_path.to_string(),
+        source_id,
         abs_path: abs_path.to_path_buf(),
         kind,
         file_size: meta.len() as i64,
@@ -106,11 +114,14 @@ pub(crate) struct Processed {
 
 /// Import every supported file under `dir`.
 ///
-/// A folder inside the library is catalogued where it lies. A folder outside
-/// it — a camera card, a downloads folder — is copied in first, because the
-/// catalog addresses photos by their path under the library root and cannot
-/// point at files that live somewhere else. Nothing at the source is altered
-/// or removed.
+/// A folder inside **any registered source** — the library root included — is
+/// catalogued where it lies, under that source. A folder outside every source
+/// (a camera card, a downloads folder) is copied into the library first,
+/// because a catalog row addresses a file by its path under a source and there
+/// is no source that reaches it. Register the folder with
+/// [`Library::add_source`] and this catalogues it in place instead, which is
+/// the whole of "import without moving my files". Nothing at the source is
+/// ever altered or removed either way.
 ///
 /// `on_progress` is called from the worker threads; keep it cheap and
 /// thread-safe.
@@ -188,7 +199,7 @@ pub fn import_dir(
 
             // Unchanged since last import → nothing to do.
             if !opts.force {
-                if let Some((size, mtime)) = known.get(&cand.rel_path) {
+                if let Some((size, mtime)) = known.get(&(cand.source_id, cand.rel_path.clone())) {
                     if *size == cand.file_size && *mtime == cand.mtime_ms {
                         return Ok(Outcome::Unchanged);
                     }
@@ -250,6 +261,58 @@ pub fn import_dir(
     Ok(summary)
 }
 
+/// Import every registered source, each at its own root.
+///
+/// This is what "import the whole library" means once photographs may live
+/// outside it: the primary and every referenced source, in id order. A source
+/// that is not reachable right now is **skipped with a note** rather than
+/// failing the run — an external drive left at the studio must not stop the
+/// laptop from picking up the frames that are here — and a source whose own
+/// scan fails is noted the same way, so one bad root never costs the others.
+pub fn import_all_sources(
+    lib: &Library,
+    opts: &ImportOptions,
+    on_progress: Option<&(dyn Fn(ImportProgress) + Sync)>,
+    should_stop: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<ImportSummary> {
+    let mut total = ImportSummary::default();
+    for source in lib.sources()? {
+        if should_stop.map(|f| f()).unwrap_or(false) {
+            total.cancelled = true;
+            break;
+        }
+        if !source.online {
+            total.notes.push(format!(
+                "source '{}' ({}) is not available — skipped",
+                source.name, source.path
+            ));
+            continue;
+        }
+        match import_dir(lib, Path::new(&source.path), opts, on_progress, should_stop) {
+            Ok(one) => merge_summaries(&mut total, one),
+            Err(e) => total
+                .notes
+                .push(format!("source '{}' could not be scanned: {e}", source.name)),
+        }
+    }
+    Ok(total)
+}
+
+/// Fold one source's summary into the run's running total.
+fn merge_summaries(total: &mut ImportSummary, one: ImportSummary) {
+    total.imported += one.imported;
+    total.duplicates += one.duplicates;
+    total.updated += one.updated;
+    total.skipped += one.skipped;
+    total.copied_in += one.copied_in;
+    total.cancelled |= one.cancelled;
+    total.failed.extend(one.failed);
+    total.undecodable.extend(one.undecodable);
+    total.notes.extend(one.notes);
+    // Only the primary can receive copies, so at most one of these is ever set.
+    total.copied_into = total.copied_into.take().or(one.copied_into);
+}
+
 /// What [`upsert_processed`] did with one file.
 pub(crate) struct Upserted {
     pub(crate) photo_id: i64,
@@ -277,26 +340,28 @@ pub(crate) fn upsert_processed(
 ) -> Result<Upserted> {
     let was_known: Option<String> = tx
         .query_row(
-            "SELECT content_hash FROM photos WHERE rel_path = ?1",
-            params![p.candidate.rel_path],
+            "SELECT content_hash FROM photos WHERE source_id = ?1 AND rel_path = ?2",
+            params![p.candidate.source_id, p.candidate.rel_path],
             |r| r.get(0),
         )
         .optional()?;
 
-    // Same bytes already catalogued under a different path.
+    // Same bytes already catalogued somewhere else — another path, or the same
+    // path under another source.
     let dupes: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM photos WHERE content_hash = ?1 AND rel_path <> ?2",
-        params![p.content_hash, p.candidate.rel_path],
+        "SELECT COUNT(*) FROM photos WHERE content_hash = ?1 \
+         AND NOT (source_id = ?2 AND rel_path = ?3)",
+        params![p.content_hash, p.candidate.source_id, p.candidate.rel_path],
         |r| r.get(0),
     )?;
 
     tx.execute(
         "INSERT INTO photos(
-            rel_path, filename, content_hash, file_size, mtime_ms, kind,
+            source_id, rel_path, filename, content_hash, file_size, mtime_ms, kind,
             width, height, orientation, captured_at, camera_make, camera_model,
             lens, iso, aperture, shutter, focal_length, blur_lqip, imported_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
-         ON CONFLICT(rel_path) DO UPDATE SET
+         VALUES(?20,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+         ON CONFLICT(source_id, rel_path) DO UPDATE SET
             content_hash = excluded.content_hash,
             file_size    = excluded.file_size,
             mtime_ms     = excluded.mtime_ms,
@@ -332,12 +397,13 @@ pub(crate) fn upsert_processed(
             p.metadata.focal_length,
             p.lqip,
             now,
+            p.candidate.source_id,
         ],
     )?;
 
     let photo_id: i64 = tx.query_row(
-        "SELECT id FROM photos WHERE rel_path = ?1",
-        params![p.candidate.rel_path],
+        "SELECT id FROM photos WHERE source_id = ?1 AND rel_path = ?2",
+        params![p.candidate.source_id, p.candidate.rel_path],
         |r| r.get(0),
     )?;
 
@@ -380,8 +446,13 @@ struct BroughtIn {
 
 /// Copy an outside folder into the library so it can be catalogued.
 ///
-/// Returns `None` when `dir` is already inside the library, which is the
-/// in-place case and needs no copying.
+/// Returns `None` when `dir` is already inside a registered source — the
+/// library root or any other — which is the in-place case and needs no
+/// copying.
+///
+/// Copies always land on the **primary** source: `.gpp` lives there, and a
+/// referenced source is a place photographs are, not a place this app puts
+/// things.
 ///
 /// The destination keeps the source folder's name, and a name already taken
 /// gains a numeric suffix rather than merging into it — two cards both called
@@ -409,7 +480,7 @@ fn bring_inside(
     // an outside one, or the reverse.
     let source = source.canonicalize().unwrap_or(source);
     let root_real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    if source.starts_with(&root_real) {
+    if lib.source_containing(&source)?.is_some() {
         return Ok(None);
     }
     if !source.is_dir() {
@@ -519,22 +590,29 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Walk the tree and collect supported files.
+/// Walk the tree and collect supported files, each tagged with the source its
+/// relative path belongs to.
 fn scan(lib: &Library, dir: &Path, recursive: bool) -> Result<Vec<Candidate>> {
-    let root = lib.root();
     let dir = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
-        root.join(dir)
+        lib.root().join(dir)
     };
-    // The root is canonical (`Library::open` sees to that), so the folder has
-    // to be compared in the same spelling — a caller may name it through a
-    // symlink, and `/tmp` on macOS is one. Without this, an in-place import of
-    // a folder that is plainly inside the library failed as "invalid path".
+    // Source roots are canonical (`Library::open` and `add_source` see to
+    // that), so the folder has to be compared in the same spelling — a caller
+    // may name it through a symlink, and `/tmp` on macOS is one. Without this,
+    // an in-place import of a folder that is plainly inside the library failed
+    // as "invalid path".
     let dir = dir.canonicalize().unwrap_or(dir);
-    if !dir.starts_with(root) {
+    let Some(source) = lib.source_containing(&dir)? else {
         return Err(Error::InvalidPath(dir.display().to_string()));
-    }
+    };
+    let source_id = source.id;
+    let root = source
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| source.path.clone());
+    let root = root.as_path();
 
     let mut walker = WalkDir::new(&dir).follow_links(false);
     if !recursive {
@@ -571,6 +649,7 @@ fn scan(lib: &Library, dir: &Path, recursive: bool) -> Result<Vec<Candidate>> {
                 .unwrap_or_default()
                 .to_string(),
             rel_path,
+            source_id,
             abs_path: path.to_path_buf(),
             kind,
             file_size: meta.len() as i64,
@@ -691,12 +770,15 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// rel_path → (size, mtime) for everything already catalogued.
-fn load_known(lib: &Library) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+/// (source, rel_path) → (size, mtime) for everything already catalogued. Keyed
+/// by both halves because a relative path only identifies a file within its own
+/// source: two cards may hold the same `DCIM/DSC_0001.jpg`, and skipping the
+/// second as "unchanged" would leave it uncatalogued for ever.
+fn load_known(lib: &Library) -> Result<std::collections::HashMap<(i64, String), (i64, i64)>> {
     lib.with_conn(|c| {
-        let mut stmt = c.prepare("SELECT rel_path, file_size, mtime_ms FROM photos")?;
+        let mut stmt = c.prepare("SELECT source_id, rel_path, file_size, mtime_ms FROM photos")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+            Ok(((r.get::<_, i64>(0)?, r.get::<_, String>(1)?), (r.get(2)?, r.get(3)?)))
         })?;
         let mut map = std::collections::HashMap::new();
         for row in rows {

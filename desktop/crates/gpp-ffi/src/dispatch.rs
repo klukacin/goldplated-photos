@@ -15,6 +15,7 @@ use gpp_core::develop::EditOp;
 use gpp_core::model::{Flag, PhotoFilter};
 use gpp_core::remotes::{PublishTargetUpdate, RemoteUpdate};
 use gpp_core::session::PublishTarget;
+use gpp_core::sources::SourceKind;
 use gpp_core::sync::{SyncDirection, SyncScopeKind};
 use gpp_core::Session;
 
@@ -55,6 +56,8 @@ impl From<gpp_core::Error> for CallError {
             E::PhotoNotFound(_) => "photo-not-found",
             E::AlbumExists(_) => "album-exists",
             E::Unsupported(_) => "unsupported",
+            E::SourceOffline { .. } => "source-offline",
+            E::SourceMismatch { .. } => "source-mismatch",
             E::SyncConflict { .. } => "sync-conflict",
             E::Other(_) => "other",
         };
@@ -78,6 +81,11 @@ pub const METHODS: &[&str] = &[
     "import",
     "cancel_import",
     "prune",
+    // sources (schema v6)
+    "sources",
+    "add_source",
+    "remove_source",
+    "relocate_source",
     // lightroom
     "lr_scan",
     "lr_import",
@@ -276,6 +284,58 @@ pub(crate) fn dispatch(session: &Session, method: &str, args: &str) -> Result<Va
         "prune" => {
             let _: NoArgs = parse(args)?;
             ok(session.prune()?)
+        }
+
+        // ------------------------------------------------ sources (v6)
+        //
+        // A source is a root photographs may live under. Registering one is
+        // what makes an import catalogue files where they are instead of
+        // copying them in — the whole of "import my Lightroom library without
+        // moving a terabyte". Nothing here writes to, moves or deletes a
+        // photograph.
+        "sources" => {
+            let _: NoArgs = parse(args)?;
+            ok(session.sources()?)
+        }
+        "add_source" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                path: String,
+                /// Omit to take the folder's own name.
+                #[serde(default)]
+                name: Option<String>,
+                /// `internal`, `external` (the default) or `network`.
+                #[serde(default)]
+                kind: Option<SourceKind>,
+            }
+            let a: A = parse(args)?;
+            ok(session.add_source(a.path, a.name, a.kind)?)
+        }
+        // `drop_photos` is deliberately not defaulted away: a source holding
+        // catalog rows is refused without it, because removing it takes every
+        // rating, flag, membership and adjustment on those photographs with it.
+        // The files themselves are never touched either way.
+        "remove_source" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                id: i64,
+                #[serde(default)]
+                drop_photos: bool,
+            }
+            let a: A = parse(args)?;
+            ok(session.remove_source(a.id, a.drop_photos)?)
+        }
+        "relocate_source" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct A {
+                id: i64,
+                new_path: String,
+            }
+            let a: A = parse(args)?;
+            ok(session.relocate_source(a.id, a.new_path)?)
         }
 
         // ---------------------------------------------------------- lightroom
