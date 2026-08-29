@@ -12,6 +12,7 @@ use gpp_core::publish::PublishResult;
 use gpp_core::remote::{ForeignPushOutcome, PullOutcome, PushOutcome, RemoteAlbum};
 use gpp_core::remotes::{RemoteInfo, RemoteUpdate};
 use gpp_core::session::{AlbumSummary, LibraryStatus, PublishTarget, Session};
+use gpp_core::sources::{SourceInfo, SourceKind};
 use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan, SyncScopeKind};
 use gpp_core::xmp::XmpExportOutcome;
 use tauri::{Emitter, Manager, State};
@@ -194,6 +195,62 @@ fn cancel_import(state: State<'_, Session>) {
 #[tauri::command]
 fn prune_missing(state: State<'_, Session>) -> CmdResult<usize> {
     state.prune().map_err(to_msg)
+}
+
+// ------------------------------------------------------------------ sources
+
+/// Every root photographs may live under: the library itself, plus any folder
+/// registered since. `online` is probed inside the core on each call, so this
+/// is also the answer to "is that drive plugged in right now".
+#[tauri::command]
+fn list_sources(state: State<'_, Session>) -> CmdResult<Vec<SourceInfo>> {
+    state.sources().map_err(to_msg)
+}
+
+/// Register a folder as a source. Nothing is catalogued by registering; an
+/// import over that folder afterwards takes its photographs in place.
+///
+/// Widening the asset scope is the shell's own business and has to happen here:
+/// the webview loads originals straight off disk, and a source the scope does
+/// not name shows a photographer blank frames with no error anywhere.
+#[tauri::command]
+fn add_source(
+    app: tauri::AppHandle,
+    path: String,
+    name: Option<String>,
+    kind: Option<SourceKind>,
+) -> CmdResult<i64> {
+    let id = app
+        .state::<Session>()
+        .add_source(path, name, kind)
+        .map_err(to_msg)?;
+    allow_reading_library(&app);
+    Ok(id)
+}
+
+/// Forget a source. Never touches a file — `drop_photos` decides only whether
+/// its catalog rows go with it, and the core refuses the removal outright when
+/// it still holds photos and the answer was `false`.
+#[tauri::command]
+fn remove_source(
+    state: State<'_, Session>,
+    id: i64,
+    drop_photos: bool,
+) -> CmdResult<usize> {
+    state.remove_source(id, drop_photos).map_err(to_msg)
+}
+
+/// Point a source at the folder it lives in now. The core re-hashes a handful
+/// of that source's own catalogued files there first and refuses by name if
+/// they are not the same photographs; nothing changes when it does.
+#[tauri::command]
+fn relocate_source(app: tauri::AppHandle, id: i64, new_path: String) -> CmdResult<()> {
+    app.state::<Session>()
+        .relocate_source(id, new_path)
+        .map_err(to_msg)?;
+    // The source now answers with a different root, so the old grant is stale.
+    allow_reading_library(&app);
+    Ok(())
 }
 
 // ------------------------------------------------------------------- photos
@@ -794,6 +851,10 @@ pub fn run() {
             import_photos,
             cancel_import,
             prune_missing,
+            list_sources,
+            add_source,
+            remove_source,
+            relocate_source,
             list_photos,
             photo_path,
             thumbnail_path,

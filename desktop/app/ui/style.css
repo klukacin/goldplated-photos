@@ -293,6 +293,10 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 /* A file the decoder could not read. The cell keeps its place in the grid —
    the file is real and still in the catalog — but says so plainly. */
 .cell.undecodable { border-color: var(--border); }
+/* Same shape, different diagnosis: nothing is wrong with this photograph, its
+   drive is simply not attached. Dashed rather than solid so the two do not
+   read as the same trouble at a glance. */
+.cell.offline { border-color: var(--border); border-style: dashed; }
 .cell-note {
   width: 100%;
   aspect-ratio: 1;
@@ -566,6 +570,23 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   gap: 0.4rem;
   margin-bottom: 0.9rem;
 }
+
+/* ---------------------------------------------------------------- sources */
+
+/* Whether a source's root is readable right now. Probed per listing, never
+   cached — an unplugged drive is the whole question this answers, so it is
+   spelled out in words as well as colour. */
+.source-state {
+  font-size: 0.7rem;
+  white-space: nowrap;
+  color: var(--text-dim);
+  margin-left: 0.35rem;
+}
+.source-state.online { color: #6fbf73; }
+/* The kind picker sits beside the Add button, not in a form column: at the
+   global 100% it squeezed "+ Add source…" onto two lines. */
+.servers-header select { width: auto; }
+.servers-header .btn { white-space: nowrap; }
 
 /* Per-server tracking chips on an album row: name, direction glyph, scope. */
 .sync-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }

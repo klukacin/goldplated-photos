@@ -31,6 +31,10 @@ const state = {
   syncRemoteId: null,
   /// remoteId -> Map(albumPath -> subscription), for the per-server chips.
   subsByRemote: new Map(),
+  /// Every root this library catalogues photographs under, the primary first.
+  /// Held outside the Sources panel because `online` is what tells a grid cell
+  /// "that drive is in the other room" rather than "this file is corrupt".
+  sources: [],
   /// Canonical root of the open library, as the core reports it — what the
   /// switcher menu compares against to mark the current entry.
   libraryRoot: '',
@@ -156,6 +160,11 @@ function resetLibraryState() {
   state.remotes = [];
   state.syncRemoteId = null;
   state.subsByRemote = new Map();
+  // Sources belong to the library too — a stale list would label the new
+  // library's photos with the old one's drives.
+  state.sources = [];
+  $('sources-list').innerHTML = '';
+  showError('sources-error', '');
   // A scan describes where photos would land in the library that was open when
   // it ran. Left standing, the wizard would offer to import it into the new one.
   resetLrWizard();
@@ -169,6 +178,8 @@ async function enterApp(info) {
   $('welcome').hidden = true;
   $('app').hidden = false;
   renderStatus(info);
+  // Sources first: the grid asks which of them are attached while it paints.
+  await refreshSources();
   await Promise.all([refreshAlbums(), refreshPhotos()]);
   await loadPublishTarget();
 }
@@ -255,6 +266,18 @@ async function renderLibraryMenu() {
     menu.appendChild(row);
   });
 
+  // Sources are configuration of the library that is open, so they hang off
+  // the library menu rather than a titlebar button of their own.
+  const sources = document.createElement('button');
+  sources.className = 'library-open-other';
+  sources.textContent = 'Sources…';
+  sources.title = 'Folders outside the library that it catalogues photographs in';
+  sources.addEventListener('click', () => {
+    $('library-menu').hidden = true;
+    openSources();
+  });
+  menu.appendChild(sources);
+
   const other = document.createElement('button');
   other.className = 'library-open-other';
   other.textContent = 'Open other library…';
@@ -263,6 +286,219 @@ async function renderLibraryMenu() {
     pickAndOpenLibrary();
   });
   menu.appendChild(other);
+}
+
+// ----------------------------------------------------------------- sources
+//
+// A library is one folder by default, and its own root is source #1 — the
+// primary, where the catalog and every thumbnail live. Any number of other
+// folders may be registered: their photographs are catalogued *where they
+// are*, never copied and never moved, which is what makes a decade of work on
+// an external drive importable without migrating a terabyte first.
+//
+// A source that is not attached right now is offline, not missing. The core
+// says so per source (`online`, probed on every listing) and refuses the
+// operations that need the original by name, so this panel is also where the
+// answer to a blank frame in the grid — plug that drive in — is on screen.
+
+async function refreshSources() {
+  try {
+    state.sources = await invoke('list_sources');
+    showError('sources-error', '');
+  } catch (err) {
+    state.sources = [];
+    // Only worth reporting where it was asked for; at boot a failure here just
+    // leaves the grid without source names, which it renders fine without.
+    if (!$('sources-modal').hidden) showError('sources-error', String(err));
+  }
+  renderSources();
+}
+
+/// One source by id, or null — a photo's row may name a source this listing
+/// has not caught up with.
+function sourceById(id) {
+  return state.sources.find((s) => s.id === id) || null;
+}
+
+/// The registered sources that are not reachable right now, by name. This is
+/// what a count of skipped photos is actually waiting for, and naming it is
+/// the whole of the remedy.
+function offlineSourceNames() {
+  return state.sources.filter((s) => !s.online).map((s) => s.name);
+}
+
+/// "3 waiting on Archive 2019" — the phrase batch reports use for work that
+/// was stepped over because a drive is elsewhere. Nothing is wrong with those
+/// photographs, so this never reads as a failure.
+function offlineNote(count) {
+  const names = offlineSourceNames();
+  return `${count} waiting on ${names.length ? names.join(', ') : 'a source that is not attached'}`;
+}
+
+const SOURCE_KIND_LABELS = {
+  primary: 'library root',
+  internal: 'internal disk',
+  external: 'external drive',
+  network: 'network share',
+};
+
+function openSources() {
+  showError('sources-error', '');
+  openModal('sources-modal');
+  refreshSources();
+}
+
+function renderSources() {
+  const list = $('sources-list');
+  list.innerHTML = '';
+  if (!state.sources.length) {
+    list.innerHTML = '<p class="muted">No sources — open a library first.</p>';
+    return;
+  }
+
+  state.sources.forEach((s) => {
+    const row = document.createElement('div');
+    row.className = 'remote-row';
+
+    const info = document.createElement('div');
+    info.className = 'remote-info';
+    const title = document.createElement('strong');
+    title.textContent = s.name;
+    info.appendChild(title);
+
+    if (s.is_primary) {
+      const badge = document.createElement('span');
+      badge.className = 'badge-new';
+      badge.textContent = 'primary';
+      info.appendChild(badge);
+    }
+
+    // Probed at the moment of the listing, so it is worth saying plainly
+    // rather than leaving the photographer to infer it from an empty grid.
+    const dot = document.createElement('span');
+    dot.className = 'source-state' + (s.online ? ' online' : '');
+    dot.textContent = s.online ? '● attached' : '○ not attached';
+    info.appendChild(dot);
+
+    const sub = document.createElement('div');
+    sub.className = 'remote-sub muted';
+    sub.title = s.path;
+    // Kind and count lead: the row ellipsizes a long path, and the count is
+    // the number the Remove dialog is about — losing it off the end of the
+    // line is how "forget this folder" reads as harmless when it is not.
+    sub.textContent =
+      `${SOURCE_KIND_LABELS[s.kind] || s.kind} · ${s.photo_count} photo(s) · ${s.path}`;
+    info.appendChild(sub);
+    row.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+
+    // The primary is the library itself: it moves by opening the library
+    // somewhere else, and it cannot be forgotten at all.
+    if (!s.is_primary) {
+      const relocate = document.createElement('button');
+      relocate.className = 'btn btn-sm';
+      relocate.textContent = 'Relocate…';
+      relocate.title = 'Point this source at the folder it lives in now';
+      relocate.addEventListener('click', () => relocateSource(s));
+      actions.appendChild(relocate);
+
+      const remove = document.createElement('button');
+      remove.className = 'btn btn-sm btn-danger';
+      remove.textContent = 'Remove';
+      remove.addEventListener('click', () => removeSource(s));
+      actions.appendChild(remove);
+    }
+
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+$('source-add-btn').addEventListener('click', async () => {
+  const dir = await openDialog({
+    directory: true,
+    title: 'Choose a folder to catalogue in place',
+  });
+  if (!dir) return;
+  showError('sources-error', '');
+  status('Registering source…');
+  try {
+    await invoke('add_source', { path: dir, name: null, kind: $('source-kind').value });
+    await refreshSources();
+    status(`Added source ${dir} — import it to catalogue its photos in place`);
+  } catch (err) {
+    // Overlap with the library or another source comes back as a sentence
+    // naming the source it clashes with. Show it as it is.
+    showError('sources-error', String(err));
+    status('Source not added');
+  }
+});
+
+async function relocateSource(s) {
+  const dir = await openDialog({
+    directory: true,
+    title: `Where is "${s.name}" now?`,
+  });
+  if (!dir) return;
+  showError('sources-error', '');
+  status(`Relocating ${s.name}…`);
+  try {
+    await invoke('relocate_source', { id: s.id, newPath: dir });
+    await refreshSources();
+    await refreshPhotos();
+    status(`${s.name} now points at ${dir}`);
+  } catch (err) {
+    // A folder that does not hold this source's photographs is refused with
+    // the file that gave it away named in the message, and nothing changed.
+    // That sentence is the whole diagnosis — show it, and leave the row alone.
+    showError('sources-error', String(err));
+    status(`${s.name} unchanged`);
+  }
+}
+
+async function removeSource(s) {
+  // The count is the difference between forgetting an empty folder and
+  // discarding a shoot's worth of ratings, so it decides the question asked —
+  // and the answer to it is what travels as `drop_photos`. Either way no file
+  // on disk is touched, which is the sentence a photographer needs to read
+  // before pressing this.
+  const holdsPhotos = s.photo_count > 0;
+  const sure = await askConfirm(
+    holdsPhotos
+      ? `"${s.name}" holds ${s.photo_count} catalogued photo(s). Removing it drops ` +
+        'those catalog rows — their ratings, flags, album memberships and ' +
+        'adjustments go with them.\n\n' +
+        'The photographs themselves are never touched: every file stays exactly ' +
+        'where it is on disk, and adding the folder back re-imports them.'
+      : `"${s.name}" holds no catalogued photos.\n\n` +
+        'Removing it only makes this library stop looking there. No file on disk ' +
+        'is touched.',
+    {
+      title: `Remove source "${s.name}"?`,
+      kind: 'warning',
+      okLabel: holdsPhotos ? `Remove and drop ${s.photo_count} row(s)` : 'Remove',
+    }
+  );
+  if (!sure) return;
+
+  showError('sources-error', '');
+  try {
+    const dropped = await invoke('remove_source', { id: s.id, dropPhotos: holdsPhotos });
+    await refreshSources();
+    await refreshAll();
+    status(
+      dropped
+        ? `Removed ${s.name} · ${dropped} catalog row(s) dropped, no file touched`
+        : `Removed ${s.name} — no file touched`
+    );
+  } catch (err) {
+    // Reached when the count this panel held was stale and the core found
+    // photos on it after all. Its message says so; nothing was removed.
+    showError('sources-error', String(err));
+    status(`${s.name} unchanged`);
+  }
 }
 
 async function switchLibrary(lib) {
@@ -322,8 +558,14 @@ $('import-btn').addEventListener('click', async () => {
       `imported ${summary.imported} · updated ${summary.updated} · ` +
       `unchanged ${summary.skipped}` +
       (summary.undecodable.length ? ` · ${summary.undecodable.length} without a preview` : '') +
-      (summary.failed.length ? ` · ${summary.failed.length} failed` : '')
+      (summary.failed.length ? ` · ${summary.failed.length} failed` : '') +
+      // A registered source that was not attached is skipped rather than
+      // failed, and the note names it. Dropping these turns "your external
+      // drive was not there" into a run that read as complete.
+      (summary.notes.length ? ` · ${summary.notes.join(' · ')}` : '')
     );
+    // A source may have come back — or gone — while the import ran.
+    await refreshSources();
     await refreshAll();
   } catch (err) {
     status(`Import failed: ${err}`);
@@ -400,12 +642,18 @@ function renderGrid() {
     // A file no decoder can read — a corrupt JPEG, a RAW format this build
     // does not develop — gets a named tile. A broken-image icon tells the
     // photographer nothing about which file is the problem.
+    //
+    // A photo on a source that is not attached is neither of those things:
+    // nothing is wrong with it, the drive is simply in the other room. Calling
+    // that "No preview" sends someone looking for a corrupt file that is
+    // perfectly safe, so it names the drive instead.
     const undecodable = () => {
-      cell.classList.add('undecodable');
+      const offline = state.sources.find((s) => s.id === photo.source_id && !s.online);
+      cell.classList.add(offline ? 'offline' : 'undecodable');
       img.remove();
       const note = document.createElement('div');
       note.className = 'cell-note';
-      note.textContent = 'No preview';
+      note.textContent = offline ? `${offline.name} not attached` : 'No preview';
       cell.prepend(note);
     };
     img.addEventListener('error', undecodable, { once: true });
@@ -595,6 +843,9 @@ async function showInspector(photo) {
     ['Exposure', formatExposure(photo)],
     ['Dimensions', photo.width && photo.height ? `${photo.width} × ${photo.height}` : '—'],
     ['Size', formatBytes(photo.file_size)],
+    // rel_path is relative to this photo's own source, so it does not name a
+    // place on its own once a library catalogues more than one root.
+    ['Source', describeSourceOf(photo)],
     ['Path', photo.rel_path],
   ];
   $('inspector-meta').innerHTML = rows
@@ -1102,6 +1353,14 @@ async function afterDevelop() {
   if (state.cursor >= 0) await showInspector(state.photos[state.cursor]);
 }
 
+/// The source a photo's path is relative to, and whether it is attached —
+/// what turns "develop failed" into "the Card drive is not plugged in".
+function describeSourceOf(photo) {
+  const s = sourceById(photo.source_id);
+  if (!s) return '—';
+  return s.name + (s.online ? '' : ' — not attached');
+}
+
 function formatExposure(p) {
   const bits = [];
   if (p.focal_length) bits.push(`${Math.round(p.focal_length)}mm`);
@@ -1478,6 +1737,10 @@ $('publish-run-btn').addEventListener('click', async () => {
       target: { dest, min_rating: minRating ? Number(minRating) : null },
     });
     const results = await invoke('publish', { album });
+    // Photos stepped over because their drive is elsewhere are named against
+    // the source they are waiting on, and `online` is only true as of the last
+    // listing — re-probe before saying which drive it is.
+    if (results.some((r) => r.offline.length)) await refreshSources();
     const total = results.reduce((n, r) => n + r.photos_copied, 0);
     $('publish-output').hidden = false;
     $('publish-output').textContent = results
@@ -1486,10 +1749,17 @@ $('publish-run-btn').addEventListener('click', async () => {
         const notes = [];
         if (r.missing.length) notes.push(`${r.missing.length} missing from disk`);
         if (r.unrenderable.length) notes.push(`${r.unrenderable.length} without a preview, not published`);
+        // Not a failure and not a loss: the album is simply short until the
+        // drive is attached, and the next publish ships them. Left unsaid, an
+        // album that quietly went up without a third of its frames looks
+        // exactly like one that went up whole.
+        if (r.offline.length) notes.push(offlineNote(r.offline.length));
         if (r.removed.length) notes.push(`${r.removed.length} removed`);
         if (r.collisions.length) notes.push(`${r.collisions.length} name clash(es)`);
         let line = `${r.album_path}: ${r.photos_copied} copied, ${r.photos_skipped} unchanged` +
           (notes.length ? ` · ${notes.join(' · ')}` : '');
+        // Each entry already names the photo and the source it is waiting on.
+        for (const o of r.offline) line += `\n  not published yet: ${o}`;
         // A clash needs both filenames spelled out — renaming one would change
         // a URL the client may already hold, so this is the photographer's call.
         for (const c of r.collisions) {
@@ -2161,6 +2431,13 @@ function reportOutcome(path, o) {
       ? `\n\nThe server has a different version of these — your originals were kept:\n  ` +
         `${o.kept_originals.join('\n  ')}`
       : '') +
+    // The read twin of a push's failures, and the same rule: one item failing
+    // never stops a transfer, so a run that drops this list has turned a
+    // partial pull into something that looks exactly like a complete one.
+    (o.failed?.length
+      ? `\n\nCould not be done — the rest of the transfer still happened:\n  ` +
+        `${o.failed.map(([file, why]) => `${file} — ${why}`).join('\n  ')}`
+      : '') +
     // A parent folder someone else configured is not this push's to rewrite.
     (o.folders_left_alone?.length
       ? `\n\nAlready on the server and configured elsewhere — left as they are:\n  ` +
@@ -2337,6 +2614,9 @@ function resetLrWizard() {
   lrState.path = null;
   lrState.report = null;
   $('lr-path').value = '';
+  // The per-root selects go with the report; this one is markup, so it has to
+  // be put back by hand or it would describe a scan that is no longer here.
+  $('lr-placement-all').value = '';
   $('lr-report').hidden = true;
   $('lr-output').hidden = true;
   $('lr-dry-run-btn').disabled = true;
@@ -2401,16 +2681,23 @@ function renderLrReport(report) {
     info.appendChild(title);
     const badge = document.createElement('span');
     badge.className = 'badge-new';
-    // In place: the folder already lives under the library root, so its files
-    // are catalogued where they lie rather than copied.
-    badge.textContent = root.in_place ? 'in place' : 'will copy';
+    // In place: the folder already lives under a registered source, so its
+    // files are catalogued where they lie rather than copied.
+    badge.textContent = root.in_place ? 'in place' : 'outside the library';
     info.appendChild(badge);
     const sub = document.createElement('div');
     sub.className = 'remote-sub muted';
+    sub.title = root.path;
     sub.textContent = `${root.path} · ${root.file_count} file(s)` +
       (root.missing_files ? ` · ${root.missing_files} missing on disk` : '');
     info.appendChild(sub);
     row.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+    actions.appendChild(placementSelect(root));
+    row.appendChild(actions);
+
     roots.appendChild(row);
   });
 
@@ -2440,6 +2727,91 @@ function renderLrReport(report) {
   });
 }
 
+/// Where one Lightroom root folder's files should end up. Values are
+/// `LrPlacement`'s own serde spellings (kebab-case) — the core reads them
+/// straight off the wire, so a re-spelling here is a rejected import, not a
+/// silently ignored option.
+const LR_PLACEMENTS = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'in-place', label: 'In place' },
+  { value: 'copy', label: 'Copy' },
+  { value: 'reference', label: 'Reference' },
+];
+
+/// The placement dropdown for one scanned root, with the choices that root
+/// cannot honour disabled — and each disabled one saying why, since "greyed
+/// out" on its own is only a puzzle.
+function placementSelect(root) {
+  const sel = document.createElement('select');
+  sel.title = 'Where this folder\'s photos end up';
+  LR_PLACEMENTS.forEach(({ value, label }) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    if (value === 'in-place' && !root.in_place) {
+      // The scan reports in_place only for a root that already lies under a
+      // registered source. Anywhere else, importing in place would have to
+      // register the folder as a source first — which is Reference, and is
+      // worth choosing deliberately rather than arriving at by accident.
+      opt.disabled = true;
+      opt.textContent = `${label} — outside every source; use Reference`;
+    }
+    if (value === 'reference' && !root.can_reference && !root.in_place) {
+      opt.disabled = true;
+      opt.textContent = `${label} — the folder is not readable from here`;
+    }
+    sel.appendChild(opt);
+  });
+  sel.value = 'auto';
+  return sel;
+}
+
+// One choice for every folder — the shape a mixed selection cannot currently
+// take (see lrPlacementProblem), and the quick way to say "reference all of it".
+$('lr-placement-all').addEventListener('change', () => {
+  const pick = $('lr-placement-all').value;
+  if (!pick) return;
+  document.querySelectorAll('#lr-roots select').forEach((sel) => {
+    const option = [...sel.options].find((o) => o.value === pick);
+    if (option && !option.disabled) sel.value = pick;
+  });
+  showError('lr-error', '');
+});
+
+/// What each scanned root is set to, paired with the id `LrRootPlacement` is
+/// keyed by — `AgLibraryRootFolder.id_local`.
+function lrRootChoices() {
+  const roots = lrState.report?.root_folders || [];
+  return [...document.querySelectorAll('#lr-roots select')].map((sel, i) => ({
+    // `LrRootReport` carries path, name, counts, in_place and can_reference —
+    // and no id. Read whichever name it grows for one, so per-root choices
+    // start travelling the moment the core hands them over.
+    rootId: roots[i]?.root_id ?? roots[i]?.id ?? null,
+    mode: sel.value,
+  }));
+}
+
+/// Why the chosen placements cannot be sent as picked, or null when they can.
+///
+/// `roots` is a list of `{ root_id, mode }`, and the scan report does not name
+/// a root id at all. One answer for every folder still travels exactly — the
+/// core falls back to the run-wide `mode` for any root it has no override for
+/// — so only a mixed selection is stuck, and inventing an id would hand some
+/// folder another folder's answer without a word.
+function lrPlacementProblem() {
+  const choices = lrRootChoices();
+  if (choices.length < 2) return null;
+  if (choices.every((c) => c.rootId != null)) return null;
+  if (new Set(choices.map((c) => c.mode)).size <= 1) return null;
+  return (
+    'Different folders are set to different placements, and this catalog scan ' +
+    'does not name the folder ids the core needs to tell them apart ' +
+    '(LrRootReport carries no id for LrRootPlacement.root_id). Set every ' +
+    'folder to the same placement to run it, or import the folders in ' +
+    'separate runs.'
+  );
+}
+
 $('lr-coll-all-btn').addEventListener('click', () => {
   document.querySelectorAll('#lr-collections input[type=checkbox]')
     .forEach((b) => (b.checked = true));
@@ -2455,6 +2827,14 @@ $('lr-coll-none-btn').addEventListener('click', () => {
 function lrOptions(dryRun) {
   const boxes = [...document.querySelectorAll('#lr-collections input[type=checkbox]')];
   const chosen = boxes.filter((b) => b.checked).map((b) => b.dataset.path);
+  const choices = lrRootChoices();
+
+  // Per-root overrides when the report names its roots; otherwise the one
+  // answer they all share, which the core applies to every root it holds no
+  // override for. lrPlacementProblem() has already refused anything else.
+  const named = choices.length > 0 && choices.every((c) => c.rootId != null);
+  const modes = [...new Set(choices.map((c) => c.mode))];
+
   return {
     dest_subdir: $('lr-dest-subdir').value.trim() || null,
     album_prefix: $('lr-album-prefix').value.trim() || null,
@@ -2462,6 +2842,8 @@ function lrOptions(dryRun) {
     // re-run are then included rather than silently skipped.
     collections: chosen.length === boxes.length ? null : chosen,
     collision: $('lr-collision').value,
+    mode: named ? 'auto' : (modes[0] || 'auto'),
+    roots: named ? choices.map((c) => ({ root_id: c.rootId, mode: c.mode })) : null,
     dry_run: dryRun,
   };
 }
@@ -2471,12 +2853,22 @@ function describeLrReport(r) {
   if (r.dry_run) lines.push('Dry run — nothing was written. This is a forecast:');
   if (r.cancelled) lines.push('Stopped on request — every count is a partial tally.');
   lines.push(
-    `photos: ${r.photos_copied} copied · ${r.photos_in_place} in place · ` +
+    // photos_referenced is the subset of photos_in_place that lives on a
+    // source other than the library root — the number that answers "how much
+    // of my Lightroom library did I take in without copying a byte".
+    `photos: ${r.photos_copied} copied · ${r.photos_in_place} in place ` +
+    `(${r.photos_referenced} referenced) · ` +
     `${r.photos_linked_existing} already here · ${r.skipped_missing_files} missing on disk`,
     `albums: ${r.albums_created} created · ${r.albums_updated} updated · ` +
     `${r.memberships_added} membership(s) · ${r.tags_added} tag(s)`,
   );
   if (r.bytes_copied) lines.push(`${formatBytes(r.bytes_copied)} copied`);
+  // A source is a lasting change to the library — it is what makes those files
+  // findable again next time — so a run that adds one has to say so.
+  if (r.sources_registered.length) {
+    lines.push('', 'Registered as sources — their photos stay where they are:',
+      ...r.sources_registered.map((s) => `  ${s}`));
+  }
   if (r.collisions.length) {
     lines.push('', 'Album paths already taken:', ...r.collisions.map((c) => `  ${c}`));
   }
@@ -2493,6 +2885,11 @@ function describeLrReport(r) {
 
 async function runLrImport(dryRun) {
   if (!lrState.path) return;
+  const problem = lrPlacementProblem();
+  if (problem) {
+    showError('lr-error', problem);
+    return;
+  }
   showError('lr-error', '');
   $('lr-dry-run-btn').disabled = true;
   $('lr-run-btn').disabled = true;
@@ -2515,7 +2912,11 @@ async function runLrImport(dryRun) {
     status(dryRun
       ? 'Dry run complete — nothing was written'
       : (report.cancelled ? 'Lightroom import stopped' : 'Lightroom import complete'));
-    if (!dryRun) await refreshAll();
+    if (!dryRun) {
+      // A referenced root is registered as a source by the run itself.
+      await refreshSources();
+      await refreshAll();
+    }
   } catch (err) {
     showError('lr-error', String(err));
     status('Lightroom import failed');
@@ -2541,11 +2942,18 @@ async function runXmpExport(album, resultEl) {
   status('Writing XMP sidecars…');
   try {
     const o = await invoke('export_xmp', { album });
+    // Same as publish: name the drive the skipped sidecars are waiting on,
+    // from a listing taken now rather than whenever the panel last looked.
+    if (o.offline.length) await refreshSources();
     const text = `${o.written} sidecar(s) written` +
       (o.skipped_foreign.length
         ? ` · ${o.skipped_foreign.length} from other tools left alone`
         : '') +
-      (o.missing.length ? ` · ${o.missing.length} original(s) missing on disk` : '');
+      (o.missing.length ? ` · ${o.missing.length} original(s) missing on disk` : '') +
+      // A sidecar sits beside its original, so a photo whose drive is elsewhere
+      // has nowhere to put one yet. Name the drive: "missing on disk" would be
+      // the wrong diagnosis and the wrong remedy.
+      (o.offline.length ? ` · ${offlineNote(o.offline.length)}` : '');
     if (resultEl) resultEl.textContent = text;
     status(`XMP: ${text}`);
   } catch (err) {

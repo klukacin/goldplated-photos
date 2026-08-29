@@ -337,6 +337,38 @@
     </div>
   </div>
 
+  <!-- Sources: the roots this library catalogues photographs under. Opened
+       from the library menu, because it is library configuration — the same
+       place the servers list is reached from its own panel. -->
+  <div id="sources-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Sources</h2>
+      <p class="muted">Every root photographs may live under. Files on a source are
+         read where they lie — never moved, never copied, never written to. The
+         library's own folder is the primary: the catalog and every thumbnail live
+         there, so it cannot be removed or relocated.</p>
+
+      <div class="servers-header">
+        <h3>Registered</h3>
+        <div class="row">
+          <select id="source-kind" title="What kind of place the folder is">
+            <option value="external">External drive</option>
+            <option value="internal">Internal disk</option>
+            <option value="network">Network share</option>
+          </select>
+          <button id="source-add-btn" class="btn btn-sm">+ Add source…</button>
+        </div>
+      </div>
+      <div id="sources-list" class="servers-list"></div>
+      <p class="muted">Adding one catalogues nothing by itself — run Import on the
+         folder afterwards and its photographs are taken in place.</p>
+      <p class="error" id="sources-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn" data-close>Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Push an album to any destination: this library's servers, or a remote
        another known library holds the credentials for. -->
   <div id="push-to-modal" class="modal" hidden>
@@ -371,6 +403,19 @@
       <div id="lr-report" hidden>
         <p class="muted" id="lr-summary"></p>
         <h3>Folders</h3>
+        <p class="muted">Reference leaves the photos exactly where they are: nothing
+           is copied or moved, and the folder becomes a source of this library.</p>
+        <div class="row" style="margin-bottom:0.4rem">
+          <label style="margin-bottom:0">Set every folder to
+            <select id="lr-placement-all">
+              <option value="">—</option>
+              <option value="auto">Auto</option>
+              <option value="in-place">In place</option>
+              <option value="copy">Copy</option>
+              <option value="reference">Reference</option>
+            </select>
+          </label>
+        </div>
         <div id="lr-roots" class="lr-list"></div>
         <h3>Collections <small class="muted">untick one to leave it out — its photos still import</small></h3>
         <div class="row" style="margin-bottom:0.4rem">
