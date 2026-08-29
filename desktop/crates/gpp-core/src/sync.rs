@@ -1325,6 +1325,32 @@ impl Library {
         })
     }
 
+    /// Album paths tracked at [`SyncScopeKind::Full`] on **any** remote.
+    ///
+    /// Deliberately not per-remote, unlike everything else about subscriptions.
+    /// A subscription is per (album, remote), but the file under the library
+    /// root is not — there is one of it, and it is the negative. So "may a
+    /// web-scope pull make the gallery's published bytes this library's copy of
+    /// this photograph?" is a library-wide question: an album whose originals
+    /// arrive through `__gpp_full__/` on one remote must not have them
+    /// pre-empted by a web pull from another. See
+    /// `crate::remote::may_adopt_media`.
+    pub fn full_scope_albums(&self) -> Result<Vec<String>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT album_path FROM album_sync WHERE scope = ?1 \
+                 ORDER BY album_path",
+            )?;
+            let rows = stmt
+                .query_map(params![SyncScopeKind::Full.as_str()], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// One album's subscription on the default remote, or `None` when this
     /// machine does not track it. `None` is the answer for most of the library
     /// on most machines, and it is what keeps the rest of it out of every plan.

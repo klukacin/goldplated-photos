@@ -52,22 +52,35 @@ impl XmpSidecar {
 ///
 /// Lightroom names a sidecar by replacing the extension (`IMG_0001.jpg` →
 /// `IMG_0001.xmp`); some other tools append instead (`IMG_0001.jpg.xmp`).
-/// Both are looked for, replaced-extension first, in either case of `xmp`.
+/// Both are looked for, in either case of `xmp`.
+///
+/// **The appended spelling wins when both exist**, because it is the one that
+/// says which file it belongs to. `IMG_0001.xmp` beside a `IMG_0001.NEF` and a
+/// `IMG_0001.JPG` cannot describe both — it is exactly the ambiguity
+/// [`export_sidecar_for`] refuses to write into — while `IMG_0001.NEF.xmp`
+/// names its photograph and nothing else. For the ordinary single-file case
+/// nothing changes: no appended sidecar exists, and Lightroom's spelling is
+/// found where it always was.
 pub fn sidecar_for(photo: &Path) -> Option<PathBuf> {
     for ext in ["xmp", "XMP"] {
+        let appended = appended_sidecar(photo, ext);
+        if appended.is_file() {
+            return Some(appended);
+        }
         let replaced = photo.with_extension(ext);
         if replaced != photo && replaced.is_file() {
             return Some(replaced);
         }
-        let mut appended = photo.as_os_str().to_owned();
-        appended.push(".");
-        appended.push(ext);
-        let appended = PathBuf::from(appended);
-        if appended.is_file() {
-            return Some(appended);
-        }
     }
     None
+}
+
+/// `IMG_0001.NEF` → `IMG_0001.NEF.xmp`: the spelling that names one file.
+fn appended_sidecar(photo: &Path, ext: &str) -> PathBuf {
+    let mut appended = photo.as_os_str().to_owned();
+    appended.push(".");
+    appended.push(ext);
+    PathBuf::from(appended)
 }
 
 /// Read and parse a sidecar. `None` only when the file cannot be read at all;
@@ -333,25 +346,97 @@ pub fn read_gpp_stack(text: &str) -> Option<String> {
 
 /// Where an export writes a photo's sidecar, honouring what already exists.
 ///
-/// A sidecar already found beside the photo (either naming convention) is the
-/// authority: ours is overwritten in place, a foreign one is kept and
-/// reported. With none, the Lightroom convention — extension replaced — is
-/// used, so other tools find it where they expect it.
-pub fn export_sidecar_for(photo_path: &Path) -> std::result::Result<PathBuf, PathBuf> {
-    if let Some(existing) = sidecar_for(photo_path) {
-        let ours = std::fs::read_to_string(&existing)
-            .map(|t| is_gpp_sidecar(&t))
-            .unwrap_or(false);
-        return if ours { Ok(existing) } else { Err(existing) };
-    }
-    let replaced = photo_path.with_extension("xmp");
-    if replaced == photo_path {
+/// **The rule.** A photograph gets the bare-stem sidecar Lightroom writes and
+/// looks for — `IMG_0001.NEF` → `IMG_0001.xmp` — *unless* another photograph
+/// beside it shares that stem, in which case every one of them gets the
+/// full-filename form instead: `IMG_0001.NEF.xmp`, `IMG_0001.JPG.xmp`. That is
+/// `shares_stem`, and the caller works it out from the set it is exporting.
+///
+/// A RAW+JPEG pair is two rows in this catalog, with their own ratings, labels
+/// and develop stacks, and one bare-stem sidecar cannot hold two of those: it
+/// held whichever was written second, silently, and the export counted both as
+/// written. Neither photo gets the ambiguous name, rather than one of them
+/// winning it by import order — a rule that would move the RAW's sidecar the
+/// day a JPEG landed next to it. Interop for the common single-file case is
+/// untouched, which is the case Lightroom's convention exists for, and
+/// [`sidecar_for`] reads both spellings anyway.
+///
+/// Whatever the name works out to, an existing packet there decides what
+/// happens to it: ours is overwritten in place, one from another tool is kept
+/// and returned as `Err` for the caller to report.
+pub fn export_sidecar_for(
+    photo_path: &Path,
+    shares_stem: bool,
+) -> std::result::Result<PathBuf, PathBuf> {
+    let dest = if shares_stem {
+        appended_sidecar(photo_path, "xmp")
+    } else if let Some(existing) = sidecar_for(photo_path) {
+        existing
+    } else {
+        let replaced = photo_path.with_extension("xmp");
         // An extensionless photo: append instead of replacing nothing.
-        let mut appended = photo_path.as_os_str().to_owned();
-        appended.push(".xmp");
-        return Ok(PathBuf::from(appended));
+        if replaced == photo_path {
+            appended_sidecar(photo_path, "xmp")
+        } else {
+            replaced
+        }
+    };
+
+    // A file that cannot be read is not evidence of another tool's work — an
+    // absent one above all, which is the ordinary case.
+    match std::fs::read_to_string(&dest) {
+        Ok(text) if !is_gpp_sidecar(&text) => Err(dest),
+        _ => Ok(dest),
     }
-    Ok(replaced)
+}
+
+/// Write a sidecar so that an interrupted write cannot destroy the previous one.
+///
+/// [`std::fs::write`] truncates before it writes, so a crash, a full disk or a
+/// pulled drive between the truncate and the last byte leaves a fragment — and
+/// a fragment carries no `gpp:` namespace, so [`is_gpp_sidecar`] then reads it
+/// as another tool's file and every later export refuses to repair it, for
+/// good. The packet goes to a temp name beside the destination and is renamed
+/// into place, so the sidecar is only ever the old packet or the new one.
+///
+/// Not [`crate::media::write_atomic`]: that one creates the destination's
+/// parent (a sidecar's parent is the photograph's own folder, and conjuring one
+/// would mean the original is not where the catalog says) and randomises the
+/// temp name for the many threads that write the thumbnail cache. Sidecar
+/// export is one photo at a time, and a predictable leftover is one a
+/// photographer can recognise.
+fn write_sidecar(dest: &Path, packet: &str) -> crate::error::Result<()> {
+    let mut temp = dest.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, packet).map_err(|e| crate::error::Error::io(&temp, e))?;
+    match std::fs::rename(&temp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(crate::error::Error::io(dest, e))
+        }
+    }
+}
+
+/// Photos whose bare-stem sidecar would name more than one of them.
+///
+/// Keyed by folder and stem, both taken from the path the sidecar would sit
+/// beside — a referenced photo's stem is shared with what is on *its* drive,
+/// not with a same-named frame gathered into the library.
+fn shared_stems(paths: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    let mut seen: std::collections::BTreeMap<PathBuf, usize> = std::collections::BTreeMap::new();
+    for path in paths {
+        *seen.entry(stem_key(path)).or_default() += 1;
+    }
+    seen.into_iter().filter(|(_, n)| *n > 1).map(|(k, _)| k).collect()
+}
+
+/// The folder-plus-stem a bare-stem sidecar is named after.
+fn stem_key(photo: &Path) -> PathBuf {
+    let mut key = photo.to_path_buf();
+    key.set_extension("");
+    key
 }
 
 fn xml_escape(value: &str) -> String {
@@ -373,11 +458,18 @@ impl crate::catalog::Library {
     /// Write (or refresh) XMP sidecars for one album's photos, or for the
     /// whole catalog when `album_path` is `None`.
     ///
-    /// The catalog stays the source of truth; sidecars are regenerated from
-    /// it so triage work survives a move to any other tool, and a `full`-scope
-    /// sync carries them along with the originals. The image file itself is
-    /// never touched, and a sidecar another tool wrote — anything without the
-    /// `gpp:` namespace marker — is left alone and named in the outcome.
+    /// The catalog stays the source of truth; sidecars are regenerated from it
+    /// so triage work survives a move to any other tool, and so a library is
+    /// reconstructible from its files alone. They do **not** ride along in a
+    /// `full`-scope sync: that namespace is built from catalogued photos
+    /// (`full::local_full_side`), and a `.xmp` is not one — it is neither
+    /// catalogued nor a member of any album, so no manifest on either side ever
+    /// mentions it. Carrying them would be a change to what the namespace
+    /// holds, not a comment.
+    ///
+    /// The image file itself is never touched, and a sidecar another tool wrote
+    /// — anything without the `gpp:` namespace marker — is left alone and named
+    /// in the outcome.
     pub fn export_xmp(&self, album_path: Option<&str>) -> crate::error::Result<XmpExportOutcome> {
         let photos = match album_path {
             Some(path) => {
@@ -392,12 +484,18 @@ impl crate::catalog::Library {
         };
 
         let mut out = XmpExportOutcome::default();
+
+        // Resolve every original first: which sidecar name a photo gets depends
+        // on the others beside it, so the set has to be known before the first
+        // file is written. "Beside it" means the photographs of this export —
+        // the ones this catalog actually has metadata for, and so the only ones
+        // that can collide. A sidecar goes beside the original, wherever the
+        // original is — a referenced photo's sidecar is written on its own
+        // drive, not gathered into the library. A drive that is not attached is
+        // named and skipped: one unplugged source must not abandon the export
+        // of everything else.
+        let mut targets = Vec::with_capacity(photos.len());
         for photo in &photos {
-            // A sidecar goes beside the original, wherever the original is —
-            // so a referenced photo's sidecar is written on its own drive, not
-            // gathered into the library. A drive that is not attached is named
-            // and skipped: one unplugged source must not abandon the export of
-            // everything else.
             let original = match self.photo_path(photo) {
                 Ok(p) => p,
                 Err(crate::error::Error::SourceOffline { name, .. }) => {
@@ -413,7 +511,12 @@ impl crate::catalog::Library {
                 out.missing.push(photo.rel_path.clone());
                 continue;
             }
-            let dest = match export_sidecar_for(&original) {
+            targets.push((photo, original));
+        }
+
+        let shared = shared_stems(&targets.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>());
+        for (photo, original) in &targets {
+            let dest = match export_sidecar_for(original, shared.contains(&stem_key(original))) {
                 Ok(dest) => dest,
                 Err(foreign) => {
                     out.skipped_foreign.push(foreign.display().to_string());
@@ -433,7 +536,7 @@ impl crate::catalog::Library {
                 photo.orientation,
                 stack_json.as_deref(),
             );
-            std::fs::write(&dest, packet).map_err(|e| crate::error::Error::io(&dest, e))?;
+            write_sidecar(&dest, &packet)?;
             out.written += 1;
         }
         Ok(out)
@@ -545,15 +648,17 @@ mod tests {
         std::fs::write(&photo, b"jpeg").unwrap();
         assert_eq!(sidecar_for(&photo), None);
 
-        // The appended spelling.
-        let appended = dir.path().join("IMG_0001.jpg.xmp");
-        std::fs::write(&appended, b"<x/>").unwrap();
-        assert_eq!(sidecar_for(&photo), Some(appended.clone()));
-
-        // Lightroom's replaced-extension spelling wins when both exist.
+        // Lightroom's replaced-extension spelling, on its own.
         let replaced = dir.path().join("IMG_0001.xmp");
         std::fs::write(&replaced, b"<x/>").unwrap();
         assert_eq!(sidecar_for(&photo), Some(replaced));
+
+        // The appended spelling wins when both exist: it names one file, while
+        // the bare stem could belong to any frame sharing it — which is exactly
+        // the case an export writes the appended form for.
+        let appended = dir.path().join("IMG_0001.jpg.xmp");
+        std::fs::write(&appended, b"<x/>").unwrap();
+        assert_eq!(sidecar_for(&photo), Some(appended));
     }
 
     /// The written packet has to be one [`parse_xmp`] — this module's own
@@ -596,18 +701,134 @@ mod tests {
 
         // Nothing there yet: Lightroom's replaced-extension convention.
         assert_eq!(
-            export_sidecar_for(&photo),
+            export_sidecar_for(&photo, false),
             Ok(dir.path().join("IMG_0001.xmp"))
         );
 
         // A foreign sidecar sits there: refused, named.
         let foreign = dir.path().join("IMG_0001.xmp");
         std::fs::write(&foreign, "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>").unwrap();
-        assert_eq!(export_sidecar_for(&photo), Err(foreign.clone()));
+        assert_eq!(export_sidecar_for(&photo, false), Err(foreign.clone()));
 
         // One of ours: overwritten in place.
         std::fs::write(&foreign, render_sidecar(3, None, &[], None, None)).unwrap();
-        assert_eq!(export_sidecar_for(&photo), Ok(foreign));
+        assert_eq!(export_sidecar_for(&photo, false), Ok(foreign.clone()));
+
+        // With the stem shared, the bare name is not a candidate at all — not
+        // even the foreign packet sitting on it, which stays exactly where it
+        // is while this photograph gets a name of its own.
+        assert_eq!(
+            export_sidecar_for(&photo, true),
+            Ok(dir.path().join("IMG_0001.jpg.xmp"))
+        );
+    }
+
+    /// A RAW and a JPEG of the same frame are two catalog rows with two sets of
+    /// metadata, and `IMG_0001.xmp` can only hold one of them: the second
+    /// export overwrote the first's packet and both were counted as written, so
+    /// a photographer moving to another tool silently lost half their triage.
+    #[test]
+    fn a_raw_and_jpeg_pair_keep_separate_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        // The JPEG is a real one so the import catalogues it; the NEF is bytes
+        // — never decoded, catalogued by extension, which is the point.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(24, 16)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        std::fs::write(dir.path().join("IMG_0001.jpg"), buf.into_inner()).unwrap();
+        std::fs::write(dir.path().join("IMG_0001.nef"), b"raw sensor bytes").unwrap();
+        // A third frame, alone on its stem: it must keep Lightroom's spelling.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(20, 20)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        std::fs::write(dir.path().join("IMG_0002.jpg"), buf.into_inner()).unwrap();
+
+        let lib = crate::catalog::Library::open(dir.path()).unwrap();
+        crate::import::import_dir(&lib, dir.path(), &Default::default(), None, None).unwrap();
+
+        let jpg = lib.photo_by_rel_path("IMG_0001.jpg").unwrap().unwrap();
+        let nef = lib.photo_by_rel_path("IMG_0001.nef").unwrap().unwrap();
+        lib.set_rating(jpg.id, 2).unwrap();
+        lib.set_color_label(jpg.id, Some("Blue")).unwrap();
+        lib.set_rating(nef.id, 5).unwrap();
+        lib.set_color_label(nef.id, Some("Red")).unwrap();
+
+        let out = lib.export_xmp(None).unwrap();
+        assert_eq!(out.written, 3, "one sidecar per photograph");
+        assert!(out.skipped_foreign.is_empty(), "{:?}", out.skipped_foreign);
+
+        // The pair share a stem, so neither takes the ambiguous name…
+        assert!(!dir.path().join("IMG_0001.xmp").exists());
+        let from_jpg = read_sidecar(&dir.path().join("IMG_0001.jpg.xmp")).unwrap();
+        let from_nef = read_sidecar(&dir.path().join("IMG_0001.nef.xmp")).unwrap();
+        assert_eq!((from_jpg.rating, from_jpg.label.as_deref()), (Some(2), Some("Blue")));
+        assert_eq!((from_nef.rating, from_nef.label.as_deref()), (Some(5), Some("Red")));
+
+        // …and each reads back to its own photograph, not to the other's.
+        assert_eq!(
+            sidecar_for(&dir.path().join("IMG_0001.nef")),
+            Some(dir.path().join("IMG_0001.nef.xmp"))
+        );
+
+        // The lone frame keeps the bare stem every other tool looks for.
+        assert_eq!(
+            sidecar_for(&dir.path().join("IMG_0002.jpg")),
+            Some(dir.path().join("IMG_0002.xmp"))
+        );
+
+        // Re-running is idempotent: same three names, nothing multiplied.
+        let again = lib.export_xmp(None).unwrap();
+        assert_eq!(again.written, 3);
+        let xmps: std::collections::BTreeSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".xmp"))
+            .collect();
+        assert_eq!(
+            xmps,
+            ["IMG_0001.jpg.xmp", "IMG_0001.nef.xmp", "IMG_0002.xmp"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+    }
+
+    /// A write that cannot finish must leave the previous sidecar whole.
+    ///
+    /// `std::fs::write` truncates first, so a crash or a full disk part-way
+    /// leaves a fragment — and a fragment carries no `gpp:` namespace, so
+    /// `is_gpp_sidecar` reads it as another tool's file and every later export
+    /// refuses to repair it, permanently. The write goes through a temp file
+    /// and a rename, so the destination only ever holds the old packet or the
+    /// new one.
+    #[test]
+    fn an_interrupted_sidecar_write_leaves_the_previous_one_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("IMG_0001.xmp");
+        let before = render_sidecar(3, Some("Red"), &["keeper".to_string()], Some(6), None);
+        write_sidecar(&dest, &before).unwrap();
+
+        // The replacement cannot be staged: the temp name is taken by a
+        // directory, which no write and no rename can replace. Same shape as
+        // the disk filling up or the process being killed mid-write.
+        std::fs::create_dir(dir.path().join("IMG_0001.xmp.tmp")).unwrap();
+        let interrupted = write_sidecar(&dest, &render_sidecar(5, None, &[], None, None));
+        assert!(
+            interrupted.is_err(),
+            "the replacement went straight onto the destination — a truncating write \
+             has nothing to interrupt, and so nothing to keep whole"
+        );
+
+        let after = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(after, before, "the previous packet was truncated");
+        assert!(
+            is_gpp_sidecar(&after),
+            "a half-written packet reads as another tool's file, and is then never repaired"
+        );
+        assert_eq!(read_sidecar(&dest).unwrap().rating, Some(3));
     }
 
     /// End to end through the catalog: fields land in the sidecar, a foreign

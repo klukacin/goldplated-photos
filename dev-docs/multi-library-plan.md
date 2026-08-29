@@ -104,9 +104,11 @@ sufficient public format. Decision:
   album membership/order (cross-photo), sync baselines, or the tag
   normalization the catalog does; and a thousand tiny files are the
   slow/fragile path for every query the grid makes. SQLite stays primary;
-  sidecars are (re)generated from it — they ride along in `full`-scope
-  sync and make a library reconstructible from its files alone
-  (catalog lost → re-import reads the sidecars back).
+  sidecars are (re)generated from it by `export_xmp`, and make a library
+  reconstructible from its files alone (catalog lost → re-import reads the
+  sidecars back). They do **not** ride along in `full`-scope sync: that
+  manifest is built from catalogued photos, and a sidecar is not one — the
+  same metadata crosses the wire in `album.gpp.json` instead.
 
 ## Schema phasing
 

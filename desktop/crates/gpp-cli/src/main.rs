@@ -907,7 +907,9 @@ fn cmd_remotes(args: &[String]) -> Result<()> {
                     "{:>3}  {:<20} {:<40} {:>3} tracked{}{}",
                     r.id,
                     r.name,
-                    if r.target.is_empty() { "(no target set)" } else { &r.target },
+                    // Never empty: `remotes()` lists destinations, not the
+                    // anchor row baselines hang off before one is chosen.
+                    r.target,
                     subs,
                     if r.token.is_some() { "  [token]" } else { "" },
                     if r.is_default { "  (default)" } else { "" },
@@ -1180,6 +1182,15 @@ fn cmd_pull(args: &[String]) -> Result<()> {
         println!("refused (the server named files this machine will not write):");
         for c in &outcome.rejected {
             println!("  {c}");
+        }
+    }
+    // Per-item failures: a develop stack this build cannot read, a metadata
+    // document that would not parse, a frame the full namespace cannot carry.
+    // The rest of the album arrived, which is exactly why these have to be said.
+    if !outcome.failed.is_empty() {
+        println!("not applied:");
+        for (what, why) in &outcome.failed {
+            println!("  {what}: {why}");
         }
     }
     Ok(())

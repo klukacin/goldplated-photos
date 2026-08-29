@@ -34,6 +34,13 @@
 //!   filled (rating 0, no flag, no label, no tags) and edits applied only
 //!   where no local stack exists. Anything both sides changed is reported in
 //!   `metadata_conflicts`, never resolved by guessing.
+//! - **One item's failure never fails the transfer.** A frame whose develop
+//!   stack this build cannot read, a document that will not parse, a
+//!   photograph the namespace cannot carry — each is named in
+//!   `PullOutcome::failed` / `PushOutcome::failed` and the rest still moves.
+//! - **A document's baseline means it was applied.** It is written after the
+//!   apply, never at fetch time, so a document that did not go on is retried
+//!   rather than treated as ours to overwrite.
 //! - **Deletes need `allow_deletes`**, and withheld ones are named.
 
 use std::collections::BTreeMap;
@@ -68,16 +75,25 @@ pub const METADATA_FILENAME: &str = "album.gpp.json";
 
 // ------------------------------------------------------------- the document
 
-/// The per-album metadata document, versioned. The bytes are what get hashed
-/// into the manifest, so serialization has to be deterministic: struct field
-/// order, album order for photos, sorted tags.
+/// The per-album metadata document, versioned.
+///
+/// **The bytes are the document's manifest hash, so identical content has to
+/// serialize to identical bytes on every machine.** That is not a tidiness
+/// preference: the doc carried the writing library's random `library_id`, so
+/// after A pushed and B pulled, each side regenerated a document the other
+/// could never match — `album.gpp.json` was re-uploaded on every sync in both
+/// directions and `apply_metadata` re-ran over the whole album each round, and
+/// a full-scope album never reached a clean state. Nothing per-machine or
+/// per-run may live in here: no identity, no timestamps, no paths. Provenance
+/// travels out of band, in [`crate::remote::ForeignPushOutcome`], where the
+/// receiving side can actually act on it.
+///
+/// Everything that remains is deterministic: struct field order is declaration
+/// order, photos follow album order, tags are stored alphabetically.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FullAlbumDoc {
     /// Format version of this document, not of anything it describes.
     pub version: u32,
-    /// The library that wrote it — provenance for a future master catalog.
-    #[serde(default)]
-    pub library_id: String,
     /// Album fields as the catalog holds them, for reconstruction. The web
     /// tree's `index.md` stays authoritative for the gallery; this is the
     /// catalog's own richer view.
@@ -143,7 +159,6 @@ pub fn album_metadata_bytes(lib: &Library, album_path: &str) -> Result<Vec<u8>> 
 
     let mut doc = FullAlbumDoc {
         version: DOC_VERSION,
-        library_id: lib.library_id()?,
         album: FullAlbumFields {
             title: album.title.clone(),
             description: album.description.clone(),
@@ -403,10 +418,11 @@ pub(crate) fn pull_full(
 
     // The albums the namespace mentions under this path.
     let mut albums: Vec<String> = Vec::new();
-    // Metadata documents to apply once every file has landed.
-    let mut metadata: Vec<(String, Vec<u8>)> = Vec::new();
+    // Metadata documents to apply once every file has landed, with the hash
+    // their baseline would take — recorded only once they have been applied.
+    let mut metadata: Vec<(String, Vec<u8>, String)> = Vec::new();
 
-    let mut dup_guard = Vec::new();
+    let mut duplicates = Vec::new();
     let known_albums: Vec<String> = remote_scoped
         .keys()
         .filter_map(|k| split_full_key(k).map(|(album, _)| album.to_string()))
@@ -420,8 +436,13 @@ pub(crate) fn pull_full(
             .filter(|a| lib.album_by_path(a).ok().flatten().is_some())
             .cloned()
             .collect::<Vec<_>>(),
-        &mut dup_guard,
+        &mut duplicates,
     )?;
+    // Two photographs of this album publishing the same full key, or one named
+    // `album.gpp.json`, is a finding about this library that the pull has just
+    // computed. The push side reports it; here it went into a throwaway and the
+    // photographer was never told which frame the namespace cannot carry.
+    outcome.failed.extend(duplicates);
 
     let synced = lib.synced_manifest_for(remote_id)?;
     let plan = sync::plan_scoped(&scope, SyncDirection::Pull, &local, &synced, &remote);
@@ -465,9 +486,13 @@ pub(crate) fn pull_full(
                 if filename == METADATA_FILENAME {
                     match transport.get(key) {
                         Ok(bytes) => {
+                            // The baseline is deliberately *not* written here.
+                            // See the loop at the end of this function: it
+                            // means "this document was applied", and recording
+                            // it before the apply was what turned one
+                            // unreadable op into their metadata being lost.
                             let hash = blake3::hash(&bytes).to_hex().to_string();
-                            lib.record_synced_for(remote_id, key, &hash)?;
-                            metadata.push((album.to_string(), bytes));
+                            metadata.push((album.to_string(), bytes, hash));
                         }
                         Err(e) => outcome
                             .rejected
@@ -525,45 +550,70 @@ pub(crate) fn pull_full(
             continue;
         }
         let album_dir = lib.resolve(album)?;
-        if album_dir.is_dir() {
-            crate::import::import_dir(
-                lib,
-                &album_dir,
-                &crate::import::ImportOptions { recursive: false, ..Default::default() },
-                None,
-                None,
-            )?;
+        if !album_dir.is_dir() {
+            continue;
         }
+        crate::import::import_dir(
+            lib,
+            &album_dir,
+            &crate::import::ImportOptions { recursive: false, ..Default::default() },
+            None,
+            None,
+        )?;
+
         // Newly catalogued originals (RAW above all — the web tree never
         // carried them) become members of their album.
+        //
+        // Asked of the catalog the other way round — every photo in the
+        // library, filtered in Rust — this cost a full table read per pulled
+        // album. The album's own folder is the only place a pull puts a file,
+        // so walking it and asking for those rows by their indexed
+        // (source, rel_path) is the same answer for the work it is worth.
+        // Only the primary source's rows: a referenced photo on another drive
+        // may carry a rel_path that reads like this album's folder and be an
+        // entirely different shoot.
         let members: std::collections::BTreeSet<String> = lib
             .album_photos(album)?
             .into_iter()
             .map(|p| p.filename)
             .collect();
-        // Only the primary source's rows. A pull writes into the library root,
-        // so that is where a newly arrived original is; a referenced photo on
-        // another drive may carry a rel_path that happens to look like this
-        // album's folder and is nothing of the kind.
         let primary = lib.primary_source_id()?;
-        let missing: Vec<i64> = lib
-            .photos(&crate::model::PhotoFilter::default())?
-            .into_iter()
-            .filter(|p| p.source_id == primary && is_direct_child_of(album, &p.rel_path))
-            .filter(|p| !members.contains(&p.filename))
-            .map(|p| p.id)
-            .collect();
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&album_dir).map_err(|e| Error::io(&album_dir, e))? {
+            let entry = entry.map_err(|e| Error::io(&album_dir, e))?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if members.contains(&name) {
+                continue;
+            }
+            if let Some(photo) = lib.photo_by_source_rel_path(primary, &format!("{album}/{name}"))?
+            {
+                missing.push(photo.id);
+            }
+        }
         if !missing.is_empty() {
             lib.add_photos_to_album(album, &missing)?;
         }
     }
 
-    for (album, bytes) in metadata {
+    for (album, bytes, hash) in metadata {
+        let key = full_key(&album, METADATA_FILENAME);
         match serde_json::from_slice::<FullAlbumDoc>(&bytes) {
-            Ok(doc) => apply_metadata(lib, &album, &doc, outcome)?,
-            Err(e) => outcome
-                .rejected
-                .push(format!("{}/{album}/{METADATA_FILENAME} (unreadable: {e})", FULL_PREFIX)),
+            Ok(doc) => {
+                // The baseline is what says "this document was applied here".
+                // Written at fetch time, a document that then failed to apply
+                // left a baseline claiming it had: the next run read local ≠
+                // synced = remote as *this* machine's change and pushed our
+                // document over theirs, so their metadata was neither applied
+                // nor mentioned again. Recording it only on success costs a
+                // retry and keeps the two sides honest — and until it succeeds
+                // the doc reads as a conflict rather than as ours to overwrite.
+                if apply_metadata(lib, &album, &doc, outcome)? {
+                    lib.record_synced_for(remote_id, &key, &hash)?;
+                }
+            }
+            Err(e) => outcome.failed.push((key, format!("unreadable: {e}"))),
         }
     }
     Ok(())
@@ -577,11 +627,16 @@ fn split_full_key(key: &str) -> Option<(&str, &str)> {
     (!album.is_empty() && !filename.is_empty()).then_some((album, filename))
 }
 
-fn is_direct_child_of(album_path: &str, rel_path: &str) -> bool {
-    rel_path
-        .strip_prefix(album_path)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .is_some_and(|name| !name.contains('/'))
+/// Tag lists compared as sets.
+///
+/// [`Library::photo_tags`] answers `ORDER BY name` and so does every document
+/// this build writes, but a document from an older writer may list them in any
+/// order — and an ordering difference is not a disagreement about what the
+/// photograph is tagged, so it must not be reported as one.
+fn same_tags(local: &[String], remote: &[String]) -> bool {
+    let local: std::collections::BTreeSet<&str> = local.iter().map(String::as_str).collect();
+    let remote: std::collections::BTreeSet<&str> = remote.iter().map(String::as_str).collect();
+    local == remote
 }
 
 /// Apply a pulled metadata document with import-style caution.
@@ -591,12 +646,33 @@ fn is_direct_child_of(album_path: &str, rel_path: &str) -> bool {
 /// filled, and edits land only where no local stack exists. A field both
 /// sides changed — local non-default, remote different — is named in
 /// `metadata_conflicts` and left exactly as it is.
+///
+/// Returns whether the whole document went on. **One photo's metadata that
+/// cannot be applied is a per-item report, never a failed pull**: an op from a
+/// newer build is a hard parse error, and letting it out of here took the
+/// entire pull down *after* the originals had landed and the baselines were
+/// written — so the retry then read our document as the newer one and pushed
+/// it over theirs. Every other error path in this module names the item and
+/// carries on; this one now does too, and a `false` here withholds the
+/// baseline so the next run tries again.
 fn apply_metadata(
     lib: &Library,
     album: &str,
     doc: &FullAlbumDoc,
     outcome: &mut PullOutcome,
-) -> Result<()> {
+) -> Result<bool> {
+    if lib.album_by_path(album)?.is_none() {
+        // A full namespace naming an album the web tree does not hold: the
+        // files are on disk, there is no row to hang metadata off, and saying
+        // so beats recording a baseline for work never done.
+        outcome.failed.push((
+            full_key(album, METADATA_FILENAME),
+            format!("no album '{album}' in this catalog — its metadata was not applied"),
+        ));
+        return Ok(false);
+    }
+
+    let mut applied_whole = true;
     for entry in &doc.photos {
         let rel = format!("{album}/{}", entry.filename);
         let Some(photo) = lib.photo_by_rel_path(&rel)? else {
@@ -634,23 +710,69 @@ fn apply_metadata(
             let local_tags = lib.photo_tags(photo.id)?;
             if local_tags.is_empty() {
                 lib.set_photo_tags(photo.id, &entry.tags)?;
-            } else if local_tags != entry.tags {
+            } else if !same_tags(&local_tags, &entry.tags) {
                 conflict("tags");
             }
         }
         if let Some(edits) = &entry.edits {
-            let local_stack = lib.edits(photo.id)?;
-            let incoming = crate::develop::EditStack::from_json(&edits.to_string())?;
-            if local_stack.is_empty() {
-                if !incoming.is_empty() {
-                    lib.set_edits(photo.id, &incoming)?;
+            match crate::develop::EditStack::from_json(&edits.to_string()) {
+                Ok(incoming) => {
+                    let local_stack = lib.edits(photo.id)?;
+                    if local_stack.is_empty() {
+                        if !incoming.is_empty() {
+                            lib.set_edits(photo.id, &incoming)?;
+                        }
+                    } else if local_stack != incoming {
+                        conflict("develop stack");
+                    }
                 }
-            } else if local_stack != incoming {
-                conflict("develop stack");
+                Err(e) => {
+                    // An op this build has never heard of — a stack written by
+                    // a newer version. It is deliberately *not* stored
+                    // verbatim: the render key hashes the stack, so a build
+                    // that could not apply an op would still cache and serve
+                    // pixels under a key claiming it had, and two versions
+                    // would disagree about what one key means. Naming the
+                    // frame and leaving its stack alone is the honest answer.
+                    outcome
+                        .failed
+                        .push((rel.clone(), format!("develop stack not applied: {e}")));
+                    applied_whole = false;
+                }
             }
         }
     }
-    Ok(())
+
+    // Album order, last, once every original the document names is catalogued.
+    //
+    // The web half applies the server's `photoOrder` — but that names
+    // *published* files and runs before the full-scope originals arrive, so on
+    // a fresh library it reordered an empty album and `sort: custom` was
+    // silently dropped on the receiving machine. This list is the sending
+    // catalog's own, by *library* filename, so a HEIC needs no published-name
+    // matching and a RAW (which `photoOrder` never mentions, because it is
+    // never published) takes its place too.
+    //
+    // Applied rather than reconciled, exactly as the web pull applies
+    // `photoOrder`: an order is one album-wide fact with no per-field default
+    // to compare against, and nothing is lost by it — members the document does
+    // not name keep their relative order, after the ones it does.
+    if !doc.membership.is_empty() {
+        let ordered: Vec<i64> = doc
+            .membership
+            .iter()
+            .filter_map(|name| {
+                lib.photo_by_rel_path(&format!("{album}/{name}"))
+                    .ok()
+                    .flatten()
+            })
+            .map(|p| p.id)
+            .collect();
+        if !ordered.is_empty() {
+            lib.reorder_album(album, &ordered)?;
+        }
+    }
+    Ok(applied_whole)
 }
 
 /// One photo's presence check against the doc — used by tests.

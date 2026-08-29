@@ -13,11 +13,16 @@
 //!
 //! One of each may be the **default**: the row the un-suffixed compatibility
 //! APIs (`remote_dir`, `publish_target`, …) operate on. The default is a
-//! settings row; with none written it is the lowest id. When nothing is
-//! configured at all, the internals lazily create a placeholder row named
-//! "Main" with an empty target, so that baselines recorded before a remote is
-//! chosen (tests drive transports directly this way) still have a row to hang
-//! off — an empty target reads back as "no remote configured".
+//! settings row; with none written it is the lowest id.
+//!
+//! When nothing is configured at all, the internals lazily create an **anchor**
+//! row named "Main" with an empty target: `album_sync` and `sync_state` both
+//! hold a `NOT NULL REFERENCES remotes(id)`, so an album tracked or a baseline
+//! recorded before a destination is chosen needs a row to point at. An anchor
+//! is bookkeeping and not a remote — [`Library::remotes`] does not list it and
+//! [`Library::remote_by_id`] does not return it, so nothing can pick it, push
+//! to it or make it the default, and a caller asking for a destination gets
+//! "no remote configured" exactly as it would with no rows at all.
 
 use std::path::Path;
 
@@ -100,6 +105,17 @@ impl Library {
     // ------------------------------------------------------------- remotes
 
     /// Every remote this library knows, lowest id first.
+    ///
+    /// A row with an empty target is **not** one of them. It is the anchor
+    /// [`ensure_default_remote`](Self::ensure_default_remote) creates so that
+    /// subscriptions and baselines — both `NOT NULL REFERENCES remotes(id)` —
+    /// have a row to hang off before a destination is chosen. Listing it
+    /// offered a picker a remote pointing nowhere, and left this library
+    /// disagreeing with itself: [`read_library_remotes`] has always filtered
+    /// the same rows out, so the same catalog answered "one remote" read from
+    /// inside and "none" read from outside.
+    ///
+    /// [`read_library_remotes`]: crate::remotes::read_library_remotes
     pub fn remotes(&self) -> Result<Vec<RemoteInfo>> {
         let default = self.default_remote_id()?;
         self.with_conn(|c| {
@@ -118,6 +134,9 @@ impl Library {
             let mut out = Vec::new();
             for row in rows {
                 let mut info = row?;
+                if info.target.is_empty() {
+                    continue;
+                }
                 info.is_default = Some(info.id) == default;
                 out.push(info);
             }
@@ -125,7 +144,8 @@ impl Library {
         })
     }
 
-    /// One remote by id, or `None`.
+    /// One remote by id, or `None` — including for an unconfigured anchor row,
+    /// which is not a remote a caller can sync to.
     pub fn remote_by_id(&self, id: i64) -> Result<Option<RemoteInfo>> {
         Ok(self.remotes()?.into_iter().find(|r| r.id == id))
     }
@@ -195,8 +215,16 @@ impl Library {
         Ok(())
     }
 
-    /// The remote the un-suffixed APIs act on. A stored choice wins; otherwise
-    /// the lowest id; `None` when the table is empty.
+    /// The remote row the un-suffixed APIs act on. A stored choice wins;
+    /// otherwise the lowest id; `None` when the table is empty.
+    ///
+    /// This is the *bookkeeping* default — the row subscriptions and baselines
+    /// are keyed by — so an unconfigured anchor row counts here, deliberately:
+    /// `track_album` and `record_synced` write against it before a destination
+    /// is chosen, and [`album_subscriptions`](Self::album_subscriptions) has to
+    /// find those rows again. Anything that needs a place to *send* files asks
+    /// [`remote_by_id`](Self::remote_by_id) instead, which never answers with
+    /// an anchor, and so still fails with "no remote configured".
     pub fn default_remote_id(&self) -> Result<Option<i64>> {
         if let Some(stored) = self
             .get_setting(SETTING_DEFAULT_REMOTE)?
@@ -225,11 +253,18 @@ impl Library {
         self.set_setting(SETTING_DEFAULT_REMOTE, &id.to_string())
     }
 
-    /// The default remote's id, creating a placeholder row when the table is
-    /// empty — baselines and subscriptions need a row to reference even before
-    /// a destination is chosen (which is exactly how the tests drive
-    /// transports directly). Public because the CLI configures remotes
-    /// through the `Library` handle directly.
+    /// The default remote's id, creating an **anchor** row when the table is
+    /// empty — `album_sync.remote_id` and `sync_state.remote_id` are both
+    /// `NOT NULL REFERENCES remotes(id)`, so baselines and subscriptions need a
+    /// row to reference even before a destination is chosen (which is exactly
+    /// how a caller holding its own transport drives one). Public because the
+    /// CLI configures remotes through the `Library` handle directly.
+    ///
+    /// The row it creates is bookkeeping, not a destination:
+    /// [`remotes`](Self::remotes) does not list it and
+    /// [`remote_by_id`](Self::remote_by_id) does not return it, so it can never
+    /// be picked or pushed to. Pointing it somewhere with
+    /// [`update_remote`](Self::update_remote) is what turns it into a remote.
     pub fn ensure_default_remote(&self) -> Result<i64> {
         if let Some(id) = self.default_remote_id()? {
             return Ok(id);
@@ -512,6 +547,51 @@ mod tests {
         lib.remove_remote(b).unwrap();
         assert_eq!(lib.default_remote_id().unwrap(), Some(a), "default falls back");
         assert!(lib.update_remote(b, &RemoteUpdate::default()).is_err(), "gone is gone");
+    }
+
+    /// An unconfigured library is not a library with a remote.
+    ///
+    /// `ensure_default_remote` writes an anchor row because `album_sync` and
+    /// `sync_state` both hold a `NOT NULL REFERENCES remotes(id)`, so an album
+    /// tracked or a baseline recorded before a destination is chosen needs a row
+    /// to point at. Listing that row as a remote offered a picker somewhere to
+    /// send a wedding that goes nowhere — and made one catalog answer "one
+    /// remote" read from inside and "none" read from outside, through
+    /// `read_library_remotes`, which has always filtered it.
+    #[test]
+    fn an_unconfigured_anchor_row_is_not_a_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path()).unwrap();
+        let anchor = lib.ensure_default_remote().unwrap();
+
+        // It does its job: a subscription and a baseline hang off it.
+        lib.track_album_for("2026/x", crate::sync::SyncDirection::Push, None, anchor)
+            .unwrap();
+        lib.record_synced_for(anchor, "2026/x/a.jpg", "h").unwrap();
+        assert_eq!(lib.album_subscriptions().unwrap().len(), 1);
+
+        // …and it is not a destination, from either side of the catalog.
+        assert!(lib.remotes().unwrap().is_empty(), "a remote pointing nowhere was listed");
+        assert!(lib.remote_by_id(anchor).unwrap().is_none());
+        assert!(read_library_remotes(dir.path()).unwrap().is_empty());
+        assert!(lib.set_default_remote(anchor).is_err(), "nor can it be chosen");
+
+        // Pointing it somewhere is what makes it one — the same row, so the
+        // books kept before a destination existed are still there.
+        lib.update_remote(
+            anchor,
+            &RemoteUpdate { target: Some("/srv/gallery".into()), ..Default::default() },
+        )
+        .unwrap();
+        let listed = lib.remotes().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_default);
+        assert_eq!(
+            lib.ensure_default_remote().unwrap(),
+            anchor,
+            "a second anchor would split this library's baselines across two rows"
+        );
+        assert_eq!(lib.synced_manifest_for(anchor).unwrap().len(), 1);
     }
 
     #[test]

@@ -983,8 +983,12 @@ pub fn lr_import(
                     ));
                     continue;
                 }
-                report.photos_copied += 1;
+                // Counted inside the guard: the file already being there means
+                // this run copied nothing, and saying it did made a re-run
+                // report work it had not done. `bytes_copied` was always
+                // right, which is how the two disagreed.
                 if !dest.is_file() {
+                    report.photos_copied += 1;
                     report.bytes_copied += size;
                     if !dry {
                         if let Some(parent) = dest.parent() {
@@ -2047,6 +2051,27 @@ mod tests {
             1,
             "the hand-set rating was clobbered by Lightroom's 3"
         );
+    }
+
+    #[test]
+    fn a_file_already_at_its_destination_is_not_reported_as_copied() {
+        let (lib, lib_dir, elsewhere, lrcat) = fixture();
+        // The copy is already exactly where this import would put it — an
+        // interrupted run, a restored backup, a folder dragged across by hand.
+        // Nothing is catalogued for it, so the run reaches the copy step and
+        // finds its work already done.
+        let dest = lib_dir.path().join("lr/shoot-b/b1.jpg");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(elsewhere.path().join("shoot-b/b1.jpg"), &dest).unwrap();
+
+        let report = lr_import(&lib, &lrcat, &LrImportOptions::default(), None, None).unwrap();
+        assert_eq!(
+            report.photos_copied, 1,
+            "only b2 was copied; b1 was already there and nothing was written for it"
+        );
+        assert!(report.conflicts.is_empty(), "same bytes is not a conflict: {:?}", report.conflicts);
+        // The photograph is still catalogued — not copied is not not imported.
+        assert!(lib.photo_by_rel_path("lr/shoot-b/b1.jpg").unwrap().is_some());
     }
 
     #[test]

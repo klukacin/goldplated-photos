@@ -730,19 +730,20 @@ impl Session {
         &self,
         remote_id: Option<i64>,
     ) -> Result<(i64, Box<dyn crate::sync::RemoteTransport>)> {
-        let info = self.with(|lib| {
-            let id = match remote_id {
-                Some(id) => id,
-                None => lib
-                    .default_remote_id()?
-                    .ok_or_else(|| Error::other("no remote configured"))?,
-            };
-            lib.remote_by_id(id)?
-                .ok_or_else(|| Error::other(format!("no remote with id {id}")))
+        // `remote_by_id` never answers with an unconfigured anchor row (see
+        // `Library::remotes`), so a library that has never been pointed
+        // anywhere reaches "no remote configured" whether it carries an anchor
+        // or no rows at all — rather than naming an id the user never chose.
+        let info = self.with(|lib| match remote_id {
+            Some(id) => lib
+                .remote_by_id(id)?
+                .ok_or_else(|| Error::other(format!("no remote with id {id}"))),
+            None => lib
+                .default_remote_id()?
+                .and_then(|id| lib.remote_by_id(id).transpose())
+                .transpose()?
+                .ok_or_else(|| Error::other("no remote configured")),
         })?;
-        if info.target.is_empty() {
-            return Err(Error::other("no remote configured"));
-        }
         Ok((info.id, Self::build_transport(&info.target, info.token)?))
     }
 

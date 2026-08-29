@@ -111,6 +111,14 @@ pub struct PullOutcome {
     /// and different there. Reported, never resolved by guessing; the web
     /// scope never produces one.
     pub metadata_conflicts: Vec<String>,
+    /// Work this pull could not do, named with the reason — the read twin of
+    /// [`PushOutcome::failed`]. A develop stack carrying an op this build does
+    /// not know, a metadata document that would not parse, two photographs of
+    /// one album that would publish the same full-scope key. Each is one item's
+    /// failure and none of them stops the rest of the transfer; a caller that
+    /// drops this list has turned a partial pull into something that looks
+    /// exactly like a complete one.
+    pub failed: Vec<(String, String)>,
     /// Every album this operation touched, shallowest first: the folders above
     /// the path, the path itself, and everything under it.
     pub albums: Vec<String>,
@@ -279,15 +287,42 @@ pub fn pull_album_for(
     published_root: &Path,
     scope: SyncScopeKind,
 ) -> Result<PullOutcome> {
+    let full_roots = lib.full_scope_albums()?;
     let mut outcome = pull_one(
         lib, remote_id, transport, album_path, published_root,
-        scope == SyncScopeKind::Web,
+        may_adopt_media(scope, &full_roots, album_path),
     )?;
     if scope == SyncScopeKind::Full {
         crate::full::pull_full(lib, remote_id, transport, album_path, &mut outcome)?;
     }
     track_default(lib, remote_id, album_path, SyncDirection::Both, scope)?;
     Ok(outcome)
+}
+
+/// Whether a pull of `album_path` may make the published bytes this library's
+/// copy of a photo it does not hold.
+///
+/// Only a web-scope pass ever may, and only where no full-scope subscription
+/// covers the album — its own or an ancestor's (`full_roots` comes from
+/// [`Library::full_scope_albums`], which spans every remote because the file
+/// under the library root does too).
+///
+/// The answer is read from the subscription table rather than from whatever the
+/// current pass happens to be doing, because the two are not the same thing and
+/// the difference cost originals. `sync_tracked_albums_for` runs each
+/// subscription separately: a folder tracked `web` and an album inside it
+/// tracked `full` are two passes, and the subscriptions come back `ORDER BY
+/// album_path`, so the folder — the shallower path — always runs first. Its web
+/// pull adopted the gallery's published bytes as the library's copy of every
+/// photo underneath, and the album's own full pull then found the file present
+/// and quite correctly refused to overwrite it. The library's "originals" were
+/// the gallery's developed, HEIC→JPEG-converted, rating-filtered pixels, the
+/// RAW never landed at all, and the only thing said about it was a
+/// `kept_originals` entry that reads like a safety message. Deciding per album
+/// from what is stored is what makes the answer independent of which pass runs
+/// first: no ordering of subscriptions can reintroduce the substitution.
+fn may_adopt_media(scope: SyncScopeKind, full_roots: &[String], album_path: &str) -> bool {
+    scope == SyncScopeKind::Web && !full_roots.iter().any(|root| at_or_under(root, album_path))
 }
 
 /// Pull one album without subscribing to it.
@@ -589,22 +624,25 @@ pub fn pull_path_for(
         album_path: path.to_string(),
         ..Default::default()
     };
+    let full_roots = lib.full_scope_albums()?;
     for album in targets {
         let one = pull_one(
             lib, remote_id, transport, &album, published_root,
-            scope == SyncScopeKind::Web,
+            may_adopt_media(scope, &full_roots, &album),
         )?;
         total.files_pulled += one.files_pulled;
         total.photos_imported += one.photos_imported;
         total.skipped_unchanged += one.skipped_unchanged;
         total.conflicts.extend(one.conflicts);
-        // Both of these are warnings, and this is the form the UI calls, so
-        // dropping them here is the same as never producing them: a kept
+        // All three of these are warnings, and this is the form the UI calls,
+        // so dropping them here is the same as never producing them: a kept
         // original said the server disagrees about a negative there is only one
-        // copy of, and a rejected path said the server asked for something no
-        // honest one asks for. Neither reached a screen.
+        // copy of, a rejected path said the server asked for something no
+        // honest one asks for, and a failure said part of the album is not
+        // here. None of them reached a screen.
         total.kept_originals.extend(one.kept_originals);
         total.rejected.extend(one.rejected);
+        total.failed.extend(one.failed);
         total.albums.push(album);
     }
 
@@ -807,6 +845,7 @@ pub fn sync_path_for(
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
                 conflicts: merged_conflicts(pulled.conflicts, pulled.metadata_conflicts),
+                failed: pulled.failed,
                 ..Default::default()
             })
         }
@@ -843,6 +882,8 @@ pub fn sync_path_for(
 
             let mut conflicts = merged_conflicts(pulled.conflicts, pulled.metadata_conflicts);
             conflicts.extend(pushed.conflicts);
+            let mut failed = pulled.failed;
+            failed.extend(pushed.failed);
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
                 pushed: pushed.files_pushed,
@@ -850,7 +891,7 @@ pub fn sync_path_for(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
-                failed: pushed.failed,
+                failed,
                 ..Default::default()
             })
         }
@@ -941,10 +982,22 @@ pub fn push_album_for(
         folders_left_alone: Vec::new(),
     };
     if scope == SyncScopeKind::Full {
+        // The whole subtree, not just this album — because the plan inside
+        // `push_full` scopes `__gpp_full__/<path>`, which *is* the whole
+        // subtree. Handed one album's keys as the local side, every original a
+        // sub-album had pushed earlier read as locally absent: DeleteRemote
+        // with `allow_deletes`, and a withheld-delete report naming files
+        // nobody had deleted without it. The local side has to cover exactly
+        // what the plan looks at, which is what `push_path_for` already does.
+        let mut subtree: Vec<String> = lib
+            .albums()?
+            .into_iter()
+            .map(|a| a.path)
+            .filter(|p| at_or_under(album_path, p))
+            .collect();
+        shallowest_first(&mut subtree);
         crate::full::push_full(
-            lib, remote_id, transport, album_path,
-            std::slice::from_ref(&album_path.to_string()),
-            allow_deletes, &mut out,
+            lib, remote_id, transport, album_path, &subtree, allow_deletes, &mut out,
         )?;
     }
     track_default(lib, remote_id, album_path, SyncDirection::Push, scope)?;
@@ -992,6 +1045,7 @@ pub fn sync_album_for(
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
                 conflicts: merged_conflicts(pulled.conflicts, pulled.metadata_conflicts),
+                failed: pulled.failed,
                 ..Default::default()
             })
         }
@@ -1023,6 +1077,8 @@ pub fn sync_album_for(
 
             let mut conflicts = merged_conflicts(pulled.conflicts, pulled.metadata_conflicts);
             conflicts.extend(pushed.conflicts);
+            let mut failed = pulled.failed;
+            failed.extend(pushed.failed);
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
                 pushed: pushed.files_pushed,
@@ -1030,7 +1086,7 @@ pub fn sync_album_for(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
-                failed: pushed.failed,
+                failed,
                 ..Default::default()
             })
         }
