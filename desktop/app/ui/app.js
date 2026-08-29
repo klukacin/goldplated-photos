@@ -2793,10 +2793,11 @@ function lrRootChoices() {
 
 /// Why the chosen placements cannot be sent as picked, or null when they can.
 ///
-/// `roots` is a list of `{ root_id, mode }`, and the scan report does not name
-/// a root id at all. One answer for every folder still travels exactly — the
-/// core falls back to the run-wide `mode` for any root it has no override for
-/// — so only a mixed selection is stuck, and inventing an id would hand some
+/// `roots` is a list of `{ root_id, mode }` keyed by the id the scan reports
+/// per folder, so normally every selection travels as picked. The guard is for
+/// a scan that named no ids — an older core — where one answer for every
+/// folder still travels exactly (the core falls back to the run-wide `mode`),
+/// and only a mixed selection is stuck: inventing an id there would hand some
 /// folder another folder's answer without a word.
 function lrPlacementProblem() {
   const choices = lrRootChoices();
@@ -2805,8 +2806,7 @@ function lrPlacementProblem() {
   if (new Set(choices.map((c) => c.mode)).size <= 1) return null;
   return (
     'Different folders are set to different placements, and this catalog scan ' +
-    'does not name the folder ids the core needs to tell them apart ' +
-    '(LrRootReport carries no id for LrRootPlacement.root_id). Set every ' +
+    'did not name the folder ids the core needs to tell them apart. Set every ' +
     'folder to the same placement to run it, or import the folders in ' +
     'separate runs.'
   );

@@ -564,6 +564,11 @@ fn safe_segment(seg: &str) -> String {
 /// One root folder as the scan reports it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LrRootReport {
+    /// `AgLibraryRootFolder.id_local` — the same id `LrRootPlacement` is keyed
+    /// by, so a caller can turn this report straight into per-root choices.
+    /// Without it a UI can only set one placement for the whole run: it has no
+    /// way to say which folder an answer belongs to.
+    pub root_id: i64,
     /// The root folder's absolute path, as the catalog records it.
     pub path: String,
     pub name: String,
@@ -628,6 +633,7 @@ pub fn scan(lib: &Library, lrcat: &Path) -> Result<LrScanReport> {
         let abs = PathBuf::from(root.absolute_path.trim_end_matches('/'));
         let in_place = lib.source_containing(&abs)?.is_some();
         root_folders.push(LrRootReport {
+            root_id: root.id,
             path: root.absolute_path.clone(),
             name: root.name.clone(),
             file_count,
@@ -1950,6 +1956,48 @@ mod tests {
         assert!(report.sources_registered.is_empty());
         assert!(lib_dir.path().join("lr/shoot-b/b1.jpg").exists());
         assert_eq!(lib.sources().unwrap().len(), 1);
+    }
+
+    /// The scan report is what a UI builds its per-root choices from, so the
+    /// ids it hands out have to be the ids a placement is keyed by. When they
+    /// were missing, a wizard could only set one placement for the whole run.
+    #[test]
+    fn a_scan_reports_the_ids_placements_are_keyed_by() {
+        let (lib, lib_dir, _elsewhere, lrcat) = fixture();
+        let scanned = scan(&lib, &lrcat).unwrap();
+
+        // Exactly what a wizard does: one answer per row of the report.
+        let roots = scanned
+            .root_folders
+            .iter()
+            .map(|r| LrRootPlacement {
+                root_id: r.root_id,
+                mode: if r.name == "shoot-b" {
+                    LrPlacement::Copy
+                } else {
+                    LrPlacement::InPlace
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let report = lr_import(
+            &lib,
+            &lrcat,
+            &LrImportOptions {
+                roots: Some(roots),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.photos_copied, 2, "shoot-b was told to copy");
+        assert!(lib_dir.path().join("lr/shoot-b/b1.jpg").exists());
+        assert!(
+            report.sources_registered.is_empty(),
+            "and nothing was referenced, so no source was added"
+        );
     }
 
     /// Asking for in-place on a root that is outside the library can only be
