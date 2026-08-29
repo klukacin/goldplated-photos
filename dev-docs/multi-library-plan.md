@@ -118,3 +118,11 @@ sufficient public format. Decision:
   (target_id, album_path, filename), `library_id` in settings. Migration
   folds today's single remote/dest into row #1 of each; behavior after
   migration is identical until a second remote is added.
+- **V6** (phase 3): `sources` (id, name, path, kind, volume_hint,
+  is_primary) and `photos.source_id`, with `rel_path` relative to its own
+  source — referenced photos, offline drives, and Lightroom import without
+  file migration. The library root migrates to source #1 and a single-source
+  library behaves exactly as before. **The migration brackets itself with
+  `PRAGMA foreign_keys OFF`**: the `photos` rebuild's `DROP TABLE` otherwise
+  cascades away every album membership and edit stack, leaving a catalog
+  that opens cleanly on an emptied library.

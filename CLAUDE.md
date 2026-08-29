@@ -650,7 +650,7 @@ A library is a folder of photos the user already has. The app never moves them; 
   .gpp/thumbs/<shard>/<key>_*.jpg  content-addressed derived images
 ```
 
-Importing a folder from **outside** the library copies it in, because the catalog addresses photos by their path under the root and cannot point anywhere else.
+A photo is addressed by its path under a **source**: the library root (the primary — where `.gpp/`, copy-in imports and pulls land) plus any other root registered with `add_source`. A folder from outside can therefore be **copied in** (the default, for a camera card) or **referenced** — catalogued where it lies, nothing copied, which is what Lightroom import's `Reference` placement uses. An unreachable source is *offline*, not lost: listings and thumbnails still work from the cache, anything needing pixels returns `Error::SourceOffline`, and `prune_missing` skips it rather than deleting the record of every photo on an unplugged drive.
 
 ### Develop is non-destructive
 
@@ -664,7 +664,7 @@ Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the
 
 **HEIC and WebP are first-class.** An iPhone shoots HEIC by default and guests send it, so the core decodes HEIF with a pure-Rust HEVC decoder (`heif-oxide`) rather than libheif — libheif is LGPL, which the licence policy forbids, and linking C would cost the portability contract. It costs speed: ~9 MP/s on one core, so ~2.5 s for a 24 MP frame against a few hundred ms for JPEG, parallelised across cores at import. **A HEIF frame is published as JPEG**, developed or not (`publish::published_filename`), because Chrome and Firefox cannot display HEIC at all — only Safari can — so a HEIC in the gallery is a broken image for most visitors, and a developed one is JPEG bytes anyway. Converting either way keeps the published name stable across a develop, and the published filename is the URL. WebP needs none of this: it decodes natively and every browser shows it.
 
-**Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), and copying a photo *into* the library on import. `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
+**Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), copying a photo *into* the library on import, and XMP sidecars *beside* originals when `export_xmp` is asked for them (never the image file itself). `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
 
 ### Publish and sync are different things
 

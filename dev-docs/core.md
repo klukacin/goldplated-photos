@@ -23,11 +23,24 @@ them; it writes a catalog beside them:
   .gpp/thumbs/<shard>/<key>_*.jpg  content-addressed derived images
 ```
 
-Importing a folder from **outside** the library copies it in
-(`import::bring_inside`), because the catalog addresses photos by their path
-under the root and cannot point anywhere else. The CLI and the app both say
-where the copies landed — a library silently growing by a card's worth of
-gigabytes is not acceptable.
+A photo is addressed by its path under a **source**, and a library has one
+source per root it knows: the library root itself (the primary, which is
+where `.gpp/` and every copy-in and pull lands) plus any root registered with
+`add_source`. So a folder from outside the library can go two ways:
+
+- **Copied in** (`import::bring_inside`) — the default for a camera card, and
+  the only behaviour before sources existed. The CLI and the app both say
+  where the copies landed; a library silently growing by a card's worth of
+  gigabytes is not acceptable.
+- **Referenced** — registered as a source and catalogued where it lies, for
+  photos already organised on another disk (this is what Lightroom import's
+  `Reference` placement uses). Nothing is copied.
+
+A source whose root is not reachable is **offline**, not lost: listings and
+thumbnails keep working from the content-addressed cache, while anything
+needing the pixels returns `Error::SourceOffline` naming the source, and
+`prune_missing` skips it entirely — pruning an unplugged drive would delete
+the catalog's record of every photo on it.
 
 **The catalog is a derived index.** The filesystem holds the pixels; a lost or
 corrupt catalog is rebuilt by re-importing. That is why a corrupt DB is an
