@@ -782,21 +782,33 @@ async fn lr_import(
     lrcat_path: String,
     options: LrImportOptions,
 ) -> CmdResult<LrImportReport> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<Session>();
-        let emitter = app.clone();
-        state
-            .lr_import(
-                lrcat_path,
-                options,
-                Some(&move |p| {
-                    let _ = emitter.emit("import-progress", p);
-                }),
-            )
-            .map_err(to_msg)
+    let report = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || {
+            let state = app.state::<Session>();
+            let emitter = app.clone();
+            state
+                .lr_import(
+                    lrcat_path,
+                    options,
+                    Some(&move |p| {
+                        let _ = emitter.emit("import-progress", p);
+                    }),
+                )
+                .map_err(to_msg)
+        }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    // A root imported by reference is registered as a source by the run
+    // itself, so the asset scope has to catch up the same way `add_source`
+    // makes it — otherwise those originals are outside everything the webview
+    // may read, and nothing says so.
+    if !report.sources_registered.is_empty() {
+        allow_reading_library(&app);
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------- xmp
