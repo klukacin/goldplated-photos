@@ -27,11 +27,29 @@ export const CONTENT_ROOT = path.resolve(process.cwd(), 'src/content/albums');
  * with no token and no album password. So: set `SYNC_FULL_ROOT` to a path
  * outside the web root on any server that fronts this app with a web server.
  * The in-tree default stays for development, and `sealPrivateStore()` writes
- * a deny-all `.htaccess` into the store as a second line of defence.
+ * a deny-all `.htaccess` into the store as a second line of defence — which
+ * Apache ignores under `AllowOverride None` and nginx never reads at all, so
+ * the env var is the real protection and the warning below says so out loud.
  */
 export const FULL_SYNC_ROOT = process.env.SYNC_FULL_ROOT?.trim()
   ? path.resolve(process.env.SYNC_FULL_ROOT.trim())
   : path.resolve(process.cwd(), '.sync-full');
+
+// A production server whose store sits under its own working directory is one
+// misconfigured web server away from serving camera originals to anyone who
+// guesses the path. Say so where an operator will see it — at startup, in the
+// log — rather than leaving it to whoever reads .env.example.
+if (
+  import.meta.env?.PROD &&
+  (FULL_SYNC_ROOT === process.cwd() || FULL_SYNC_ROOT.startsWith(process.cwd() + path.sep))
+) {
+  console.warn(
+    `[sync] SYNC_FULL_ROOT is unset, so full-scope originals are stored at ${FULL_SYNC_ROOT}, ` +
+      `inside this process's working directory. If a web server serves static files from there, ` +
+      `every uploaded original is downloadable without a token. Set SYNC_FULL_ROOT to a path ` +
+      `outside the web root.`
+  );
+}
 
 /** Apache 2.4 and 2.2 spellings of "serve nothing from this directory". */
 const DENY_ALL_HTACCESS = `# Full-scope sync store: camera originals and album metadata.
