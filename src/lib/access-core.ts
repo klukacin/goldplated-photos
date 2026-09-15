@@ -97,12 +97,20 @@ export function _resetSecretForTests(): void {
 // Primitives
 // ---------------------------------------------------------------------------
 
-/** Constant-time string comparison (length-safe). */
+/**
+ * Constant-time string comparison.
+ *
+ * `timingSafeEqual` needs equal-length inputs, and returning early on a
+ * length mismatch is itself a (tiny) oracle for the secret's length. So both
+ * sides are reduced to a fixed-width digest first and those are compared —
+ * every call does the same work whatever the inputs. The key is arbitrary
+ * and constant: it only exists to make the digests fixed-width, not secret.
+ */
+const COMPARE_KEY = Buffer.from('goldplated-photos.safeCompare');
 export function safeCompare(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+  const digestA = createHmac('sha256', COMPARE_KEY).update(a).digest();
+  const digestB = createHmac('sha256', COMPARE_KEY).update(b).digest();
+  return timingSafeEqual(digestA, digestB);
 }
 
 function sign(payload: string): string {

@@ -10,6 +10,7 @@ import type { APIRoute } from 'astro';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { checkSyncAuth, safeRelPath } from '../../../lib/sync-auth';
+import { getClientIp } from '../../../lib/access-core';
 import { flushHashCache, forgetHash, rememberHash } from './_hash-cache';
 import { blake3HexOf, CONTENT_ROOT, jsonError } from './_shared';
 
@@ -27,8 +28,8 @@ function resolve(url: URL): { full: string; rel: string } | null {
   return { full, rel };
 }
 
-export const GET: APIRoute = async ({ request, url }) => {
-  const auth = checkSyncAuth(request);
+export const GET: APIRoute = async ({ request, url, clientAddress }) => {
+  const auth = checkSyncAuth(request, getClientIp(clientAddress, request.headers.get('x-forwarded-for')));
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
   const target = resolve(url);
@@ -46,8 +47,8 @@ export const GET: APIRoute = async ({ request, url }) => {
   }
 };
 
-export const PUT: APIRoute = async ({ request, url }) => {
-  const auth = checkSyncAuth(request);
+export const PUT: APIRoute = async ({ request, url, clientAddress }) => {
+  const auth = checkSyncAuth(request, getClientIp(clientAddress, request.headers.get('x-forwarded-for')));
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
   const target = resolve(url);
@@ -103,8 +104,8 @@ export const PUT: APIRoute = async ({ request, url }) => {
   return new Response(null, { status: 204 });
 };
 
-export const DELETE: APIRoute = async ({ request, url }) => {
-  const auth = checkSyncAuth(request);
+export const DELETE: APIRoute = async ({ request, url, clientAddress }) => {
+  const auth = checkSyncAuth(request, getClientIp(clientAddress, request.headers.get('x-forwarded-for')));
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
   const target = resolve(url);

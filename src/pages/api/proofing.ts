@@ -5,24 +5,19 @@ import { getAlbumByPath, getPhotosForAlbum } from '../../lib/albums';
 import { resolveAlbumAccess, getAccessCookieValue, getClientIp } from '../../lib/access';
 import { validateProofingPayload, submissionFilename, type ProofingSubmission } from '../../lib/proofing';
 import { siteConfig } from '../../config';
+import { createRateLimiter } from '../../lib/rate-limit';
 
 export const prerender = false;
 
 // Dedicated rate limit for submissions: 5 per 15 minutes per client IP
-// (separate from the password limiter so the two can't starve each other)
-const SUBMIT_LIMIT = 5;
-const SUBMIT_WINDOW_MS = 15 * 60 * 1000;
-const submissions = new Map<string, { count: number; windowStart: number }>();
+// (separate from the password limiter so the two can't starve each other).
+// Bounded like every other limiter, so rotating IPs cannot grow it forever.
+const submitLimiter = createRateLimiter({ maxAttempts: 5, windowMs: 15 * 60 * 1000 });
 
 function isSubmitLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = submissions.get(ip);
-  if (!entry || now - entry.windowStart > SUBMIT_WINDOW_MS) {
-    submissions.set(ip, { count: 1, windowStart: now });
-    return false;
-  }
-  entry.count++;
-  return entry.count > SUBMIT_LIMIT;
+  if (submitLimiter.isRateLimited(ip)) return true;
+  submitLimiter.recordFailedAttempt(ip);
+  return false;
 }
 
 const MAX_BODY_BYTES = 256 * 1024;

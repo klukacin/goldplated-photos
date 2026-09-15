@@ -27,7 +27,7 @@ vi.mock('../src/pages/api/sync/_shared', async (importOriginal) => {
   return { ...actual, CONTENT_ROOT };
 });
 
-import { checkSyncAuth, safeRelPath, safeScope } from '../src/lib/sync-auth';
+import { _resetSyncAuthForTests, checkSyncAuth, safeRelPath, safeScope } from '../src/lib/sync-auth';
 import { useCacheFileForTests } from '../src/pages/api/sync/_hash-cache';
 import { blake3HexOf } from '../src/pages/api/sync/_shared';
 import { GET as fileGET, PUT as filePUT, DELETE as fileDELETE } from '../src/pages/api/sync/file';
@@ -86,6 +86,7 @@ async function listing(dir: string): Promise<string[]> {
 }
 
 beforeEach(async () => {
+  _resetSyncAuthForTests();
   process.env.SYNC_TOKEN = TOKEN;
   await rm(CONTENT_ROOT, { recursive: true, force: true });
   await mkdir(CONTENT_ROOT, { recursive: true });
@@ -581,5 +582,49 @@ describe('sync upload and manifest agree', () => {
     await manifest();
     await upload('2025/wedding/a.jpg', 'omega');
     expect(await manifest()).toEqual([{ path: '2025/wedding/a.jpg', hash: hashOf('omega') }]);
+  });
+});
+
+describe('sync token throttling', () => {
+  // The token is meant to be long and random; this bounds how fast a weak
+  // one could be tried. Thirty misses from one address and the endpoints stop
+  // answering that address for the window — a right token from elsewhere is
+  // unaffected, and a right token clears the count.
+  beforeEach(() => {
+    process.env.SYNC_TOKEN = TOKEN;
+    _resetSyncAuthForTests();
+  });
+
+  it('answers 429 after thirty wrong tokens from one address', () => {
+    const bad = () => new Request('http://localhost/', { headers: authorized('wrong-token-of-any-size') });
+    for (let i = 0; i < 30; i++) {
+      expect(checkSyncAuth(bad(), '203.0.113.5')).toMatchObject({ ok: false, status: 401 });
+    }
+    expect(checkSyncAuth(bad(), '203.0.113.5')).toMatchObject({ ok: false, status: 429 });
+    // Even the right token is refused for that address now.
+    expect(checkSyncAuth(new Request('http://localhost/', { headers: authorized() }), '203.0.113.5'))
+      .toMatchObject({ ok: false, status: 429 });
+  });
+
+  it('counts addresses separately and clears on success', () => {
+    const bad = () => new Request('http://localhost/', { headers: authorized('wrong-token-of-any-size') });
+    for (let i = 0; i < 30; i++) checkSyncAuth(bad(), '203.0.113.5');
+    expect(checkSyncAuth(bad(), '203.0.113.6')).toMatchObject({ ok: false, status: 401 });
+    expect(checkSyncAuth(new Request('http://localhost/', { headers: authorized() }), '203.0.113.6'))
+      .toEqual({ ok: true });
+    // The success wiped .6's single miss; it can miss thirty more times.
+    for (let i = 0; i < 30; i++) {
+      expect(checkSyncAuth(bad(), '203.0.113.6')).toMatchObject({ ok: false, status: 401 });
+    }
+  });
+
+  it('a route passes the caller address through', async () => {
+    for (let i = 0; i < 30; i++) checkSyncAuth(new Request('http://localhost/', { headers: authorized('nope-nope-nope-nope') }), '203.0.113.7');
+    const response = await Promise.resolve(manifestGET({
+      request: new Request('http://localhost/api/sync/manifest', { headers: authorized() }),
+      url: new URL('http://localhost/api/sync/manifest'),
+      clientAddress: '203.0.113.7',
+    } as unknown as APIContext)) as Response;
+    expect(response.status).toBe(429);
   });
 });
