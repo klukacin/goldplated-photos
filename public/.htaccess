@@ -1,21 +1,38 @@
 DirectoryIndex index.html
 
+# Never list a directory. Album folders hold the originals; a listing would
+# hand over every filename in a locked album to anyone who knows its path.
+Options -Indexes
+
+<IfModule mod_headers.c>
+  Header always set X-Frame-Options "DENY"
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  # HTTPS is forced below, so pin it for a year.
+  Header always set Strict-Transport-Security "max-age=31536000"
+</IfModule>
+
 <IfModule mod_rewrite.c>
   RewriteEngine On
 
-  # 1. Security: Block access to index.md (contains passwords) and .meta folders
-  RewriteRule (^|/)index\.md$ - [F,L]
+  # 1. Security: nothing from the content tree or the deploy tree is a static
+  #    file for Apache. Markdown carries passwords, .meta holds proofing
+  #    submissions and caches, dotfiles include .env and .access-secret.
+  #    /.well-known/ stays reachable: Let's Encrypt and cPanel AutoSSL prove
+  #    domain ownership there, and a blocked challenge is a lapsed certificate.
+  RewriteRule \.md$ - [F,L]
   RewriteRule (^|/)\.meta/ - [F,L]
+  RewriteCond %{REQUEST_URI} !^/\.well-known/
+  RewriteRule (^|/)\.[^/]+ - [F,L]
 
   # 2. Force HTTPS
   RewriteCond %{HTTPS} off
   RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
 
-  # 3. Serve existing files/dirs directly (Static Assets, Images)
-  RewriteCond %{REQUEST_FILENAME} -f [OR]
-  RewriteCond %{REQUEST_FILENAME} -d
-  RewriteRule ^ - [L]
-
-  # 4. Proxy everything else to Node.js App
+  # 3. Proxy everything to the Node app. Originals under /albums/* are served
+  #    by Node, which checks album access; there is no static path to them,
+  #    and there must not be one — a symlink from the web root into
+  #    src/content/albums would let Apache serve locked albums to anyone
+  #    who guesses a filename.
   RewriteRule ^(.*)$ http://127.0.0.1:4321/$1 [P,L]
 </IfModule>

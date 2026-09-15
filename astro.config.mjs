@@ -12,7 +12,14 @@ export default defineConfig({
     port: 4321
   },
   security: {
-    checkOrigin: false  // Disable CSRF origin check (safe: we have rate limiting + sameSite cookies)
+    // Astro's CSRF check compares the Origin header to the request URL, and
+    // behind the reverse proxy the app sees http://127.0.0.1:4321 — every
+    // form post would fail. What actually stands in for it: the access cookie
+    // is sameSite=strict (never sent cross-site), API routes that need a
+    // token read a custom header (blocked by CORS without a preflight we
+    // never grant), and the password limiter is keyed per IP *and* album so
+    // a cross-site form spamming /api/unlock cannot lock a visitor out.
+    checkOrigin: false
   },
   vite: {
     server: {

@@ -752,7 +752,7 @@ npm run deploy -- --parallel --checksum  # Combine flags
 2. `npm run build` - Build production site
 3. Fix paths for production server
 4. Sync client, public, albums, server files
-5. Create symlinks on server
+5. Create asset symlinks on server (`client/home`, `client/images`). **Never** a symlink from the web root into `src/content/albums` — originals are served by Node only, which checks album access; the deploy removes such a symlink if it finds one
 6. Set private file permissions
 7. `npm install --production` + `pm2 restart` on remote
 
@@ -845,7 +845,8 @@ sshpass -p 'PASSWORD' rsync -avz --progress \
 - `src/layouts/Layout.astro` - Base layout wrapper
 
 **API Routes:**
-- `src/pages/albums/[...path].ts` - Serve original images (access-checked)
+- `src/pages/albums/[...path].ts` - Serve original images (access-checked; the ONLY path to originals — no static alias may exist)
+- `src/middleware.ts` - Security headers on every SSR response (X-Frame-Options, nosniff, Referrer-Policy)
 - `src/pages/api/thumbnail.ts` - Generate/serve cached thumbnails (access-checked)
 - `src/pages/api/exif.ts` - Extract EXIF metadata (access-checked)
 - `src/pages/api/video-info.ts` - Video metadata via ffprobe (access-checked)

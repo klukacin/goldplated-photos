@@ -34,6 +34,23 @@ a test proving the replacement holds.
   thumbnails, EXIF, video-info, watermark, ZIP download. Never add a media
   route without it. Hidden/locked inherit through the album chain everywhere
   content is listed (tag pages, search).
+- **No static path to `src/content/albums` may exist under the web root.**
+  The Node route is the only way to an original; a symlink or alias that lets
+  Apache find the file first serves locked albums to anyone who guesses a
+  filename, and no `.htaccess` rule can check a signed cookie. `deploy.sh`
+  removes such a symlink, `public/.htaccess` proxies everything to Node and
+  refuses `.md`, `.meta/` and dotfiles outright. After a deploy, verify from
+  outside: `curl -I https://<host>/package.json` and
+  `curl -I https://<host>/albums/<locked-album>/<file>` must both be non-200.
+- **Rate limits are per IP *and* album**, in bounded maps (`rate-limit.ts`).
+  Share-token guesses have their own bucket: any page on the internet can post
+  wrong passwords to `/api/unlock` on a visitor's behalf (Astro's origin check
+  is off behind the proxy), and that must not switch the visitor's share links
+  off. The maps evict when full, so an attacker rotating IPv6 addresses cannot
+  grow them without limit.
+- **EXIF location is stripped for public albums** (`stripLocation`): a public
+  overlay must not say where a photo was taken. Locked albums keep it; the
+  original file always carries whatever the camera wrote.
 
 ## Untrusted bytes
 

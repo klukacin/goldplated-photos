@@ -5,7 +5,7 @@ export const prerender = false;
 
 import { getAlbumByPath, getSubAlbums, getPhotosForAlbum, getArchiveFiles, buildBreadcrumbs, getAlbumCoverPhoto, getAlbumBody, parseInlineMarkdown, type ArchiveFile } from '../../lib/albums';
 import { resolveAlbumAccess, setAccessCookie, getAccessCookieValue, getClientIp } from '../../lib/access';
-import { isRateLimited, recordFailedAttempt } from '../../lib/rate-limit';
+import { shareTokenLimiter, albumKey } from '../../lib/rate-limit';
 import Layout from '../../layouts/Layout.astro';
 import SEO from '../../components/SEO.astro';
 import AlbumGrid from '../../components/AlbumGrid.astro';
@@ -34,21 +34,31 @@ const photoParam = url.searchParams.get('photo');
 
 // SECURITY: Server-side access verification (shared module — same rules as media routes)
 const ip = getClientIp(Astro.clientAddress, Astro.request.headers.get('x-forwarded-for'));
-// Ignore share tokens from rate-limited clients (prevents token brute force)
-const providedToken = isRateLimited(ip) ? null : url.searchParams.get('token');
+// Share-token guesses have their own bucket, per IP and album. It is NOT the
+// password bucket: a flood of wrong passwords (which any page on the internet
+// can post on a visitor's behalf) must not switch that visitor's share links
+// off. This bucket only bounds how fast a 128-bit token can be guessed.
+const tokenKey = albumKey(ip, path!);
+const providedToken = shareTokenLimiter.isRateLimited(tokenKey) ? null : url.searchParams.get('token');
 
 const access = await resolveAlbumAccess(path!, getAccessCookieValue(cookies), providedToken);
 const { hasAccess, blockingAlbum } = access;
 const hasPasswordProtection = access.isProtected;
 
-// A share token was presented but didn't grant access → count towards rate limit
+// A share token was presented but didn't grant access → count towards its limit
 if (providedToken && !hasAccess) {
-  recordFailedAttempt(ip);
+  shareTokenLimiter.recordFailedAttempt(tokenKey);
 }
 
 // Persist a fresh share-token grant in the signed cookie
 if (access.grantedTokens) {
   setAccessCookie(cookies, access.grantedTokens);
+}
+
+// The share token rides in this URL, and the page names protected content.
+// Shared caches must not keep either.
+if (access.isProtected) {
+  Astro.response.headers.set('Cache-Control', 'no-store');
 }
 
 // SECURITY: Only fetch content if access is granted

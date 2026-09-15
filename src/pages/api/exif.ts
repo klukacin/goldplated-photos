@@ -3,6 +3,7 @@ import * as exifr from 'exifr';
 import fs from 'fs/promises';
 import path from 'path';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
+import { stripLocation } from '../../lib/media-info';
 
 export const prerender = false;
 
@@ -70,7 +71,11 @@ export const POST: APIRoute = async ({ request, cookies }) => {
         interop: false,
       } as unknown as Parameters<typeof exifr.parse>[1]);
 
-      return new Response(JSON.stringify({ exif: exifData || {} }), {
+      // PRIVACY: a public album's overlay must not say where the photo was
+      // taken. Locked albums are for the people in them; they keep it.
+      const exif = access.isProtected ? (exifData || {}) : stripLocation(exifData || {});
+
+      return new Response(JSON.stringify({ exif }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
       });

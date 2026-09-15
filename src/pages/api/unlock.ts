@@ -8,7 +8,7 @@ import {
   safeReturnUrl,
   setAccessCookie
 } from '../../lib/access';
-import { isRateLimited, recordFailedAttempt, clearRateLimit, getRemainingAttempts } from '../../lib/rate-limit';
+import { passwordLimiter, albumKey } from '../../lib/rate-limit';
 
 export const prerender = false;
 
@@ -26,9 +26,13 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
       return redirect(`${returnUrl}?error=missing-fields`);
     }
 
-    // Rate limiting (real client IP, also behind the reverse proxy)
+    // Rate limiting (real client IP, also behind the reverse proxy). Keyed by
+    // IP *and* album: a burst of failures forced on one album — a cross-site
+    // form can post here on a visitor's behalf — must not lock every album
+    // for that IP and everyone sharing its NAT.
     const ip = getClientIp(clientAddress, request.headers.get('x-forwarded-for'));
-    if (isRateLimited(ip)) {
+    const limitKey = albumKey(ip, albumPath);
+    if (passwordLimiter.isRateLimited(limitKey)) {
       return redirect(`${returnUrl}?error=rate-limited`);
     }
 
@@ -45,13 +49,13 @@ export const POST: APIRoute = async ({ request, cookies, redirect, clientAddress
 
     // Verify password (timing-safe)
     if (!safeCompare(password, correctPassword)) {
-      recordFailedAttempt(ip);
-      const remaining = getRemainingAttempts(ip);
+      passwordLimiter.recordFailedAttempt(limitKey);
+      const remaining = passwordLimiter.getRemainingAttempts(limitKey);
       return redirect(`${returnUrl}?error=wrong-password&remaining=${remaining}`);
     }
 
     // Password correct - clear rate limit
-    clearRateLimit(ip);
+    passwordLimiter.clearRateLimit(limitKey);
 
     // Get existing unlocked albums from the signed cookie (invalid → empty)
     const unlocked = parseAccessCookie(getAccessCookieValue(cookies));

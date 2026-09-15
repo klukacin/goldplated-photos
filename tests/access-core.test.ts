@@ -39,6 +39,10 @@ describe('safeCompare', () => {
     expect(safeCompare('abc', 'abd')).toBe(false);
     expect(safeCompare('abc', 'abcd')).toBe(false);
     expect(safeCompare('', 'a')).toBe(false);
+    expect(safeCompare('a', '')).toBe(false);
+    expect(safeCompare('', '')).toBe(true);
+    expect(safeCompare('pässword', 'pässword')).toBe(true);
+    expect(safeCompare('pässword', 'password')).toBe(false);
   });
 });
 

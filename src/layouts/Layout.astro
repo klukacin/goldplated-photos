@@ -13,6 +13,10 @@ const { title } = Astro.props;
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="generator" content={Astro.generator} />
+    <!-- A share token rides in the album URL. Cross-origin requests (Google
+         Fonts, any external link) get the origin only. Prerendered pages do
+         not pass through the middleware that sets the same header. -->
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
 
     <!-- Google Fonts: Outfit (headings) + DM Sans (body) + Satisfy (signature) -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
