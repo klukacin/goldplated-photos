@@ -8,6 +8,7 @@ fn main() {
         "../ui/app.js",
         "../ui/develop-queue.js",
         "../ui/features.js",
+        "../ui/prefs.js",
         "../ui/style.css",
     ] {
         println!("cargo:rerun-if-changed={asset}");

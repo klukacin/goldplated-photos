@@ -14,6 +14,7 @@ const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { open: openDialog, confirm: askConfirm } = window.__TAURI__.dialog;
 const { listen } = window.__TAURI__.event;
 
+
 const LIBRARY_KEY = 'gpp.lastLibrary';
 
 const state = {
@@ -28,6 +29,271 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+// ------------------------------------------------------------ preferences
+//
+// How the photographer arranged the window — panels open or shut, in what
+// order, sidebars showing, what the overlay says — is read once at boot and
+// written on every change. The reading, writing and repair of stored values
+// lives in prefs.js, apart from the DOM and under test; this half is only the
+// one path from a preference to the screen.
+
+let prefs = loadPrefs(localStorage);
+
+function persistPrefs() {
+  savePrefs(localStorage, prefs);
+}
+
+/// Human names for the overlay's rows. Keyed by the field names prefs.js knows,
+/// so a field added there without a label here is a visible blank rather than a
+/// silent omission.
+const OVERLAY_LABELS = {
+  filename: 'File',
+  captured: 'Captured',
+  camera: 'Camera',
+  lens: 'Lens',
+  exposure: 'Exposure',
+  dimensions: 'Size',
+  size: 'On disk',
+  rating: 'Rating',
+};
+
+/// Put the whole stored arrangement on screen.
+///
+/// One function, called at boot and after every change, rather than each
+/// setting updating its own corner: with two of them the second way works, and
+/// by the fifth the window is in a state no single line of code intended.
+function applyPrefs() {
+  const container = $('panels');
+  // Appending in order sorts them — the nodes are moved, never rebuilt, so a
+  // half-dragged slider or an open crop tool survives a reorder.
+  for (const name of prefs.panelOrder) {
+    const panel = container.querySelector(`[data-panel="${name}"]`);
+    if (panel) container.appendChild(panel);
+  }
+  for (const [name, open] of Object.entries(prefs.panelOpen)) {
+    const panel = container.querySelector(`[data-panel="${name}"]`);
+    if (panel) panel.open = open;
+  }
+  updatePanelMoveButtons();
+
+  $('sidebar').hidden = !prefs.sidebars.left;
+  $('toggle-left').setAttribute('aria-pressed', String(prefs.sidebars.left));
+  $('toggle-left').classList.toggle('on', prefs.sidebars.left);
+  $('toggle-right').setAttribute('aria-pressed', String(prefs.sidebars.right));
+  $('toggle-right').classList.toggle('on', prefs.sidebars.right);
+  $('overlay-btn').setAttribute('aria-pressed', String(prefs.overlay.on));
+  $('overlay-btn').classList.toggle('on', prefs.overlay.on);
+
+  updateInspectorVisibility();
+  renderInfoOverlay();
+}
+
+// ----------------------------------------------------------- panel plumbing
+
+/// An end panel cannot move further that way. Dim rather than gone, so the two
+/// buttons stay where the hand expects them.
+function updatePanelMoveButtons() {
+  const panels = [...$('panels').querySelectorAll('.panel')];
+  panels.forEach((panel, i) => {
+    panel.querySelector('[data-move="up"]').disabled = i === 0;
+    panel.querySelector('[data-move="down"]').disabled = i === panels.length - 1;
+  });
+}
+
+function movePanel(name, delta) {
+  const order = prefs.panelOrder;
+  const from = order.indexOf(name);
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= order.length) return;
+  [order[from], order[to]] = [order[to], order[from]];
+  persistPrefs();
+  applyPrefs();
+}
+
+// The buttons live inside <summary>, where a plain click would also collapse
+// the panel being moved.
+$('panels').addEventListener('click', (e) => {
+  const button = e.target.closest('.panel-move');
+  if (!button) return;
+  e.preventDefault();
+  e.stopPropagation();
+  movePanel(button.closest('.panel').dataset.panel, button.dataset.move === 'up' ? -1 : 1);
+});
+
+// `toggle` does not bubble, so it is caught on the way down instead.
+$('panels').addEventListener(
+  'toggle',
+  (e) => {
+    const panel = e.target.closest?.('.panel');
+    if (!panel) return;
+    prefs.panelOpen[panel.dataset.panel] = panel.open;
+    persistPrefs();
+    // Closing develop is the end of previewing, so let the core drop the
+    // decoded pixels it was rendering proxies from. Reopening pays one decode.
+    if (panel.dataset.panel === 'develop' && !panel.open) {
+      invoke('release_preview').catch(() => {});
+    }
+  },
+  true,
+);
+
+// ---------------------------------------------------------- info overlay
+//
+// Over the picture rather than beside it, so it can be read while culling
+// without the eye leaving the photograph — and over the *enlarged* picture too,
+// because it sits inside the frame the loupe moves.
+
+/// The rows this photo can offer, in the order the overlay draws them.
+///
+/// `null` means "leave it out". The inspector's own list writes an em dash for
+/// a value the file does not carry, which is right in a panel beside the photo
+/// and wrong in an overlay on top of it: a frame with no EXIF would be covered
+/// by a column of dashes. So the shared formatters' em dash is mapped back to
+/// nothing here.
+function overlayRows(photo) {
+  const orNothing = (text) => (text && text !== '—' ? text : null);
+  return {
+    filename: photo.filename,
+    captured: photo.captured_at || null,
+    camera: [photo.camera_make, photo.camera_model].filter(Boolean).join(' ') || null,
+    lens: photo.lens || null,
+    exposure: orNothing(formatExposure(photo)),
+    dimensions: photo.width && photo.height ? `${photo.width} × ${photo.height}` : null,
+    size: orNothing(formatBytes(photo.file_size)),
+    rating: photo.rating ? '★'.repeat(photo.rating) : null,
+  };
+}
+
+function renderInfoOverlay() {
+  const el = $('info-overlay');
+  const photo = state.cursor >= 0 ? state.photos[state.cursor] : null;
+  if (!prefs.overlay.on || !photo) {
+    el.hidden = true;
+    return;
+  }
+  const values = overlayRows(photo);
+  // A field with nothing in it is left out rather than shown as a dash: the
+  // overlay covers the photograph, so every row has to earn its place.
+  const rows = prefs.overlay.fields
+    .filter((f) => values[f])
+    .map((f) => `<dt>${escapeHtml(OVERLAY_LABELS[f] ?? f)}</dt><dd>${escapeHtml(String(values[f]))}</dd>`);
+  if (!rows.length) {
+    el.hidden = true;
+    return;
+  }
+  el.innerHTML = `<dl>${rows.join('')}</dl>`;
+  el.hidden = false;
+  positionInfoOverlay();
+}
+
+/// Inset from the corner of the *picture*, in pixels.
+const OVERLAY_INSET = 12;
+
+/// Lay the overlay on the photograph rather than on the box around it.
+///
+/// Same problem the crop rectangle has, and the same solution: `object-fit:
+/// contain` centres the picture and leaves bars on one axis, so an overlay
+/// pinned to the element sits in the black band above a wide photo in a tall
+/// frame — floating over nothing, which is where it first appeared in the
+/// loupe.
+function positionInfoOverlay() {
+  const el = $('info-overlay');
+  if (el.hidden) return;
+  const pic = drawnPictureBox();
+  if (!pic) return;
+  el.style.left = `${pic.left + OVERLAY_INSET}px`;
+  el.style.top = `${pic.top + OVERLAY_INSET}px`;
+  el.style.maxWidth = `${Math.max(120, pic.width - OVERLAY_INSET * 2)}px`;
+}
+
+function toggleOverlay(on = !prefs.overlay.on) {
+  prefs.overlay.on = on;
+  persistPrefs();
+  applyPrefs();
+}
+
+$('overlay-btn').addEventListener('click', () => toggleOverlay());
+
+// -------------------------------------------------------- sidebar toggles
+
+function toggleSidebar(side, on = !prefs.sidebars[side]) {
+  prefs.sidebars[side] = on;
+  persistPrefs();
+  applyPrefs();
+  // The picture's box changed width, and both overlays are measured against it.
+  repositionOverlays();
+}
+
+$('toggle-left').addEventListener('click', () => toggleSidebar('left'));
+$('toggle-right').addEventListener('click', () => toggleSidebar('right'));
+
+// ------------------------------------------------------ settings dialog
+
+/// Build the overlay's field checkboxes from what prefs.js says exists, so the
+/// dialog cannot drift out of step with what the overlay can actually draw.
+function renderOverlayFieldChecks() {
+  const box = $('pref-overlay-fields');
+  box.innerHTML = '';
+  for (const field of OVERLAY_FIELDS) {
+    const label = document.createElement('label');
+    label.className = 'check';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = prefs.overlay.fields.includes(field);
+    input.addEventListener('change', () => {
+      // Rebuilt from the canonical list rather than pushed and spliced, so the
+      // stored order always matches the order the overlay draws.
+      const chosen = new Set(prefs.overlay.fields);
+      input.checked ? chosen.add(field) : chosen.delete(field);
+      prefs.overlay.fields = OVERLAY_FIELDS.filter((f) => chosen.has(f));
+      persistPrefs();
+      renderInfoOverlay();
+    });
+    label.append(input, ` ${OVERLAY_LABELS[field] ?? field}`);
+    box.appendChild(label);
+  }
+}
+
+function openSettings() {
+  $('pref-overlay-on').checked = prefs.overlay.on;
+  $('pref-left').checked = prefs.sidebars.left;
+  $('pref-right').checked = prefs.sidebars.right;
+  renderOverlayFieldChecks();
+  openModal('settings-modal');
+}
+
+$('settings-btn').addEventListener('click', openSettings);
+$('pref-overlay-on').addEventListener('change', (e) => toggleOverlay(e.target.checked));
+$('pref-left').addEventListener('change', (e) => toggleSidebar('left', e.target.checked));
+$('pref-right').addEventListener('change', (e) => toggleSidebar('right', e.target.checked));
+
+$('pref-reset-btn').addEventListener('click', () => {
+  prefs = defaultPrefs();
+  persistPrefs();
+  applyPrefs();
+  // The dialog is showing the values that just changed underneath it.
+  openSettings();
+  status('Settings back to their defaults');
+});
+
+$('shortcuts-btn').addEventListener('click', () => openModal('shortcuts-modal'));
+
+// ------------------------------------------------------------- fullscreen
+//
+// The window's own fullscreen, not the loupe: the two compose, and the pair of
+// them is what "show me this photograph" actually means.
+
+async function toggleFullscreen() {
+  try {
+    const on = await invoke('toggle_fullscreen');
+    status(on ? 'Fullscreen — F to leave' : 'Fullscreen off');
+  } catch (err) {
+    status(`Fullscreen failed: ${err}`);
+  }
+}
+
+
 
 // --------------------------------------------------------------- utilities
 
@@ -125,6 +391,9 @@ async function openLibrary(path) {
 async function enterApp(info) {
   $('welcome').hidden = true;
   $('app').hidden = false;
+  // Before the first paint, so the window comes up arranged the way it was left
+  // rather than snapping into it a moment later.
+  applyPrefs();
   renderStatus(info);
   await Promise.all([refreshAlbums(), refreshPhotos()]);
   await loadPublishTarget();
@@ -222,6 +491,19 @@ async function refreshPhotos() {
   if (loupe.active && state.cursor < 0) setLoupe(false);
   renderGrid();
   updateSelectionUI();
+  // The cursor is already on the first photo, and the rating keys already act
+  // on it — so show it. Leaving this out put an empty inspector on screen at
+  // boot: no filename, no preview, no stars, no sliders, while pressing `3`
+  // silently rated the photo it was not showing. It went unnoticed for as long
+  // as the panel stayed hidden until the first click.
+  if (state.cursor >= 0) {
+    await showInspector(state.photos[state.cursor]);
+  } else {
+    // Nothing matches: nothing to inspect, and an overlay left up would be
+    // describing a photo that is no longer on screen.
+    updateInspectorVisibility();
+    renderInfoOverlay();
+  }
 }
 
 async function refreshAll() {
@@ -346,7 +628,8 @@ async function applyRating(rating) {
     if (p) p.rating = rating;
   });
   renderGrid();
-  // Keep the inspector's own star row in step with what the grid now shows.
+  // Keep the inspector's own star row — and the overlay, which can carry the
+  // rating too — in step with what the grid now shows.
   if (state.cursor >= 0) showInspector(state.photos[state.cursor]);
   status(`Rated ${ids.length} photo(s) ${rating}★`);
 }
@@ -388,6 +671,24 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'e' || e.key === 'E' || e.key === 'Enter') {
     e.preventDefault();
     setLoupe(!loupe.active);
+  } else if (e.key === 'i' || e.key === 'I') {
+    e.preventDefault();
+    toggleOverlay();
+  } else if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault();
+    toggleFullscreen();
+  } else if (e.key === '[') {
+    e.preventDefault();
+    toggleSidebar('left');
+  } else if (e.key === ']') {
+    e.preventDefault();
+    toggleSidebar('right');
+  } else if (e.key === '?') {
+    e.preventDefault();
+    openModal('shortcuts-modal');
+  } else if (e.key === ',') {
+    e.preventDefault();
+    openSettings();
   } else if (e.key === 'a' && (e.metaKey || e.ctrlKey)) {
     e.preventDefault();
     state.photos.forEach((p) => state.selected.add(p.id));
@@ -475,8 +776,9 @@ async function showInspector(photo) {
   const generation = ++inspectorGeneration;
   // Whatever was queued was for the photo being left.
   livePreview.next = null;
-  const panel = $('inspector');
-  panel.hidden = false;
+  // Whether the panel is up is now a preference as well as a question of
+  // having something to show, so it is decided in one place.
+  updateInspectorVisibility();
   $('inspector-name').textContent = photo.filename;
 
   // Framing is about one picture. Moving to another leaves the rectangle
@@ -512,6 +814,24 @@ async function showInspector(photo) {
     });
     rating.appendChild(star);
   }
+
+  // Triage beside the rating, because it is the same decision made twice a
+  // second — and it shows the current state rather than only offering the
+  // three choices, so a glance answers "have I done this one?".
+  const flags = $('inspector-flags');
+  flags.innerHTML = '';
+  for (const [flag, label] of [['pick', '⚑ Pick'], ['none', '○ Unpick'], ['reject', '✕ Reject']]) {
+    const button = document.createElement('button');
+    button.className = 'btn btn-sm' + (flag === 'reject' ? ' reject' : '');
+    button.classList.toggle('on', photo.flag === flag);
+    button.textContent = label;
+    // Acts on the selection, exactly as P/X/U do — the panel and the keys must
+    // not disagree about what "this photo" means.
+    button.addEventListener('click', () => applyFlag(flag));
+    flags.appendChild(button);
+  }
+
+  renderInfoOverlay();
 
   const rows = [
     ['Captured', photo.captured_at || '—'],
@@ -612,6 +932,14 @@ async function renderDevelop(photo, generation = inspectorGeneration) {
       requestPreview(adj, Number(input.value));
     });
     input.addEventListener('change', () => applyAdjustment(adj, Number(input.value)));
+    // The label has always done this; the slider is the bigger target and the
+    // one the hand is already on. `input` fires on the way, so the readout and
+    // the preview follow without a second case.
+    input.addEventListener('dblclick', () => {
+      input.value = 0;
+      input.dispatchEvent(new Event('input'));
+      applyAdjustment(adj, 0);
+    });
 
     row.append(label, input, out);
     panel.appendChild(row);
@@ -995,8 +1323,16 @@ if (!FEATURES.crop) $('dev-crop').hidden = true;
 // A new preview is a new picture box, and while cropping the rectangle has to
 // follow it. Without this the overlay keeps the previous photo's dimensions
 // after the tool takes an existing crop off.
-$('inspector-img').addEventListener('load', positionCropOverlay);
-window.addEventListener('resize', positionCropOverlay);
+/// Everything laid over the picture, laid again. The crop rectangle and the
+/// info overlay are both measured against the drawn photograph, so they move
+/// together or not at all.
+function repositionOverlays() {
+  positionCropOverlay();
+  positionInfoOverlay();
+}
+
+$('inspector-img').addEventListener('load', repositionOverlays);
+window.addEventListener('resize', repositionOverlays);
 
 $('crop-overlay').addEventListener('pointerdown', (e) => {
   if (!cropMode.active) return;

@@ -666,6 +666,17 @@ proxy (~4 ms) from pixels the session keeps decoded and returns it inline as a
 data URL. Downscaling first is faithful, not an approximation — geometry is
 fractions of the frame and tone is per pixel, so neither reads a dimension.
 
+**The window remembers how it was arranged.** Which inspector panels are open,
+in what order, which sidebars are showing, and what the info overlay says all
+live in `localStorage` via `desktop/app/ui/prefs.js` — a DOM-free module so the
+part that matters is testable (`tests/desktop-prefs.test.ts`). What matters is
+not the read and write but the repair: a stored order naming a panel this build
+dropped, or missing one it added, or listing one twice, each ends with a panel
+that exists in the markup and cannot be reached from the UI. `normalize` keeps
+the known panels in the stored order and appends the rest, so a downgrade and an
+upgrade are both survivable. One function, `applyPrefs()`, is the only path from
+a preference to the screen.
+
 **The loupe is the sidebar preview, moved.** `E`/`Enter`/double-click gives one
 photo the whole main area; the UI *relocates* `#inspector-frame` onto the stage
 rather than drawing a second copy, because a second copy means a second crop

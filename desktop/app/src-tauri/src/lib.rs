@@ -20,6 +20,24 @@ fn to_msg(e: gpp_core::Error) -> String {
     e.to_string()
 }
 
+// ------------------------------------------------------------------- window
+
+/// Turn the window's own fullscreen on or off, reporting where it ended up.
+///
+/// A Tauri command rather than the JS window API so the capability set stays as
+/// it is: every other action the UI takes is already one `invoke`, and this way
+/// there is one list of what the shell can do instead of two.
+///
+/// Composes with the loupe rather than replacing it — the loupe gives the photo
+/// the window, this gives the window the screen, and the pair is what "show me
+/// this photograph" means.
+#[tauri::command]
+fn toggle_fullscreen(window: tauri::WebviewWindow) -> CmdResult<bool> {
+    let on = !window.is_fullscreen().map_err(|e| e.to_string())?;
+    window.set_fullscreen(on).map_err(|e| e.to_string())?;
+    Ok(on)
+}
+
 // ------------------------------------------------------------------ library
 
 #[tauri::command]
@@ -472,6 +490,7 @@ pub fn run() {
             set_flag,
             set_color_label,
             photo_edits,
+            toggle_fullscreen,
             set_photo_edit,
             preview_photo_edit,
             release_preview,

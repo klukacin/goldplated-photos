@@ -116,19 +116,7 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   overflow-y: auto;
 }
 .sidebar-section { padding: 0.75rem; }
-.sidebar-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 0.4rem;
-}
-.sidebar-header h2 {
-  margin: 0;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-}
+
 .sidebar-footer { margin-top: auto; padding: 0.75rem; border-top: 1px solid var(--border); }
 .stats { font-size: 0.8rem; color: var(--text-dim); line-height: 1.5; }
 
@@ -223,6 +211,72 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   max-height: none;
   background: transparent;
 }
+
+/* ------------------------------------------------------- info overlay */
+/*
+   Over the picture, not beside it — so it reads at a glance while culling, and
+   it is over the *enlarged* picture too, because it lives inside the frame that
+   moves into the loupe.
+
+   `pointer-events: none` is load-bearing: the crop rectangle is dragged on the
+   same pixels, and an overlay that swallowed the press would make framing
+   impossible whenever the overlay happened to be up.
+*/
+.info-overlay {
+  position: absolute;
+  /* Placed by positionInfoOverlay(), against the picture the preview actually
+     draws rather than against this box: `object-fit: contain` letterboxes a
+     wide photo in a tall frame, and an overlay pinned to the frame floats in
+     the black band above the photograph instead of sitting on it. */
+  left: 0;
+  top: 0;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius);
+  background: rgba(10, 10, 12, 0.72);
+  color: #f2f2f4;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+.info-overlay dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0 0.6rem; }
+.info-overlay dt { color: #a9a9b2; white-space: nowrap; }
+.info-overlay dd { margin: 0; word-break: break-word; }
+/* Enlarged, it can afford to be read from further away. */
+.inspector-frame.in-loupe .info-overlay { font-size: 0.82rem; }
+
+/* --------------------------------------------------- settings & shortcuts */
+.settings-head {
+  margin: 1.1rem 0 0.5rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.settings-head:first-of-type { margin-top: 0; }
+/* The overlay's fields are subordinate to the switch above them, and at the
+   same indent they read as nine peers instead of one and its eight. */
+#pref-overlay-fields { margin-left: 1.4rem; }
+kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75em;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  color: var(--text);
+}
+.shortcuts dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(6.5rem, auto) 1fr;
+  gap: 0.4rem 0.9rem;
+  align-items: baseline;
+  font-size: 0.85rem;
+}
+.shortcuts dt { text-align: right; color: var(--text-dim); }
+.shortcuts dd { margin: 0; }
 .btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 
 .cell {
@@ -501,13 +555,24 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 
 /* ---------------------------------------------------------------- develop */
 
-.develop {
+/* ----------------------------------------------------- inspector panels */
+/*
+   Both panels are <details>, so collapsing is the element's own job rather than
+   a class and a height calculation. Which is open, and which comes first, is
+   read out of prefs.js at boot and written back on every change — app.js
+   reorders these nodes, so the order in the markup is only a starting point.
+*/
+.panels { display: flex; flex-direction: column; }
+.panel {
   margin: 0.9rem 0;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   padding: 0.6rem 0;
 }
-.develop > summary {
+/* Consecutive panels share a rule rather than drawing two. */
+.panel + .panel { margin-top: -0.9rem; border-top: none; }
+
+.panel > summary {
   cursor: pointer;
   font-size: 0.72rem;
   text-transform: uppercase;
@@ -517,8 +582,35 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   align-items: center;
   gap: 0.4rem;
 }
-.develop > summary::-webkit-details-marker { display: none; }
+.panel > summary::-webkit-details-marker { display: none; }
+/* A closed panel should look closed from across the room. */
+.panel > summary .panel-title::before { content: "▾ "; }
+.panel:not([open]) > summary .panel-title::before { content: "▸ "; }
+
+/* Reordering. Small, quiet, and only meaningful at the ends — a panel that
+   cannot move that way says so by going dim rather than by disappearing, so
+   the two buttons stay where the hand expects them. */
+.panel-move {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0.15rem 0.25rem;
+  border-radius: 3px;
+}
+.panel-move:hover:not(:disabled) { background: var(--bg-sunken); color: var(--text); }
+.panel-move:disabled { opacity: 0.25; cursor: default; }
+
 .sliders { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.45rem; }
+
+/* Flags, beside the stars and reading the same way: the state is shown, not
+   just offered. */
+.flag-row { display: flex; gap: 0.3rem; margin-bottom: 0.9rem; }
+.flag-row .btn { flex: 1; }
+.flag-row .btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.flag-row .btn.on.reject { background: var(--danger); color: #fff; border-color: var(--danger); }
 
 /* Rotate and flip. The glyphs need a little more room than the label buttons
    elsewhere, and the state readout takes whatever is left. */
