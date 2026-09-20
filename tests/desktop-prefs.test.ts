@@ -21,6 +21,7 @@ interface Prefs {
   panelOpen: Record<string, boolean>;
   overlay: { on: boolean; fields: string[] };
   sidebars: { left: boolean; right: boolean };
+  zoom: number;
 }
 
 // Evaluated rather than imported, because the app loads it as a bare <script>
@@ -33,7 +34,9 @@ const source = readFileSync(
 const {
   PANELS,
   OVERLAY_FIELDS,
+  ZOOM_STEPS,
   RECENT_LIMIT,
+  zoomStep,
   defaultPrefs,
   normalize,
   loadPrefs,
@@ -42,11 +45,13 @@ const {
   rememberLibrary,
   forgetLibrary,
 } = new Function(
-  `${source}\nreturn { PANELS, OVERLAY_FIELDS, RECENT_LIMIT, defaultPrefs, normalize, loadPrefs, savePrefs, loadRecent, rememberLibrary, forgetLibrary };`
+  `${source}\nreturn { PANELS, OVERLAY_FIELDS, ZOOM_STEPS, RECENT_LIMIT, zoomStep, defaultPrefs, normalize, loadPrefs, savePrefs, loadRecent, rememberLibrary, forgetLibrary };`
 )() as {
   PANELS: string[];
   OVERLAY_FIELDS: string[];
+  ZOOM_STEPS: number[];
   RECENT_LIMIT: number;
+  zoomStep: (current: number, direction: number) => number;
   defaultPrefs: () => Prefs;
   normalize: (raw: unknown) => Prefs;
   loadPrefs: (storage: Storage, key?: string) => Prefs;
@@ -148,10 +153,70 @@ describe('normalize', () => {
     expect(normalize({ overlay: { fields: [] } }).overlay.fields).toEqual([]);
   });
 
+  it('clamps a stored zoom that would put the controls off-screen', () => {
+    // This one is not cosmetic. The zoom is applied before anything is drawn
+    // and reloaded on every restart, so an unclamped 40 leaves a window whose
+    // settings button — and whose reset — are past the edge of the screen,
+    // with no way back that does not involve editing localStorage by hand.
+    expect(normalize({ zoom: 40 }).zoom).toBe(ZOOM_STEPS[ZOOM_STEPS.length - 1]);
+    expect(normalize({ zoom: 0.01 }).zoom).toBe(ZOOM_STEPS[0]);
+  });
+
+  it('ignores a zoom that is not a usable number', () => {
+    for (const bad of [null, 'big', NaN, Infinity, -Infinity, undefined]) {
+      expect(normalize({ zoom: bad as unknown as number }).zoom).toBe(1);
+    }
+  });
+
+  it('keeps a zoom that is already sensible', () => {
+    expect(normalize({ zoom: 1.5 }).zoom).toBe(1.5);
+  });
+
   it('keeps both sidebars unless told otherwise', () => {
     expect(normalize({ sidebars: { left: false } })).toMatchObject({
       sidebars: { left: false, right: true },
     });
+  });
+});
+
+describe('zoomStep', () => {
+  it('has 1 on the ladder, so there is an exact way back', () => {
+    expect(ZOOM_STEPS).toContain(1);
+  });
+
+  it('returns to where it started after equal steps in and out', () => {
+    // The reason this is a ladder and not a repeated ×1.1: with a multiplier,
+    // four presses in and four out lands on 0.9999… and never on 1.
+    let z = 1;
+    for (let i = 0; i < 4; i++) z = zoomStep(z, 1);
+    for (let i = 0; i < 4; i++) z = zoomStep(z, -1);
+    expect(z).toBe(1);
+  });
+
+  it('always moves off a rung it is already standing on', () => {
+    // A stored 0.9 comes back from JSON as 0.9000000000000001 or thereabouts,
+    // and an exact comparison would return the same rung — a key that does
+    // nothing, intermittently, depending on what was saved last.
+    for (const step of ZOOM_STEPS.slice(1, -1)) {
+      expect(zoomStep(step, 1)).toBeGreaterThan(step);
+      expect(zoomStep(step, -1)).toBeLessThan(step);
+    }
+  });
+
+  it('stops at the ends rather than running off them', () => {
+    let z = 1;
+    for (let i = 0; i < 20; i++) z = zoomStep(z, 1);
+    expect(z).toBe(ZOOM_STEPS[ZOOM_STEPS.length - 1]);
+    for (let i = 0; i < 40; i++) z = zoomStep(z, -1);
+    expect(z).toBe(ZOOM_STEPS[0]);
+  });
+
+  it('steps from a value that is not on the ladder at all', () => {
+    // A zoom stored by an older build, or one the ladder no longer lists.
+    // Strictly past the value, in the direction asked for — not the neighbour
+    // of whichever rung happens to be nearest.
+    expect(zoomStep(1.13, 1)).toBe(1.25);
+    expect(zoomStep(1.13, -1)).toBe(1.1);
   });
 });
 
@@ -220,6 +285,7 @@ describe('loadPrefs / savePrefs', () => {
     prefs.panelOpen.info = false;
     prefs.overlay.on = true;
     prefs.sidebars.left = false;
+    prefs.zoom = 1.25;
 
     expect(savePrefs(storage, prefs)).toBe(true);
     expect(loadPrefs(storage)).toEqual(prefs);

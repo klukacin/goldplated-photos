@@ -17,6 +17,17 @@ const { open: openDialog, confirm: askConfirm } = window.__TAURI__.dialog;
 const { revealItemInDir } = window.__TAURI__.opener;
 const { listen } = window.__TAURI__.event;
 
+// Only macOS draws its window buttons *inside* the page — `titleBarStyle:
+// Transparent` makes the frame see-through and leaves the traffic lights on
+// top of our own bar. Windows and Linux ignore that setting and put a system
+// frame above the page instead, so the gutter this class turns on would be a
+// dead notch on the left of every window there.
+//
+// Set synchronously, before anything is painted: a round trip to the shell to
+// ask would mean a visible jump on the first frame.
+if (navigator.userAgent.includes('Mac')) {
+  document.documentElement.classList.add('mac');
+}
 
 const LIBRARY_KEY = 'gpp.lastLibrary';
 
@@ -50,6 +61,9 @@ function persistPrefs() {
 /// Human names for the overlay's rows. Keyed by the field names prefs.js knows,
 /// so a field added there without a label here is a visible blank rather than a
 /// silent omission.
+/// The keys that mean "scale the interface" when ⌘ or Ctrl is down.
+const ZOOM_KEYS = new Set(['+', '=', '-', '_', '0']);
+
 const OVERLAY_LABELS = {
   filename: 'File',
   captured: 'Captured',
@@ -88,8 +102,41 @@ function applyPrefs() {
   $('overlay-btn').setAttribute('aria-pressed', String(prefs.overlay.on));
   $('overlay-btn').classList.toggle('on', prefs.overlay.on);
 
+  applyZoom();
   updateInspectorVisibility();
   renderInfoOverlay();
+}
+
+// ------------------------------------------------------------------- zoom
+//
+// The webview's own page zoom, not a CSS transform: it re-lays out and
+// re-renders, so type gets bigger and stays sharp. On a 4K display that is the
+// difference between a readable interface and a magnified blurry one.
+
+/// Hand the level to the shell, and tell the stylesheet what it is.
+function applyZoom() {
+  invoke('set_zoom', { factor: prefs.zoom }).catch(() => {});
+  // The macOS traffic lights are drawn by the system and do not zoom, so the
+  // gutter reserved for them must shrink as the page grows or the window title
+  // drifts right of them. Everything else in the UI should scale, and does.
+  document.documentElement.style.setProperty('--zoom', String(prefs.zoom));
+}
+
+function setZoom(factor) {
+  prefs.zoom = factor;
+  persistPrefs();
+  applyZoom();
+  // Every box on screen just changed size, and both overlays are measured
+  // against the picture inside one of them.
+  repositionOverlays();
+  status(`Interface at ${Math.round(factor * 100)}%`);
+}
+
+/// The inspector is up when there is something to inspect *and* the
+/// photographer has not put it away. Two conditions, one place — otherwise
+/// selecting a photo silently reopens a sidebar that was deliberately closed.
+function updateInspectorVisibility() {
+  $('inspector').hidden = !prefs.sidebars.right || state.cursor < 0;
 }
 
 // ----------------------------------------------------------- panel plumbing
@@ -262,9 +309,22 @@ function openSettings() {
   $('pref-overlay-on').checked = prefs.overlay.on;
   $('pref-left').checked = prefs.sidebars.left;
   $('pref-right').checked = prefs.sidebars.right;
+  $('zoom-readout').textContent = `${Math.round(prefs.zoom * 100)}%`;
   renderOverlayFieldChecks();
   openModal('settings-modal');
 }
+
+// The dialog is open while these are pressed, so the readout is updated here
+// rather than in setZoom — which also runs from the keyboard, with nothing to
+// update.
+function zoomFromDialog(factor) {
+  setZoom(factor);
+  $('zoom-readout').textContent = `${Math.round(prefs.zoom * 100)}%`;
+}
+
+$('zoom-in').addEventListener('click', () => zoomFromDialog(zoomStep(prefs.zoom, 1)));
+$('zoom-out').addEventListener('click', () => zoomFromDialog(zoomStep(prefs.zoom, -1)));
+$('zoom-reset').addEventListener('click', () => zoomFromDialog(1));
 
 $('settings-btn').addEventListener('click', openSettings);
 $('pref-overlay-on').addEventListener('change', (e) => toggleOverlay(e.target.checked));
@@ -295,6 +355,21 @@ async function toggleFullscreen() {
     status(`Fullscreen failed: ${err}`);
   }
 }
+
+/// macOS takes its traffic lights away in fullscreen, so the gutter the bar
+/// reserves for them has to go too — otherwise it is an empty pocket to the
+/// left of the app's own name.
+///
+/// Driven by the shell rather than by `toggleFullscreen` above, because that
+/// key is only one of four ways in: the green button, ⌃⌘F and the Window menu
+/// are the others, and none of them passes through this file.
+function setFullscreenClass(on) {
+  document.documentElement.classList.toggle('fullscreen', Boolean(on));
+}
+
+listen('fullscreen-changed', (e) => setFullscreenClass(e.payload));
+// A window restored into fullscreen is already there before the first resize.
+invoke('is_fullscreen').then(setFullscreenClass).catch(() => {});
 
 // --------------------------------------------------------------- utilities
 
@@ -777,7 +852,14 @@ document.addEventListener('keydown', (e) => {
   if ($('app').hidden) return;
   if (modalIsOpen()) return;
 
-  if (e.key >= '0' && e.key <= '5') {
+  // Before the digits: ⌘0 means "back to 100%", a bare 0 means "clear the
+  // rating", and the digit branch below does not look at modifiers.
+  if ((e.metaKey || e.ctrlKey) && ZOOM_KEYS.has(e.key)) {
+    e.preventDefault();
+    // `+` needs Shift on most layouts, so `=` is the key actually reported;
+    // accept both, and the numeric keypad's own signs too.
+    setZoom(e.key === '0' ? 1 : zoomStep(prefs.zoom, e.key === '-' || e.key === '_' ? -1 : 1));
+  } else if (e.key >= '0' && e.key <= '5') {
     e.preventDefault();
     applyRating(Number(e.key));
   } else if (e.key === 'p' || e.key === 'P') {

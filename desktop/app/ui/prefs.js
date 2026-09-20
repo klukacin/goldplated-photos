@@ -30,6 +30,33 @@ const OVERLAY_FIELDS = [
   'rating',
 ];
 
+/// Interface scale, as a ladder rather than a multiplier.
+///
+/// Repeatedly multiplying by 1.1 drifts — press in and out the same number of
+/// times and you do not land back where you started — and it gives no
+/// predictable stops. A ladder does both, and 1 is on it.
+const ZOOM_STEPS = [0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5];
+
+/// The next rung up or down, stopping at either end.
+///
+/// The rung strictly past `current`, not the neighbour of the nearest one: a
+/// value that is not on the ladder — stored by an older build, or one the
+/// ladder no longer lists — would otherwise step the wrong way. From 1.13,
+/// snapping to the nearest rung (1.1) and stepping down lands on 1, skipping
+/// past a 1.1 that is genuinely smaller than where the photographer was.
+///
+/// The epsilon is for the ladder's own values: 0.9 does not survive a JSON
+/// round trip as exactly 0.9, and without it "zoom in" from a stored 0.9 could
+/// return 0.9 again and the key would look dead.
+function zoomStep(current, direction) {
+  const EPSILON = 1e-9;
+  if (direction > 0) {
+    return ZOOM_STEPS.find((step) => step > current + EPSILON) ?? ZOOM_STEPS[ZOOM_STEPS.length - 1];
+  }
+  const below = ZOOM_STEPS.filter((step) => step < current - EPSILON);
+  return below.length ? below[below.length - 1] : ZOOM_STEPS[0];
+}
+
 function defaultPrefs() {
   return {
     panelOrder: [...PANELS],
@@ -38,6 +65,8 @@ function defaultPrefs() {
     /// the app to look at pictures should be shown pictures.
     overlay: { on: false, fields: [...OVERLAY_FIELDS] },
     sidebars: { left: true, right: true },
+    /// Interface scale. 1 is the webview's own idea of a pixel.
+    zoom: 1,
   };
 }
 
@@ -81,6 +110,15 @@ function normalize(raw) {
     ? OVERLAY_FIELDS.filter((f) => storedFields.includes(f))
     : [...OVERLAY_FIELDS];
 
+  // A stored zoom is applied before anything is on screen, so a bad one is not
+  // a cosmetic problem — at 40× the controls that would put it right are all
+  // off the edge of the window, and the value is reloaded on every restart.
+  // Clamping is the difference between a setting and a brick.
+  const zoom =
+    typeof raw.zoom === 'number' && Number.isFinite(raw.zoom)
+      ? Math.min(ZOOM_STEPS[ZOOM_STEPS.length - 1], Math.max(ZOOM_STEPS[0], raw.zoom))
+      : base.zoom;
+
   return {
     panelOrder: kept,
     panelOpen: open,
@@ -89,6 +127,7 @@ function normalize(raw) {
       left: asBool(raw.sidebars?.left, base.sidebars.left),
       right: asBool(raw.sidebars?.right, base.sidebars.right),
     },
+    zoom,
   };
 }
 

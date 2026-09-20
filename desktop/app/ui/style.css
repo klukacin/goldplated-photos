@@ -92,13 +92,25 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .titlebar {
   display: flex;
   align-items: center;
-  gap: 1rem;
   height: 46px;
-  padding: 0 1rem 0 88px; /* room for the macOS traffic lights */
+  padding: 0 1rem;
+  gap: 0.6rem;
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+/* Only macOS puts window buttons inside our bar — see the `mac` class in
+   app.js. Windows and Linux draw their own frame above it, so reserving this
+   gutter there would be a dead notch on the left of every window.
+
+   Divided by the zoom because the lights are drawn by the system at a fixed
+   size and do not scale with the page; a constant 88px would drift right of
+   them as the interface grew. */
+html.mac .titlebar { padding-left: calc(88px / var(--zoom, 1)); }
+/* …except in fullscreen, where macOS takes the traffic lights away and the
+   gutter reserved for them is an empty pocket on the left of the bar. */
+html.mac.fullscreen .titlebar { padding-left: 1rem; }
+
 .titlebar-icon {
   flex-shrink: 0;
   border-radius: 4px;
@@ -255,11 +267,37 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.toolbar input[type="search"] { max-width: 260px; min-width: 9rem; }
+
+/* Wrap rather than overflow. A toolbar that runs off the edge does not scroll
+   and has no affordance saying so, it simply loses its last controls — which at
+   150% zoom was Enlarge, the overlay toggle and the inspector toggle, all
+   silently unreachable. A taller bar costs a row; an unreachable button costs
+   the feature. The same thing happens without zoom in a narrow window, which is
+   where "Remove from album" had been clipped all along.
+
+   Only the middle wraps. The two sidebar toggles sit outside it so they stay
+   pinned to the edges however many rows this takes — inside, the right-hand one
+   reflowed to the *start* of the second row, which is the one place it must
+   never be. */
+.toolbar-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  row-gap: 0.45rem;
+}
+/* The search box is the one thing here that can give up width gracefully, so
+   it does — it shrinks before the bar is forced to take a second row. */
+.toolbar input[type="search"] { max-width: 260px; min-width: 7rem; flex: 1 1 7rem; }
 /* With the inspector open the toolbar is tight, and a wrapped "Remove from
    album" spread over three lines and dragged the whole bar taller. The search
    box gives up the width instead. */
 .toolbar .btn { white-space: nowrap; flex-shrink: 0; }
+/* The spacer pushes the right-hand group over only while there is room for it
+   to do so; once the bar wraps it must not claim a whole row of its own. */
+.toolbar .spacer { flex: 1 1 0; min-width: 0; }
 /* The count broke across two lines mid-phrase — "1" above "selected" — which
    reads as a rendering fault rather than a tight fit. */
 #selection-info { white-space: nowrap; }
@@ -377,6 +415,9 @@ kbd {
   align-items: baseline;
   font-size: 0.85rem;
 }
+.zoom-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+.zoom-row #zoom-readout { min-width: 3.5rem; text-align: center; }
+
 .shortcuts dt { text-align: right; color: var(--text-dim); }
 .shortcuts dd { margin: 0; }
 .btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }

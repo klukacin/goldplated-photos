@@ -40,4 +40,3 @@ fn copy_titlebar_icon() {
         std::fs::write(DEST, &icon).expect("could not write the titlebar icon");
     }
 }
-

@@ -689,6 +689,60 @@ the known panels in the stored order and appends the rest, so a downgrade and an
 upgrade are both survivable. One function, `applyPrefs()`, is the only path from
 a preference to the screen.
 
+**The window buttons are the system's, sitting in our bar.** That needs
+`titleBarStyle: Overlay`, not `Transparent`: Tauri's own doc for `Transparent`
+says it shows "the window background color" and is for when you "don't need to
+have actual HTML under the title bar" — which is the opposite of this. It shipped
+that way and it looked it: a strip of window background at the top holding the
+traffic lights, our dark bar starting *below* it, and the 88px gutter reserving
+room for buttons that were in a different strip entirely. `Overlay` puts the
+content under the bar and the lights on top of it. The setting is
+`#[cfg(target_os = "macos")]` in Tauri either way, so only macOS puts its traffic
+lights inside the page — Windows and Linux draw a system frame above it.
+That is why the gutter reserving room for them is on `html.mac` (set from the
+user agent, synchronously, before first paint) rather than on `.titlebar`: on
+the other two it would be a dead notch. In fullscreen macOS takes the lights away, so that gutter has to go with them —
+the shell watches `WindowEvent::Resized`, compares `is_fullscreen()` against an
+`AtomicBool` and emits `fullscreen-changed` only on the change (every frame of a
+window-edge drag is a resize too). It must come from the shell: fullscreen is
+entered four ways — our `F`, the green button, `⌃⌘F`, the Window menu — and only
+one of them passes through the UI.
+
+**That `AtomicBool` is also the only trustworthy answer to "are we fullscreen?"**
+Measured on macOS 27 with Tauri 2.11: `WebviewWindow::is_fullscreen()` answered
+`false` while the window was genuinely fullscreen, though the same question asked
+of the `Window` in the resize handler answered correctly. `toggle_fullscreen`
+first derived its target from the wrong one, so it asked for the state the window
+was already in — and tao returns early on exactly that (`window.rs:1147`),
+silently. The key did nothing, in both directions, while `set_fullscreen`
+returned `Ok` and the status line cheerfully reported success. Anything asking
+where the window is should read the flag, not the window.
+
+Drawing our own red/yellow/green means
+`decorations: false` and re-implementing three different conventions —
+hover glyphs, Option-click, and the right-click menu on macOS; Windows 11 snap
+layouts on hover; and `gtk-decoration-layout`, which puts the buttons on either
+side depending on the user's setting. Don't, unless the whole frame is being
+taken over deliberately.
+
+**The interface scales with `⌘`/`Ctrl` and `+` `-` `0`**, through the webview's
+own page zoom (`WebviewWindow::set_zoom`, macOS 11+/Windows/Linux) rather than a
+CSS transform — it re-lays out and re-renders, so a 4K display gets larger
+*sharp* type instead of a magnified bitmap. Tauri has no getter, so the level is
+`prefs.js`'s to remember, on a ladder rather than a multiplier (press in and out
+the same number of times and you land back on 1). `normalize` clamps it, and
+that clamp is load-bearing: the zoom is applied before anything is drawn and
+reloaded on every restart, so an unclamped value leaves the controls that would
+undo it off the edge of the screen. The macOS traffic-light gutter divides by
+`--zoom`, because the lights are drawn by the system and do not scale.
+
+**The info overlay rides inside `#inspector-frame`**, like the crop overlay and
+for the same reason — the frame is what the loupe moves, so the overlay is over
+the enlarged picture with no second case. It is `pointer-events: none` because
+the crop rectangle is dragged on those same pixels. `I` toggles it, `F` is the
+window's own fullscreen, `[` and `]` the sidebars, `?` the shortcut list, `,`
+settings.
+
 **The loupe is the sidebar preview, moved.** `E`/`Enter`/double-click gives one
 photo the whole main area; the UI *relocates* `#inspector-frame` onto the stage
 rather than drawing a second copy, because a second copy means a second crop

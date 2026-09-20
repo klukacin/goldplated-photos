@@ -69,6 +69,12 @@
       <main class="main">
         <div class="toolbar">
           <button id="toggle-left" class="btn btn-sm" title="Albums sidebar ([)" aria-pressed="true">◧</button>
+          <!-- Everything between the two sidebar toggles wraps; the toggles
+               themselves do not. Inside one wrapping row they would drift to
+               wherever the reflow left them — the right-hand one landed at the
+               *start* of the second row — and a control that points at a
+               sidebar has to stay on that sidebar's side. -->
+          <div class="toolbar-main">
           <input type="search" id="search" placeholder="Filter by name or camera…" autocomplete="off">
           <div class="filter-group" role="group" aria-label="Minimum rating">
             <button class="chip active" data-rating="">All</button>
@@ -91,7 +97,6 @@
           <button id="loupe-btn" class="btn btn-sm" title="Enlarge the selected photo (E · Enter)">
             ⤢ Enlarge
           </button>
-          <button id="toggle-right" class="btn btn-sm" title="Inspector sidebar (])" aria-pressed="true">◨</button>
 
           <span id="selection-info" class="muted"></span>
           <button id="add-to-album-btn" class="btn btn-sm" disabled>Add to album…</button>
@@ -103,6 +108,8 @@
           </button>
           <!-- Last, hard against the right edge: each sidebar's toggle sits on
                the side it opens, so the control points at the thing it moves. -->
+          </div>
+          <button id="toggle-right" class="btn btn-sm" title="Inspector sidebar (])" aria-pressed="true">◨</button>
         </div>
 
         <div id="grid" class="grid" tabindex="0"></div>
@@ -412,6 +419,16 @@
       <label class="check"><input type="checkbox" id="pref-overlay-on"> Show the overlay</label>
       <div id="pref-overlay-fields" class="checks"></div>
 
+      <h3 class="settings-head">Interface scale</h3>
+      <p class="muted">For a display that puts too many pixels in a small space.
+         The whole window scales and the text stays sharp.</p>
+      <div class="zoom-row">
+        <button id="zoom-out" class="btn btn-sm" title="Smaller (⌘−)">−</button>
+        <span id="zoom-readout" class="muted">100%</span>
+        <button id="zoom-in" class="btn btn-sm" title="Larger (⌘+)">+</button>
+        <button id="zoom-reset" class="btn btn-sm" title="Back to 100% (⌘0)">Reset</button>
+      </div>
+
       <h3 class="settings-head">Sidebars</h3>
       <label class="check"><input type="checkbox" id="pref-left"> Albums, on the left <kbd>[</kbd></label>
       <label class="check"><input type="checkbox" id="pref-right"> Inspector, on the right <kbd>]</kbd></label>
@@ -450,6 +467,8 @@
           <dt><kbd>F</kbd></dt><dd>Fullscreen window</dd>
           <dt><kbd>I</kbd></dt><dd>Photo info over the picture</dd>
           <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Albums / inspector sidebar</dd>
+          <dt><kbd>⌘</kbd><kbd>+</kbd> <kbd>⌘</kbd><kbd>−</kbd></dt><dd>Interface larger / smaller</dd>
+          <dt><kbd>⌘</kbd><kbd>0</kbd></dt><dd>Interface back to 100%</dd>
           <dt><kbd>Esc</kbd></dt><dd>Close, in order: dialog, crop tool, enlarged view</dd>
           <dt><kbd>⌘</kbd><kbd>A</kbd></dt><dd>Select every photo shown</dd>
         </dl>
