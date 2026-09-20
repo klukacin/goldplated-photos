@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,13 @@ pub struct Session {
     /// worker, and it sits outside the library lock so the UI thread can raise
     /// it while the import it is trying to stop holds that lock.
     import_cancel: AtomicBool,
+    /// Decoded pixels the live preview renders against — see
+    /// [`Session::preview_photo_edit`]. One photo's worth: a drag stays on one
+    /// frame, and holding more would be holding decoded 24 MP images.
+    ///
+    /// Its own lock, not the library's: a preview must not queue behind an
+    /// import, and it never touches the catalog once the photo row is read.
+    preview_base: Mutex<Option<crate::develop::PreviewBase>>,
 }
 
 /// What the UI shows in the sidebar for one album.
@@ -73,6 +80,23 @@ pub struct LibraryStatus {
     /// Distinct camera models in the catalog. The filter bar's dropdown is
     /// built from this, so a body disappears from it when its last frame does.
     pub cameras: Vec<String>,
+}
+
+/// A live preview of an uncommitted adjustment.
+///
+/// The pixels ride inline as a data URL rather than through a file: a preview
+/// is thrown away the moment the next one arrives, and a file would mean a name
+/// per tick of slider travel and a webview reading one while this rewrites it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewImage {
+    /// `data:image/jpeg;base64,…` — assignable straight to an `<img>`.
+    pub data_url: String,
+    /// Dimensions after the geometry ops, so a caller can size a frame without
+    /// waiting for the image to load. Bounded by
+    /// [`crate::develop::PREVIEW_MAX_EDGE`], not the original's size.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Settings the UI persists between launches.
@@ -274,6 +298,57 @@ impl Session {
         op: crate::develop::EditOp,
     ) -> Result<usize> {
         self.edit_each(ids, |stack| stack.set(op.clone()))
+    }
+
+    /// What one adjustment would look like, without committing it.
+    ///
+    /// This is the slider's answer while the hand is still moving.
+    /// [`Session::set_photo_edit`] is the wrong call for that: it writes the
+    /// stack, renders the frame at full size and rebuilds three thumbnails —
+    /// a fifth of a second on a 24 MP file, and a cache entry per intermediate
+    /// value the photographer only slid past. This writes nothing at all. The
+    /// catalog is untouched, so abandoning a drag leaves no trace, and the
+    /// committing call on release is still the one that decides.
+    ///
+    /// One photo, never a selection: this feeds a preview, and there is only
+    /// one preview. A bulk adjustment shows its result when it commits.
+    pub fn preview_photo_edit(
+        &self,
+        id: i64,
+        op: crate::develop::EditOp,
+    ) -> Result<PreviewImage> {
+        let (photo, mut stack, original) = self.with(|lib| {
+            let photo = lib.photo_by_id(id)?;
+            let stack = lib.edits(id)?;
+            let original = lib.resolve(&photo.rel_path)?;
+            Ok((photo, stack, original))
+        })?;
+        stack.set(op);
+
+        let mut guard = self.preview_base.lock().expect("preview lock poisoned");
+        // Decoding is ~46 ms against ~4 ms to render, so it happens once per
+        // photo and every later tick of the same drag reuses it.
+        if !guard.as_ref().is_some_and(|b| b.matches(&photo)) {
+            *guard = Some(crate::develop::PreviewBase::load(&original, &photo)?);
+        }
+        let rendered = guard.as_ref().expect("just loaded").render(&stack)?;
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&rendered.bytes);
+        Ok(PreviewImage {
+            data_url: format!("data:image/jpeg;base64,{encoded}"),
+            width: rendered.width,
+            height: rendered.height,
+        })
+    }
+
+    /// Let go of the decoded preview pixels.
+    ///
+    /// Closing the panel that previews is what calls this; without it a decoded
+    /// image stays resident for the rest of the session over a slider nobody is
+    /// touching any more.
+    pub fn release_preview(&self) {
+        *self.preview_base.lock().expect("preview lock poisoned") = None;
     }
 
     /// Turn each selected photo a further quarter — positive clockwise.
@@ -784,6 +859,98 @@ mod tests {
         let summary = s.import(None, None).unwrap();
         assert!(!summary.cancelled);
         assert_eq!(summary.imported, 2);
+    }
+
+    /// The whole point of the preview: it must answer without writing
+    /// anything. A preview that left a render behind would fill the cache with
+    /// every value slid past, and one that wrote the stack would make an
+    /// abandoned drag permanent.
+    #[test]
+    fn a_preview_commits_nothing() {
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a.jpg"), 200, 120);
+
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.import(None, None).unwrap();
+        let id = s.photos(PhotoFilter::default()).unwrap()[0].id;
+
+        let before = s.photo_edits(id).unwrap();
+        assert!(before.is_empty());
+
+        let preview = s
+            .preview_photo_edit(id, crate::develop::EditOp::Exposure { ev: 1.5 })
+            .unwrap();
+        assert!(preview.data_url.starts_with("data:image/jpeg;base64,"));
+        assert!(preview.data_url.len() > 100, "a preview with no pixels in it");
+        assert!(preview.width <= crate::develop::PREVIEW_MAX_EDGE);
+        assert!(preview.height <= crate::develop::PREVIEW_MAX_EDGE);
+
+        // The catalog is exactly as it was: no stack, so the photo is still on
+        // its original render key and still shows its original thumbnails.
+        assert!(s.photo_edits(id).unwrap().is_empty(), "a preview wrote the stack");
+
+        // Committing is what changes things, and it is a separate call.
+        s.set_photo_edit(vec![id], crate::develop::EditOp::Exposure { ev: 1.5 })
+            .unwrap();
+        assert!(!s.photo_edits(id).unwrap().is_empty());
+    }
+
+    /// Geometry is fractions of the frame and tone is per pixel, so neither
+    /// reads a dimension — the proxy differs from the delivered render in
+    /// resolution and nothing else. A crop is the one that would betray a
+    /// mistake here, by naming a different part of the photograph.
+    #[test]
+    fn a_preview_crops_the_same_fraction_the_commit_would() {
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a.jpg"), 800, 400);
+
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.import(None, None).unwrap();
+        let id = s.photos(PhotoFilter::default()).unwrap()[0].id;
+
+        let preview = s
+            .preview_photo_edit(
+                id,
+                crate::develop::EditOp::Crop { x: 0.0, y: 0.0, w: 0.5, h: 0.5 },
+            )
+            .unwrap();
+
+        // Half of each edge, at whatever scale the proxy happens to be — so
+        // compare the shape, not the pixel count. The source is 2:1 and half of
+        // each edge keeps it 2:1.
+        let ratio = preview.width as f32 / preview.height as f32;
+        assert!((ratio - 2.0).abs() < 0.05, "cropped proxy is {ratio}:1, expected 2:1");
+    }
+
+    /// The decoded pixels are cached across a drag; a second photo must not be
+    /// previewed through the first one's.
+    #[test]
+    fn a_preview_follows_the_photo_it_was_asked_about() {
+        let src = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("wide.jpg"), 400, 100);
+        write_jpeg(&src.path().join("tall.jpg"), 100, 400);
+
+        let s = Session::new();
+        s.open_library(src.path()).unwrap();
+        s.import(None, None).unwrap();
+        let photos = s.photos(PhotoFilter::default()).unwrap();
+        let wide = photos.iter().find(|p| p.filename == "wide.jpg").unwrap().id;
+        let tall = photos.iter().find(|p| p.filename == "tall.jpg").unwrap().id;
+
+        let op = crate::develop::EditOp::Exposure { ev: 0.5 };
+        let a = s.preview_photo_edit(wide, op.clone()).unwrap();
+        assert!(a.width > a.height, "the wide frame previewed tall");
+
+        // Straight after, through the cache the first call populated.
+        let b = s.preview_photo_edit(tall, op.clone()).unwrap();
+        assert!(b.height > b.width, "the second photo was previewed through the first one's pixels");
+
+        // And releasing the base does not change what a preview says.
+        s.release_preview();
+        let c = s.preview_photo_edit(tall, op).unwrap();
+        assert_eq!((b.width, b.height), (c.width, c.height));
     }
 
     #[test]

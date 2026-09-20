@@ -8,7 +8,7 @@ use gpp_core::albums::{AlbumUpdate, NewAlbum};
 use gpp_core::develop::{EditOp, EditStack};
 use gpp_core::model::{Flag, ImportSummary, Photo, PhotoFilter};
 use gpp_core::publish::PublishResult;
-use gpp_core::session::{AlbumSummary, LibraryStatus, PublishTarget, Session};
+use gpp_core::session::{AlbumSummary, LibraryStatus, PreviewImage, PublishTarget, Session};
 use gpp_core::remote::{PullOutcome, PushOutcome, RemoteAlbum};
 use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan};
 use tauri::{Emitter, Manager, State};
@@ -155,6 +155,30 @@ async fn set_photo_edit(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// What an adjustment would look like, committing nothing.
+///
+/// The slider calls this while it is being dragged and `set_photo_edit` when it
+/// is let go. Blocking, like the others — the render is CPU-bound — but it
+/// writes no thumbnails and no catalog row, so it costs milliseconds.
+#[tauri::command]
+async fn preview_photo_edit(
+    app: tauri::AppHandle,
+    id: i64,
+    op: EditOp,
+) -> CmdResult<PreviewImage> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().preview_photo_edit(id, op).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Drop the decoded pixels the previews were rendering against.
+#[tauri::command]
+fn release_preview(state: State<'_, Session>) {
+    state.release_preview();
 }
 
 /// Relative, unlike `set_photo_edit`: the app's rotate buttons add a quarter
@@ -449,6 +473,8 @@ pub fn run() {
             set_color_label,
             photo_edits,
             set_photo_edit,
+            preview_photo_edit,
+            release_preview,
             rotate_photos,
             toggle_photo_edit,
             clear_photo_edit,

@@ -71,6 +71,10 @@ document.addEventListener('keydown', (e) => {
     document.querySelectorAll('.modal:not([hidden])').forEach((m) => (m.hidden = true));
   } else if (cropMode.active) {
     cancelCrop();
+  } else if (loupe.active) {
+    // Last, because framing happens inside the loupe: one Escape puts the crop
+    // tool away and leaves the photograph up, a second goes back to the grid.
+    setLoupe(false);
   }
 });
 
@@ -213,6 +217,9 @@ async function refreshPhotos() {
   state.photos = await invoke('list_photos', { filter });
   state.selected.clear();
   state.cursor = state.photos.length ? 0 : -1;
+  // A filter that matches nothing leaves no photo to enlarge, and the loupe
+  // would otherwise stay up showing one that is no longer in the grid.
+  if (loupe.active && state.cursor < 0) setLoupe(false);
   renderGrid();
   updateSelectionUI();
 }
@@ -225,7 +232,7 @@ async function refreshAll() {
 function renderGrid() {
   const grid = $('grid');
   grid.innerHTML = '';
-  $('empty-state').hidden = state.photos.length > 0;
+  $('empty-state').hidden = state.photos.length > 0 || loupe.active;
 
   const frag = document.createDocumentFragment();
   state.photos.forEach((photo, index) => {
@@ -295,6 +302,14 @@ function renderGrid() {
       renderGrid();
       updateSelectionUI();
       showInspector(photo);
+    });
+
+    // The way out of the grid, and `dblclick` in the loupe is the way back —
+    // both wired here so the gesture is symmetric.
+    cell.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      state.cursor = index;
+      setLoupe(true);
     });
 
     frag.appendChild(cell);
@@ -370,6 +385,9 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
     e.preventDefault();
     moveCursor(e.key === 'ArrowRight' ? 1 : -1);
+  } else if (e.key === 'e' || e.key === 'E' || e.key === 'Enter') {
+    e.preventDefault();
+    setLoupe(!loupe.active);
   } else if (e.key === 'a' && (e.metaKey || e.ctrlKey)) {
     e.preventDefault();
     state.photos.forEach((p) => state.selected.add(p.id));
@@ -390,6 +408,62 @@ function moveCursor(delta) {
   document.querySelector('.cell.cursor')?.scrollIntoView({ block: 'nearest' });
 }
 
+// ------------------------------------------------------------------- loupe
+//
+// A 300px sidebar preview is enough to tell one frame from another and not
+// nearly enough to judge one. The loupe gives the photograph the whole of the
+// main area while leaving every control exactly where it was: the stars, the
+// sliders, the crop tool and the rating keys all still act on the same photo,
+// because none of them ever addressed the preview — they address the cursor.
+//
+// It does that by *moving* #inspector-frame onto the stage rather than drawing
+// a second copy. A second copy would mean a second crop overlay over different
+// pixels at a different scale, and the two would disagree about which part of
+// the photograph the rectangle names.
+
+const loupe = { active: false };
+
+/// Switch between the grid and the single-photo view.
+function setLoupe(on) {
+  // Nothing to enlarge: leave the grid up rather than show an empty stage.
+  if (on && state.cursor < 0) return;
+  if (loupe.active === on) return;
+  loupe.active = on;
+
+  const frame = $('inspector-frame');
+  if (on) {
+    $('loupe').appendChild(frame);
+  } else {
+    // Back to the top of the inspector, above the filename and the stars.
+    $('inspector').insertBefore(frame, $('inspector').firstChild);
+  }
+  frame.classList.toggle('in-loupe', on);
+  $('loupe').hidden = !on;
+  $('grid').hidden = on;
+  $('loupe-btn').classList.toggle('on', on);
+  $('loupe-btn').textContent = on ? '⤡ Grid' : '⤢ Enlarge';
+
+  // The preview is a different size on each side of this, and the loupe wants
+  // more pixels than the sidebar did — so repaint before re-laying the crop.
+  if (state.cursor >= 0) showInspector(state.photos[state.cursor]);
+  renderGrid();
+  repositionOverlays();
+}
+
+$('loupe-btn').addEventListener('click', () => setLoupe(!loupe.active));
+
+// Double-click enlarged a photo from the grid; double-click puts it back.
+//
+// On the picture itself, because there is nowhere else: the frame is sized to
+// fill the stage, so a guard of `e.target === stage` never matched and the
+// gesture silently did nothing. The one case it must not fire in is framing —
+// the crop rectangle is dragged on these same pixels, and a double-click while
+// adjusting a corner would throw away the loupe mid-crop.
+$('loupe').addEventListener('dblclick', () => {
+  if (cropMode.active) return;
+  setLoupe(false);
+});
+
 // --------------------------------------------------------------- inspector
 
 /// Bumped on every inspector paint. Held arrow keys start several of these at
@@ -399,6 +473,8 @@ let inspectorGeneration = 0;
 
 async function showInspector(photo) {
   const generation = ++inspectorGeneration;
+  // Whatever was queued was for the photo being left.
+  livePreview.next = null;
   const panel = $('inspector');
   panel.hidden = false;
   $('inspector-name').textContent = photo.filename;
@@ -409,7 +485,10 @@ async function showInspector(photo) {
   if (cropMode.active && photo.id !== cropMode.photoId) cancelCrop();
 
   try {
-    const p = await invoke('thumbnail_path', { id: photo.id, size: 'medium' });
+    const p = await invoke('thumbnail_path', {
+      id: photo.id,
+      size: loupe.active ? 'large' : 'medium',
+    });
     if (generation !== inspectorGeneration) return;
     $('inspector-img').src = convertFileSrc(p);
   } catch {
@@ -524,12 +603,13 @@ async function renderDevelop(photo, generation = inspectorGeneration) {
     const out = document.createElement('output');
     out.textContent = formatAmount(value, adj);
 
-    // Update the readout while dragging, but only hit the core on release:
-    // every change re-renders thumbnails, which is far too much work per pixel
-    // of slider travel.
+    // Dragging previews; releasing commits. The core is hit either way, but
+    // with very different calls — see the live-preview section below for why
+    // the committing one cannot be used per pixel of slider travel.
     input.addEventListener('input', () => {
       out.textContent = formatAmount(Number(input.value), adj);
       row.classList.toggle('touched', Number(input.value) !== 0);
+      requestPreview(adj, Number(input.value));
     });
     input.addEventListener('change', () => applyAdjustment(adj, Number(input.value)));
 
@@ -553,6 +633,69 @@ function opKind(op) {
 function formatAmount(value, adj) {
   const sign = value > 0 ? '+' : '';
   return adj.unit ? `${sign}${value.toFixed(2)}${adj.unit}` : `${sign}${value}`;
+}
+
+// ------------------------------------------------------- live preview
+//
+// A slider has to answer while the hand is still moving. Committing cannot do
+// that: `set_photo_edit` writes the stack, develops the frame at full size and
+// rebuilds three thumbnails — measured at ~200 ms on a 24 MP file, and a cache
+// entry for every value slid past on the way to the one that was wanted.
+//
+// So a drag asks for `preview_photo_edit` instead, which renders a small proxy
+// from pixels the core keeps decoded and writes nothing at all: ~4 ms once the
+// first call has paid for the decode. Release still calls the committing one,
+// and the true render replaces the proxy — so what a drag shows is a proxy of
+// exactly the same stack, differing only in resolution.
+//
+// One request in flight at a time, with the newest value kept. Firing per
+// `input` event would queue a dozen renders behind a fast drag and land the
+// preview several values in the past; dropping the ones in between and always
+// finishing on the latest keeps it honest and self-pacing on any machine.
+
+const livePreview = { inFlight: false, next: null };
+
+/// Show what `value` would do, without committing it.
+///
+/// The frame on screen is the one under the cursor, so that is the only frame
+/// worth previewing — and only when the adjustment would actually reach it. A
+/// selection made with cmd-click can leave the cursor on a photo that is not in
+/// it; previewing another of the targets there would put one photograph's
+/// pixels in the other one's frame, and previewing the cursor's would show a
+/// change the release is not going to make. So neither: show nothing, and let
+/// the commit repaint the grid.
+function requestPreview(adj, value) {
+  if (state.cursor < 0) return;
+  const id = state.photos[state.cursor]?.id;
+  if (id == null || !developTargets().includes(id)) return;
+  livePreview.next = { id, op: { op: adj.kind, [adj.field]: value } };
+  drainPreview();
+}
+
+async function drainPreview() {
+  if (livePreview.inFlight || !livePreview.next) return;
+  livePreview.inFlight = true;
+  try {
+    while (livePreview.next) {
+      const { id, op } = livePreview.next;
+      livePreview.next = null;
+      // The photo can change under a slow render — a held arrow key moves the
+      // cursor. Painting the result then would put one photo's pixels beside
+      // another photo's adjustments, which is the bug the generation counter
+      // exists to prevent, so it is checked here too.
+      const generation = inspectorGeneration;
+      const preview = await invoke('preview_photo_edit', { id, op });
+      if (generation !== inspectorGeneration) return;
+      $('inspector-img').src = preview.dataUrl;
+    }
+  } catch (err) {
+    // A preview is a courtesy. Losing one must not interrupt the drag or
+    // overwrite the status line with noise the commit will report anyway.
+  } finally {
+    livePreview.inFlight = false;
+    // A value that arrived while the last render was finishing.
+    if (livePreview.next) drainPreview();
+  }
 }
 
 // Adjustments are coalesced rather than sent one per keystroke; the scheduling
@@ -1043,10 +1186,87 @@ async function selectAlbum(path) {
 
 document.querySelector('.nav-item[data-album=""]').addEventListener('click', () => selectAlbum(''));
 
+// ------------------------------------------------- putting an album inside one
+//
+// Nesting has always worked — an album's path *is* its place in the tree, so
+// typing `colleccija/test` into either dialog puts it inside `colleccija` and
+// carries its sub-albums along. Nothing said so. The only hint was a line of
+// small print under a text field, and a collection created for the purpose sat
+// there with no visible way to put anything in it.
+//
+// So this is a picker over the same field rather than a second mechanism: it
+// rewrites the path's prefix, and the path stays on screen showing exactly what
+// will be created or moved. Typing a path by hand still works, still creates
+// any missing collections above it, and now moves the picker to match.
+
+/// Fill an "Inside" picker with the collections an album could sit in.
+/// `exclude` is an album being moved: an album cannot be put inside itself, and
+/// it cannot be put inside its own descendant either — that would ask the tree
+/// to hold a loop.
+function fillParentPicker(select, currentParent, exclude) {
+  select.innerHTML = '';
+  const top = document.createElement('option');
+  top.value = '';
+  top.textContent = '— top level —';
+  select.appendChild(top);
+
+  state.albums
+    .filter((a) => a.is_collection)
+    .filter((a) => !exclude || (a.path !== exclude && !a.path.startsWith(`${exclude}/`)))
+    .forEach((a) => {
+      const opt = document.createElement('option');
+      opt.value = a.path;
+      opt.textContent = a.path;
+      select.appendChild(opt);
+    });
+
+  // A parent that is not on the list — the album sits under a plain album, or
+  // under nothing that exists yet — is still where the album is, so offer it
+  // rather than silently reading as "top level" and moving the album on save.
+  if (currentParent && !select.querySelector(`option[value="${CSS.escape(currentParent)}"]`)) {
+    const opt = document.createElement('option');
+    opt.value = currentParent;
+    opt.textContent = currentParent;
+    select.appendChild(opt);
+  }
+  select.value = currentParent || '';
+}
+
+/// Everything before the last path segment, or '' at the top level.
+function parentOf(path) {
+  const parts = path.split('/').filter(Boolean);
+  return parts.slice(0, -1).join('/');
+}
+
+/// Keep the two controls telling the same story: the picker rewrites the path's
+/// prefix, and typing a path moves the picker to whatever prefix was typed.
+function linkParentPicker(selectId, inputId) {
+  const select = $(selectId);
+  const input = $(inputId);
+  select.addEventListener('change', () => {
+    const name = input.value.trim().split('/').filter(Boolean).pop() || '';
+    input.value = select.value ? `${select.value}/${name}` : name;
+  });
+  input.addEventListener('input', () => {
+    const parent = parentOf(input.value.trim());
+    // Only when the picker already offers it — a half-typed path should not add
+    // an option for a collection nobody has created.
+    if (select.querySelector(`option[value="${CSS.escape(parent)}"]`)) select.value = parent;
+  });
+}
+
+linkParentPicker('album-parent', 'album-path');
+linkParentPicker('set-parent', 'set-path');
+
 $('new-album-btn').addEventListener('click', () => {
-  $('album-path').value = '';
+  // Creating an album while looking at a collection almost always means
+  // creating it in there, so start the picker on it.
+  const here = state.albums.find((a) => a.path === state.currentAlbum);
+  const parent = here?.is_collection ? here.path : parentOf(state.currentAlbum || '');
+  $('album-path').value = parent ? `${parent}/` : '';
   $('album-title').value = '';
   $('album-collection').checked = false;
+  fillParentPicker($('album-parent'), parent, null);
   showError('album-error', '');
   openModal('album-modal');
 });
@@ -1075,6 +1295,7 @@ function openAlbumSettings(entry) {
   state.editingAlbum = entry;
   $('settings-album-title').textContent = entry.path;
   $('set-path').value = entry.path;
+  fillParentPicker($('set-parent'), parentOf(entry.path), entry.path);
   $('set-title').value = entry.title || '';
   $('set-description').value = entry.description || '';
   $('set-sort').value = entry.sort;

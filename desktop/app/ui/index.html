@@ -66,6 +66,11 @@
             <button class="chip" data-flag="reject">Rejects</button>
           </div>
           <div class="spacer"></div>
+          <!-- The grid is for choosing a photo; this is for looking at one.
+               Every edit control stays where it is — only the preview grows. -->
+          <button id="loupe-btn" class="btn btn-sm" title="Enlarge the selected photo (E · Enter)">
+            ⤢ Enlarge
+          </button>
           <span id="selection-info" class="muted"></span>
           <button id="add-to-album-btn" class="btn btn-sm" disabled>Add to album…</button>
           <!-- Only means anything while looking at one album; it takes photos
@@ -77,6 +82,10 @@
         </div>
 
         <div id="grid" class="grid" tabindex="0"></div>
+        <!-- Deliberately empty: #inspector-frame is moved in here and back out
+             again. Rebuilding a second copy of the preview would mean a second
+             crop overlay, and the two would disagree. -->
+        <div id="loupe" class="loupe" hidden></div>
         <div id="empty-state" class="empty" hidden>
           <p>No photos match. Import a folder or clear the filters.</p>
         </div>
@@ -151,7 +160,10 @@
   <div id="album-modal" class="modal" hidden>
     <div class="modal-card">
       <h2>New album</h2>
-      <label>Path <small>e.g. 2026/weddings/ana-ivan</small>
+      <label>Inside <small>a collection, or nothing for the top level</small>
+        <select id="album-parent"></select>
+      </label>
+      <label>Path <small>e.g. 2026/weddings/ana-ivan — folders above it are created as collections</small>
         <input type="text" id="album-path" placeholder="2026/weddings/ana-ivan">
       </label>
       <label>Title <input type="text" id="album-title" placeholder="Ana &amp; Ivan"></label>
@@ -168,6 +180,9 @@
   <div id="settings-album-modal" class="modal" hidden>
     <div class="modal-card">
       <h2 id="settings-album-title">Album settings</h2>
+      <label>Inside <small>move the album into a collection — its sub-albums come along</small>
+        <select id="set-parent"></select>
+      </label>
       <label>Path <small>change it to rename or move the album — sub-albums come along</small>
         <input type="text" id="set-path" placeholder="2026/weddings/ana-ivan">
       </label>

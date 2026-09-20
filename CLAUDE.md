@@ -658,6 +658,20 @@ An adjustment is a row in `edits`, never a write to the original. What identifie
 
 Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
 
+**A dragged slider previews; a released one commits.** Committing writes the
+stack, develops at full size and rebuilds three thumbnails — ~200 ms on a 24 MP
+frame, and a cache entry per value slid past. So a drag calls
+`Session::preview_photo_edit`, which writes *nothing*: it renders a 1024 px
+proxy (~4 ms) from pixels the session keeps decoded and returns it inline as a
+data URL. Downscaling first is faithful, not an approximation — geometry is
+fractions of the frame and tone is per pixel, so neither reads a dimension.
+
+**The loupe is the sidebar preview, moved.** `E`/`Enter`/double-click gives one
+photo the whole main area; the UI *relocates* `#inspector-frame` onto the stage
+rather than drawing a second copy, because a second copy means a second crop
+overlay over different pixels at a different scale, and the two would disagree
+about which part of the photograph the rectangle names.
+
 **Where order matters, and where it cannot.** `apply` runs two passes: geometry in stack order, then tone in stack order, purely per pixel. So a tone op's position relative to a geometry op is irrelevant — measured, not assumed (`tests/geometry_order.rs`). Within tone, order matters, as in any developer: exposure-then-contrast is not contrast-then-exposure. Within geometry it matters too, and that is why the turns and mirrors are **not** edited where they lie in the stack.
 
 **Orientation is stored canonically**, as one left-to-right mirror followed by quarter turns — the eight ways a rectangle can be set down. A button composes onto the *outside* of that framing and the whole thing is written back, so a top-to-bottom flip is stored as a mirror plus a half turn, and `flip-vertical` is never written. Editing the ops in place instead gave two defects that were three presses away in the panel: "rotate right" on a flipped frame turned the photograph left, and pressing a flip again to undo it mirrored the wrong axis once a turn sat between them. Anything reading orientation must fold the whole op list (as `renderGeometry` does), never look for a particular op. The crop is held last and its rectangle is carried along by each press, so a frame drawn on the picture keeps framing the same part of it. A stack written before all this — the crop appended wherever it fell, ahead of the turns — is normalised on the next press, rectangle carried through the framing that used to follow it; without that, moving the crop to the end reads the same four fractions against a frame that has since turned and the bride is out of the picture.

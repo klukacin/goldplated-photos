@@ -196,6 +196,35 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 }
 .grid:focus-visible { outline: none; }
 
+/* ------------------------------------------------------------------ loupe */
+/*
+   One photo, as large as the window allows. The stage is only a box: the
+   picture inside it is #inspector-frame, moved here from the sidebar and moved
+   back on the way out, so the crop overlay keeps measuring the same element it
+   always did and none of its geometry needed a second case.
+*/
+.loupe {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.9rem;
+  background: #0b0b0d;
+  overflow: hidden;
+}
+/* Fill the stage and let `object-fit: contain` letterbox the picture, exactly
+   as it does at sidebar size — `drawnPictureBox()` solves for the bars, so the
+   crop rectangle lands on the photograph at either size without knowing which. */
+.inspector-frame.in-loupe { width: 100%; height: 100%; }
+.inspector-frame.in-loupe .inspector-img {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  background: transparent;
+}
+.btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+
 .cell {
   position: relative;
   border-radius: var(--radius);
