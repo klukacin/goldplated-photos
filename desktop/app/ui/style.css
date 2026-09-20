@@ -99,6 +99,13 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+.titlebar-icon {
+  flex-shrink: 0;
+  border-radius: 4px;
+  /* The mark is a photograph's aperture, not a control — it must not read as
+     something to press. */
+  pointer-events: none;
+}
 .titlebar-title { font-weight: 600; }
 .titlebar-actions { margin-left: auto; display: flex; gap: 0.5rem; }
 
@@ -117,6 +124,101 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 }
 .sidebar-section { padding: 0.75rem; }
 
+/* ---------------------------------------------------------------- library */
+/*
+   The open library, at the top of the sidebar holding its contents. It is a
+   button because it does something — everything about libraries is behind it —
+   and it looks like a header because that is what it is the rest of the time.
+*/
+.library-section { border-bottom: 1px solid var(--border); }
+.library-current {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "meta caret" "name caret";
+  align-items: center;
+  gap: 0 0.5rem;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+}
+.library-current:hover { background: #26262e; border-color: var(--border); }
+.library-meta {
+  grid-area: meta;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.library-name {
+  grid-area: name;
+  font-weight: 600;
+  /* A library is a folder someone named; it can be long, and the sidebar is
+     240px. Truncate rather than let it push the caret off the edge. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.library-caret { grid-area: caret; color: var(--text-dim); font-size: 0.8rem; }
+
+/* The switcher's rows: a library to open, and a way to forget one whose folder
+   has moved. Forgetting removes it from this list and from nowhere else. */
+.library-recent { display: flex; flex-direction: column; gap: 0.2rem; margin-bottom: 0.75rem; }
+.library-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: var(--radius-sm);
+}
+.library-row:hover { background: var(--bg-sunken); }
+.library-switch {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.4rem 0.55rem;
+}
+.library-switch .path {
+  display: block;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Deliberately NOT `direction: rtl`. That is the usual trick for keeping the
+     end of a path visible, and it reorders the punctuation: `/Volumes/Archive`
+     renders as `Volumes/Archive/`, with the leading slash moved to the end. The
+     folder's own name is on the line above in bold, so this line is context and
+     may truncate normally; the full path is on the row's tooltip. */
+}
+.library-forget {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  opacity: 0;
+}
+.library-row:hover .library-forget { opacity: 0.7; }
+.library-forget:hover { opacity: 1; color: var(--danger); }
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+.sidebar-header h2 {
+  margin: 0;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
 .sidebar-footer { margin-top: auto; padding: 0.75rem; border-top: 1px solid var(--border); }
 .stats { font-size: 0.8rem; color: var(--text-dim); line-height: 1.5; }
 

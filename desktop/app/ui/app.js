@@ -12,6 +12,9 @@ const { invoke, convertFileSrc } = window.__TAURI__.core;
 // server — would then go ahead unasked. Tauri's dialog plugin is a real native
 // prompt on every platform.
 const { open: openDialog, confirm: askConfirm } = window.__TAURI__.dialog;
+// Granted by `opener:default`, which covers revealing a path in the system's
+// own file manager.
+const { revealItemInDir } = window.__TAURI__.opener;
 const { listen } = window.__TAURI__.event;
 
 
@@ -293,8 +296,6 @@ async function toggleFullscreen() {
   }
 }
 
-
-
 // --------------------------------------------------------------- utilities
 
 function status(text) {
@@ -352,6 +353,7 @@ async function boot() {
   try {
     const info = await invoke('library_status');
     localStorage.setItem(LIBRARY_KEY, info.root);
+    rememberLibrary(localStorage, info.root);
     await enterApp(info);
     return;
   } catch {
@@ -383,9 +385,130 @@ $('open-library-btn').addEventListener('click', async () => {
 
 async function openLibrary(path) {
   const info = await invoke('open_library', { path });
-  localStorage.setItem(LIBRARY_KEY, path);
+  // The path the core resolved, not the one that was asked for — a picker can
+  // hand over a symlink or a trailing slash, and the switcher has to offer back
+  // exactly what would open again.
+  localStorage.setItem(LIBRARY_KEY, info.root);
+  rememberLibrary(localStorage, info.root);
   await enterApp(info);
 }
+
+// ---------------------------------------------------------------- libraries
+//
+// A photographer has more than one: this shoot's card, last year's archive, the
+// drive that is only plugged in sometimes. Remembering the last one is not a
+// switcher — the list of the last few lives in prefs.js, along with the repair
+// of whatever ends up stored there.
+
+/// Open another library, leaving nothing of the last one behind.
+///
+/// Ids, album paths and the cursor all mean something only within one catalog,
+/// so every one of them is dropped rather than carried across. The album filter
+/// especially: a path that existed in the old library would quietly filter the
+/// new one down to nothing, and look like an empty import.
+async function switchLibrary(path) {
+  showError('library-error', '');
+  state.currentAlbum = '';
+  state.selected.clear();
+  state.cursor = -1;
+  setLoupe(false);
+  // The decoded preview pixels belong to a photo in the library being left.
+  invoke('release_preview').catch(() => {});
+  try {
+    await openLibrary(path);
+    closeModal('library-modal');
+    status(`Opened ${path}`);
+  } catch (err) {
+    showError('library-error', String(err));
+    // The list keeps a folder that has moved or is on an unplugged drive, so
+    // that plugging it back in is all that is needed — but say so plainly
+    // rather than leaving a row that silently does nothing.
+    renderLibraryModal();
+  }
+}
+
+function renderLibraryModal() {
+  const current = localStorage.getItem(LIBRARY_KEY) || '';
+  $('library-path').textContent = current || 'No library open';
+  $('library-reveal').disabled = !current;
+  $('library-prune').disabled = !current;
+
+  const others = loadRecent(localStorage).filter((path) => path !== current);
+  const list = $('library-recent');
+  list.innerHTML = '';
+  $('library-recent-empty').hidden = others.length > 0;
+
+  for (const path of others) {
+    const row = document.createElement('div');
+    row.className = 'library-row';
+
+    const open = document.createElement('button');
+    open.className = 'library-switch';
+    // The name identifies it; the path is context and may truncate. The whole
+    // path is on the tooltip, where truncation cannot hide it.
+    open.title = path;
+    open.innerHTML = `<strong>${escapeHtml(libraryName(path))}</strong><span class="path">${escapeHtml(path)}</span>`;
+    open.addEventListener('click', () => switchLibrary(path));
+
+    const forget = document.createElement('button');
+    forget.className = 'library-forget';
+    forget.textContent = '✕';
+    forget.title = 'Forget this library. The folder and its photos are untouched.';
+    forget.addEventListener('click', (e) => {
+      e.stopPropagation();
+      forgetLibrary(localStorage, path);
+      renderLibraryModal();
+    });
+
+    row.append(open, forget);
+    list.appendChild(row);
+  }
+}
+
+/// The last segment of a path — what the folder is called.
+function libraryName(path) {
+  return path.split('/').filter(Boolean).pop() || path;
+}
+
+$('library-btn').addEventListener('click', () => {
+  renderLibraryModal();
+  openModal('library-modal');
+});
+
+$('library-open-btn').addEventListener('click', async () => {
+  const dir = await openDialog({ directory: true, title: 'Choose a photo folder' });
+  if (dir) await switchLibrary(dir);
+});
+
+$('library-reveal').addEventListener('click', async () => {
+  const current = localStorage.getItem(LIBRARY_KEY);
+  if (!current) return;
+  try {
+    await revealItemInDir(current);
+  } catch (err) {
+    showError('library-error', String(err));
+  }
+});
+
+$('library-prune').addEventListener('click', async () => {
+  // It deletes nothing on disk, but it does change what the catalog holds, and
+  // a photographer looking at an unplugged drive would lose the whole library
+  // from the grid without being asked.
+  const ok = await askConfirm(
+    'Drop catalog entries whose photo files are no longer there?\n\n' +
+      'Nothing on disk is deleted. If a drive is unplugged, plug it back in first — ' +
+      'its photos count as missing.',
+    { title: 'Remove missing photos', kind: 'warning' },
+  );
+  if (!ok) return;
+  try {
+    const removed = await invoke('prune_missing');
+    status(removed ? `Removed ${removed} missing photo(s)` : 'Nothing was missing');
+    await refreshAll();
+  } catch (err) {
+    showError('library-error', String(err));
+  }
+});
 
 /// Swap the welcome screen for the app and load its contents.
 async function enterApp(info) {
@@ -400,8 +523,9 @@ async function enterApp(info) {
 }
 
 function renderStatus(info) {
-  const name = info.root.split('/').filter(Boolean).pop() || info.root;
-  $('library-name').textContent = name;
+  // The sidebar names the library; the titlebar names the application.
+  $('library-name').textContent = libraryName(info.root);
+  $('library-name').title = info.root;
   $('all-count').textContent = info.photo_count;
   // Camera names come out of EXIF, which is to say out of the files — escape
   // them. A photo whose Model field is "<b>bold</b>" must not restyle the app.

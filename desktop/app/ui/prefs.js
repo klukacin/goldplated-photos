@@ -92,6 +92,74 @@ function normalize(raw) {
   };
 }
 
+// --------------------------------------------------------- recent libraries
+//
+// A library is a folder the photographer chose, and photographers have more
+// than one — this shoot's card, last year's archive, the drive that is only
+// plugged in sometimes. Remembering the last one is not a switcher; remembering
+// the last few is.
+//
+// Stored apart from the arrangement above because it is a different kind of
+// thing: paths from a file picker, not settings. Same repair problem though —
+// the list is written on every open, so a duplicate, a stale entry or a value
+// that is not a path at all all reach it.
+
+const RECENT_KEY = 'gpp.recentLibraries';
+
+/// How many to keep. Long enough to cover the drives someone actually works
+/// from, short enough that the list stays a list and not a history.
+const RECENT_LIMIT = 8;
+
+/// Strings only, no duplicates, newest first, capped.
+///
+/// Order is meaning here, unlike the overlay's fields: the most recently opened
+/// library goes first because that is the one most likely wanted next.
+function normalizeRecent(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string') continue;
+    const path = entry.trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+    if (out.length === RECENT_LIMIT) break;
+  }
+  return out;
+}
+
+function loadRecent(storage, key = RECENT_KEY) {
+  try {
+    return normalizeRecent(JSON.parse(storage.getItem(key)));
+  } catch {
+    return [];
+  }
+}
+
+/// Put a library at the front, keeping the list clean. Returns the new list.
+function rememberLibrary(storage, path, key = RECENT_KEY) {
+  const list = normalizeRecent([path, ...loadRecent(storage, key)]);
+  try {
+    storage.setItem(key, JSON.stringify(list));
+  } catch {
+    // A blocked profile loses the history, not the library that just opened.
+  }
+  return list;
+}
+
+/// Drop one — a folder that has been moved, or one the photographer is done
+/// with. Never touches the library itself, only this list.
+function forgetLibrary(storage, path, key = RECENT_KEY) {
+  const list = loadRecent(storage, key).filter((entry) => entry !== path);
+  try {
+    storage.setItem(key, JSON.stringify(list));
+  } catch {
+    // As above.
+  }
+  return list;
+}
+
 const PREFS_KEY = 'gpp.prefs';
 
 /// Read the stored preferences. Unreadable or unparsable storage is not an

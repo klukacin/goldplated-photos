@@ -666,6 +666,18 @@ proxy (~4 ms) from pixels the session keeps decoded and returns it inline as a
 data URL. Downscaling first is faithful, not an approximation — geometry is
 fractions of the frame and tone is per pixel, so neither reads a dimension.
 
+**The titlebar names the application; the sidebar names the library.** Which
+folder is open is a property of the work, not of the program, so it sits at the
+top of the sidebar whose albums and counts are that library's contents — and it
+is the switcher. The last few libraries live under their own key via
+`prefs.js` (`loadRecent` / `rememberLibrary` / `forgetLibrary`, order is
+meaning: newest first). Switching drops `currentAlbum`, the selection and the
+cursor before opening: ids and album paths mean something only inside one
+catalog, and a path carried across would quietly filter the new library down to
+nothing and look like a failed import. `prune_missing` was registered in the
+shell and reachable from nowhere; it is the library dialog's "Remove missing
+photos", behind a confirmation that says an unplugged drive counts as missing.
+
 **The window remembers how it was arranged.** Which inspector panels are open,
 in what order, which sidebars are showing, and what the info overlay says all
 live in `localStorage` via `desktop/app/ui/prefs.js` — a DOM-free module so the

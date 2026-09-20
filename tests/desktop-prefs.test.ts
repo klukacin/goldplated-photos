@@ -33,19 +33,27 @@ const source = readFileSync(
 const {
   PANELS,
   OVERLAY_FIELDS,
+  RECENT_LIMIT,
   defaultPrefs,
   normalize,
   loadPrefs,
   savePrefs,
+  loadRecent,
+  rememberLibrary,
+  forgetLibrary,
 } = new Function(
-  `${source}\nreturn { PANELS, OVERLAY_FIELDS, defaultPrefs, normalize, loadPrefs, savePrefs };`
+  `${source}\nreturn { PANELS, OVERLAY_FIELDS, RECENT_LIMIT, defaultPrefs, normalize, loadPrefs, savePrefs, loadRecent, rememberLibrary, forgetLibrary };`
 )() as {
   PANELS: string[];
   OVERLAY_FIELDS: string[];
+  RECENT_LIMIT: number;
   defaultPrefs: () => Prefs;
   normalize: (raw: unknown) => Prefs;
   loadPrefs: (storage: Storage, key?: string) => Prefs;
   savePrefs: (storage: Storage, prefs: Prefs, key?: string) => boolean;
+  loadRecent: (storage: Storage, key?: string) => string[];
+  rememberLibrary: (storage: Storage, path: string, key?: string) => string[];
+  forgetLibrary: (storage: Storage, path: string, key?: string) => string[];
 };
 
 /** localStorage's surface, with the failures a real one has. */
@@ -144,6 +152,63 @@ describe('normalize', () => {
     expect(normalize({ sidebars: { left: false } })).toMatchObject({
       sidebars: { left: false, right: true },
     });
+  });
+});
+
+describe('recent libraries', () => {
+  it('puts the newest first — that is the one wanted next', () => {
+    const storage = fakeStorage();
+    rememberLibrary(storage, '/a');
+    rememberLibrary(storage, '/b');
+    expect(loadRecent(storage)).toEqual(['/b', '/a']);
+  });
+
+  it('moves a re-opened library to the front instead of listing it twice', () => {
+    // Opening the same library every morning must not fill the switcher with
+    // eight copies of it and push every other one off the end.
+    const storage = fakeStorage();
+    rememberLibrary(storage, '/a');
+    rememberLibrary(storage, '/b');
+    rememberLibrary(storage, '/a');
+    expect(loadRecent(storage)).toEqual(['/a', '/b']);
+  });
+
+  it('keeps the list a list, not a history', () => {
+    const storage = fakeStorage();
+    for (let i = 0; i < RECENT_LIMIT + 5; i++) rememberLibrary(storage, `/lib-${i}`);
+    const list = loadRecent(storage);
+    expect(list).toHaveLength(RECENT_LIMIT);
+    expect(list[0]).toBe(`/lib-${RECENT_LIMIT + 4}`);
+  });
+
+  it('drops entries that are not paths', () => {
+    const storage = fakeStorage({
+      'gpp.recentLibraries': JSON.stringify(['/good', 42, null, '', '   ', { path: '/x' }]),
+    });
+    expect(loadRecent(storage)).toEqual(['/good']);
+  });
+
+  it('reads unusable storage as an empty list rather than throwing', () => {
+    // The switcher has to open even when this key is nonsense.
+    expect(loadRecent(fakeStorage({ 'gpp.recentLibraries': 'not json' }))).toEqual([]);
+    expect(loadRecent(fakeStorage({ 'gpp.recentLibraries': '{"a":1}' }))).toEqual([]);
+    expect(loadRecent(fakeStorage())).toEqual([]);
+  });
+
+  it('forgets one without disturbing the rest', () => {
+    const storage = fakeStorage();
+    rememberLibrary(storage, '/a');
+    rememberLibrary(storage, '/b');
+    rememberLibrary(storage, '/c');
+    expect(forgetLibrary(storage, '/b')).toEqual(['/c', '/a']);
+    expect(loadRecent(storage)).toEqual(['/c', '/a']);
+  });
+
+  it('survives storage that refuses to be written', () => {
+    // Losing the history must not take down the library that just opened.
+    const storage = fakeStorage({}, { readOnly: true });
+    expect(() => rememberLibrary(storage, '/a')).not.toThrow();
+    expect(() => forgetLibrary(storage, '/a')).not.toThrow();
   });
 });
 

@@ -21,7 +21,8 @@
   <!-- Main application -->
   <div id="app" class="app" hidden>
     <header class="titlebar" data-tauri-drag-region>
-      <div class="titlebar-title" id="library-name">Library</div>
+      <img class="titlebar-icon" src="app-icon.png" alt="" width="18" height="18">
+      <div class="titlebar-title">Goldplated Photos</div>
       <div class="titlebar-actions">
         <button id="shortcuts-btn" class="btn" title="Keyboard shortcuts (?)">?</button>
         <button id="settings-btn" class="btn" title="Settings (,)">⚙</button>
@@ -33,6 +34,18 @@
 
     <div class="body">
       <aside id="sidebar" class="sidebar">
+        <!-- Which library is open, and the way to another one. At the top of
+             the sidebar because everything below it — the albums, the counts,
+             the grid — is the contents of this one. -->
+        <div class="sidebar-section library-section">
+          <button id="library-btn" class="library-current"
+                  title="Switch library, or manage this one">
+            <span class="library-meta">Library</span>
+            <span class="library-name" id="library-name">…</span>
+            <span class="library-caret">⌄</span>
+          </button>
+        </div>
+
         <div class="sidebar-section">
           <button class="nav-item active" data-album="">
             <span>All Photos</span>
@@ -352,6 +365,38 @@
       <div class="modal-actions">
         <button class="btn" data-close>Cancel</button>
         <button id="add-confirm-btn" class="btn btn-primary">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Libraries -->
+  <div id="library-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Libraries</h2>
+
+      <h3 class="settings-head">Open now</h3>
+      <p class="muted" id="library-path"></p>
+      <div class="row">
+        <button id="library-reveal" class="btn btn-sm">Show in Finder</button>
+        <!-- The catalog indexes files; files can be deleted from underneath it.
+             This drops the rows whose photographs are gone, and touches nothing
+             on disk. -->
+        <button id="library-prune" class="btn btn-sm"
+                title="Drop catalog entries whose files are no longer there. Deletes nothing.">
+          Remove missing photos
+        </button>
+      </div>
+
+      <h3 class="settings-head">Switch to</h3>
+      <div id="library-recent" class="library-recent"></div>
+      <p class="muted" id="library-recent-empty" hidden>No other library has been
+         opened on this machine yet.</p>
+
+      <p class="error" id="library-error" hidden></p>
+      <div class="modal-actions">
+        <button id="library-open-btn" class="btn">Open another folder…</button>
+        <div class="spacer"></div>
+        <button class="btn btn-primary" data-close>Done</button>
       </div>
     </div>
   </div>
