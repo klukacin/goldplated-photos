@@ -94,12 +94,13 @@ if (!existsSync(capDir) || readdirSync(capDir).filter((f) => f.endsWith('.json')
 
   // Which plugin APIs the UI actually reaches for, and what has to allow them.
   const needs = [
-    { used: /window\.__TAURI__\.event|listen\(/, perm: /^core:(default|event)/, what: 'event.listen' },
-    { used: /openDialog\(|\.dialog\b/, perm: /^dialog:/, what: 'dialog.open' },
-    { used: /askConfirm\(/, perm: /^dialog:(default|allow-confirm|allow-ask)/, what: 'dialog.confirm' },
+    { source: appJs, used: /window\.__TAURI__\.event|listen\(/, perm: /^core:(default|event)/, what: 'event.listen' },
+    { source: appJs, used: /openDialog\(|\.dialog\b/, perm: /^dialog:/, what: 'dialog.open' },
+    { source: appJs, used: /askConfirm\(/, perm: /^dialog:(default|allow-confirm|allow-ask)/, what: 'dialog.confirm' },
+    { source: indexHtml, used: /data-tauri-drag-region/, perm: /^core:window:allow-start-dragging$/, what: 'window dragging' },
   ];
-  for (const { used, perm, what } of needs) {
-    if (used.test(appJs) && !perms.some((p) => perm.test(p))) {
+  for (const { source, used, perm, what } of needs) {
+    if (used.test(source) && !perms.some((p) => perm.test(p))) {
       fail(`UI uses ${what} but no capability grants it`, `permissions: ${perms.join(', ')}`);
     }
   }
