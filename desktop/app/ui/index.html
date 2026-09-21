@@ -21,8 +21,11 @@
   <!-- Main application -->
   <div id="app" class="app" hidden>
     <header class="titlebar" data-tauri-drag-region>
-      <div class="titlebar-title" id="library-name">Library</div>
+      <img class="titlebar-icon" src="app-icon.png" alt="" width="18" height="18">
+      <div class="titlebar-title">Goldplated Photos</div>
       <div class="titlebar-actions">
+        <button id="shortcuts-btn" class="btn" title="Keyboard shortcuts (?)">?</button>
+        <button id="settings-btn" class="btn" title="Settings (,)">⚙</button>
         <button id="import-btn" class="btn">Import…</button>
         <button id="sync-btn" class="btn">Sync…</button>
         <button id="publish-btn" class="btn btn-primary">Publish</button>
@@ -30,7 +33,19 @@
     </header>
 
     <div class="body">
-      <aside class="sidebar">
+      <aside id="sidebar" class="sidebar">
+        <!-- Which library is open, and the way to another one. At the top of
+             the sidebar because everything below it — the albums, the counts,
+             the grid — is the contents of this one. -->
+        <div class="sidebar-section library-section">
+          <button id="library-btn" class="library-current"
+                  title="Switch library, or manage this one">
+            <span class="library-meta">Library</span>
+            <span class="library-name" id="library-name">…</span>
+            <span class="library-caret">⌄</span>
+          </button>
+        </div>
+
         <div class="sidebar-section">
           <button class="nav-item active" data-album="">
             <span>All Photos</span>
@@ -53,6 +68,13 @@
 
       <main class="main">
         <div class="toolbar">
+          <button id="toggle-left" class="btn btn-sm" title="Albums sidebar ([)" aria-pressed="true">◧</button>
+          <!-- Everything between the two sidebar toggles wraps; the toggles
+               themselves do not. Inside one wrapping row they would drift to
+               wherever the reflow left them — the right-hand one landed at the
+               *start* of the second row — and a control that points at a
+               sidebar has to stay on that sidebar's side. -->
+          <div class="toolbar-main">
           <input type="search" id="search" placeholder="Filter by name or camera…" autocomplete="off">
           <div class="filter-group" role="group" aria-label="Minimum rating">
             <button class="chip active" data-rating="">All</button>
@@ -64,8 +86,18 @@
             <button class="chip active" data-flag="">Any</button>
             <button class="chip" data-flag="pick">Picks</button>
             <button class="chip" data-flag="reject">Rejects</button>
+            <!-- `flag: none` is an exact match on the untriaged, not the absence
+                 of a filter — which is what "Any" above is. -->
+            <button class="chip" data-flag="none">Untriaged</button>
           </div>
           <div class="spacer"></div>
+          <!-- The grid is for choosing a photo; this is for looking at one.
+               Every edit control stays where it is — only the preview grows. -->
+          <button id="overlay-btn" class="btn btn-sm" title="Photo info over the picture (I)" aria-pressed="false">ⓘ</button>
+          <button id="loupe-btn" class="btn btn-sm" title="Enlarge the selected photo (E · Enter)">
+            ⤢ Enlarge
+          </button>
+
           <span id="selection-info" class="muted"></span>
           <button id="add-to-album-btn" class="btn btn-sm" disabled>Add to album…</button>
           <!-- Only means anything while looking at one album; it takes photos
@@ -74,9 +106,17 @@
                   title="Take the selected photos out of this album. They stay in your library.">
             Remove from album
           </button>
+          <!-- Last, hard against the right edge: each sidebar's toggle sits on
+               the side it opens, so the control points at the thing it moves. -->
+          </div>
+          <button id="toggle-right" class="btn btn-sm" title="Inspector sidebar (])" aria-pressed="true">◨</button>
         </div>
 
         <div id="grid" class="grid" tabindex="0"></div>
+        <!-- Deliberately empty: #inspector-frame is moved in here and back out
+             again. Rebuilding a second copy of the preview would mean a second
+             crop overlay, and the two would disagree. -->
+        <div id="loupe" class="loupe" hidden></div>
         <div id="empty-state" class="empty" hidden>
           <p>No photos match. Import a folder or clear the filters.</p>
         </div>
@@ -88,6 +128,10 @@
              element exactly — hence the wrapper rather than a floating layer. -->
         <div id="inspector-frame" class="inspector-frame">
           <img id="inspector-img" class="inspector-img" alt="">
+          <!-- Rides inside the frame for the same reason the crop overlay does:
+               the frame is what moves into the loupe, so the overlay is over
+               the enlarged picture without a second case anywhere. -->
+          <div id="info-overlay" class="info-overlay" hidden></div>
           <div id="crop-overlay" class="crop-overlay" hidden>
             <div id="crop-rect" class="crop-rect">
               <span class="crop-handle nw" data-handle="nw"></span>
@@ -99,14 +143,36 @@
         </div>
         <div class="inspector-body">
           <h3 id="inspector-name"></h3>
-          <div class="rating-row" id="inspector-rating"></div>
+
+          <!-- Two panels, collapsible and reorderable; which is open and which
+               comes first is remembered per machine — see prefs.js. The order
+               here is only the markup's; app.js reorders these nodes at boot to
+               whatever was stored. -->
+          <div id="panels" class="panels">
+
+          <!-- What the photograph is, and the triage that says what to do with
+               it. First by default: the frame comes before the edit. -->
+          <details class="panel" id="panel-info" data-panel="info" open>
+            <summary>
+              <span class="panel-title">Info &amp; tagging</span>
+              <span class="spacer"></span>
+              <button class="panel-move" data-move="up" title="Move panel up">↑</button>
+              <button class="panel-move" data-move="down" title="Move panel down">↓</button>
+            </summary>
+            <div class="rating-row" id="inspector-rating"></div>
+            <div class="flag-row" id="inspector-flags"></div>
+            <dl id="inspector-meta" class="meta"></dl>
+          </details>
 
           <!-- Develop. Adjustments are recorded, never written into the
                original; the grid re-renders from the new render key. -->
-          <details class="develop" id="develop" open>
+          <details class="panel develop" id="develop" data-panel="develop" open>
             <summary>
-              Develop
+              <span class="panel-title">Develop</span>
               <span id="develop-scope" class="muted"></span>
+              <span class="spacer"></span>
+              <button class="panel-move" data-move="up" title="Move panel up">↑</button>
+              <button class="panel-move" data-move="down" title="Move panel down">↓</button>
             </summary>
             <!-- Geometry first, as it is applied first: the tone sliders see
                  the frame these leave behind. -->
@@ -117,6 +183,11 @@
               <button id="dev-flip-v" class="btn btn-sm" title="Flip top to bottom">⇵</button>
               <button id="dev-crop" class="btn btn-sm" title="Crop">⛶</button>
               <span id="dev-geometry-state" class="muted"></span>
+              <span class="spacer"></span>
+              <!-- Right-aligned and above everything it undoes — the turns, the
+                   crop and every slider — rather than below the sliders, where
+                   it read as though it reset only those. -->
+              <button id="develop-reset" class="btn btn-sm" title="Undo every adjustment on this photo">Reset all</button>
             </div>
             <!-- Only while framing. Cancel puts back whatever crop was on the
                  photo when the tool opened; Remove leaves it off. -->
@@ -130,11 +201,10 @@
             <div id="develop-sliders" class="sliders"></div>
             <div class="develop-actions">
               <label class="check"><input type="checkbox" id="dev-bw"> Black &amp; white</label>
-              <button id="develop-reset" class="btn btn-sm">Reset</button>
             </div>
           </details>
 
-          <dl id="inspector-meta" class="meta"></dl>
+          </div>
         </div>
       </aside>
     </div>
@@ -151,7 +221,10 @@
   <div id="album-modal" class="modal" hidden>
     <div class="modal-card">
       <h2>New album</h2>
-      <label>Path <small>e.g. 2026/weddings/ana-ivan</small>
+      <label>Inside <small>a collection, or nothing for the top level</small>
+        <select id="album-parent"></select>
+      </label>
+      <label>Path <small>e.g. 2026/weddings/ana-ivan — folders above it are created as collections</small>
         <input type="text" id="album-path" placeholder="2026/weddings/ana-ivan">
       </label>
       <label>Title <input type="text" id="album-title" placeholder="Ana &amp; Ivan"></label>
@@ -168,6 +241,9 @@
   <div id="settings-album-modal" class="modal" hidden>
     <div class="modal-card">
       <h2 id="settings-album-title">Album settings</h2>
+      <label>Inside <small>move the album into a collection — its sub-albums come along</small>
+        <select id="set-parent"></select>
+      </label>
       <label>Path <small>change it to rename or move the album — sub-albums come along</small>
         <input type="text" id="set-path" placeholder="2026/weddings/ana-ivan">
       </label>
@@ -300,8 +376,125 @@
     </div>
   </div>
 
+  <!-- Libraries -->
+  <div id="library-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Libraries</h2>
+
+      <h3 class="settings-head">Open now</h3>
+      <p class="muted" id="library-path"></p>
+      <div class="row">
+        <button id="library-reveal" class="btn btn-sm">Show in Finder</button>
+        <!-- The catalog indexes files; files can be deleted from underneath it.
+             This drops the rows whose photographs are gone, and touches nothing
+             on disk. -->
+        <button id="library-prune" class="btn btn-sm"
+                title="Drop catalog entries whose files are no longer there. Deletes nothing.">
+          Remove missing photos
+        </button>
+      </div>
+
+      <h3 class="settings-head">Switch to</h3>
+      <div id="library-recent" class="library-recent"></div>
+      <p class="muted" id="library-recent-empty" hidden>No other library has been
+         opened on this machine yet.</p>
+
+      <p class="error" id="library-error" hidden></p>
+      <div class="modal-actions">
+        <button id="library-open-btn" class="btn">Open another folder…</button>
+        <div class="spacer"></div>
+        <button class="btn btn-primary" data-close>Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div id="settings-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Settings</h2>
+
+      <h3 class="settings-head">Photo info overlay</h3>
+      <p class="muted">Drawn over the picture, in the grid and enlarged alike.
+         Toggle it any time with <kbd>I</kbd>.</p>
+      <label class="check"><input type="checkbox" id="pref-overlay-on"> Show the overlay</label>
+      <div id="pref-overlay-fields" class="checks"></div>
+
+      <h3 class="settings-head">Interface scale</h3>
+      <p class="muted">For a display that puts too many pixels in a small space.
+         The whole window scales and the text stays sharp.</p>
+      <div class="zoom-row">
+        <button id="zoom-out" class="btn btn-sm" title="Smaller (⌘−)">−</button>
+        <span id="zoom-readout" class="muted">100%</span>
+        <button id="zoom-in" class="btn btn-sm" title="Larger (⌘+)">+</button>
+        <button id="zoom-reset" class="btn btn-sm" title="Back to 100% (⌘0)">Reset</button>
+      </div>
+
+      <h3 class="settings-head">Sidebars</h3>
+      <label class="check"><input type="checkbox" id="pref-left"> Albums, on the left <kbd>[</kbd></label>
+      <label class="check"><input type="checkbox" id="pref-right"> Inspector, on the right <kbd>]</kbd></label>
+
+      <h3 class="settings-head">Inspector panels</h3>
+      <p class="muted">Collapse a panel by its title, and move it with the ↑ ↓
+         beside it. Both are remembered.</p>
+
+      <div class="modal-actions">
+        <button class="btn btn-danger" id="pref-reset-btn"
+                title="Put every setting on this page back to its default">Reset settings</button>
+        <div class="spacer"></div>
+        <button class="btn btn-primary" data-close>Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Keyboard shortcuts -->
+  <div id="shortcuts-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h2>Keyboard shortcuts</h2>
+      <div class="shortcuts">
+        <h3 class="settings-head">Triage</h3>
+        <dl>
+          <dt><kbd>1</kbd>–<kbd>5</kbd></dt><dd>Rate</dd>
+          <dt><kbd>0</kbd></dt><dd>Clear the rating</dd>
+          <dt><kbd>P</kbd></dt><dd>Pick</dd>
+          <dt><kbd>X</kbd></dt><dd>Reject</dd>
+          <dt><kbd>U</kbd></dt><dd>Unpick — back to untriaged</dd>
+        </dl>
+
+        <h3 class="settings-head">Moving around</h3>
+        <dl>
+          <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Previous / next photo</dd>
+          <dt><kbd>E</kbd> · <kbd>Enter</kbd></dt><dd>Enlarge, and back to the grid</dd>
+          <dt><kbd>F</kbd></dt><dd>Fullscreen window</dd>
+          <dt><kbd>I</kbd></dt><dd>Photo info over the picture</dd>
+          <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Albums / inspector sidebar</dd>
+          <dt><kbd>⌘</kbd><kbd>+</kbd> <kbd>⌘</kbd><kbd>−</kbd></dt><dd>Interface larger / smaller</dd>
+          <dt><kbd>⌘</kbd><kbd>0</kbd></dt><dd>Interface back to 100%</dd>
+          <dt><kbd>Esc</kbd></dt><dd>Close, in order: dialog, crop tool, enlarged view</dd>
+          <dt><kbd>⌘</kbd><kbd>A</kbd></dt><dd>Select every photo shown</dd>
+        </dl>
+
+        <h3 class="settings-head">Develop</h3>
+        <dl>
+          <dt>Double-click</dt><dd>A slider or its label — back to neutral</dd>
+        </dl>
+
+        <h3 class="settings-head">This window</h3>
+        <dl>
+          <dt><kbd>,</kbd></dt><dd>Settings</dd>
+          <dt><kbd>?</kbd></dt><dd>This list</dd>
+        </dl>
+      </div>
+      <div class="modal-actions">
+        <div class="spacer"></div>
+        <button class="btn btn-primary" data-close>Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Before app.js: the switches gate what it wires up at boot. -->
   <script src="features.js"></script>
+  <!-- Before app.js: it reads the stored arrangement at boot. -->
+  <script src="prefs.js"></script>
   <!-- Before app.js: it builds its queue as it loads. -->
   <script src="develop-queue.js"></script>
   <script src="app.js"></script>

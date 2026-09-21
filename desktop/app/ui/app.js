@@ -12,7 +12,22 @@ const { invoke, convertFileSrc } = window.__TAURI__.core;
 // server — would then go ahead unasked. Tauri's dialog plugin is a real native
 // prompt on every platform.
 const { open: openDialog, confirm: askConfirm } = window.__TAURI__.dialog;
+// Granted by `opener:default`, which covers revealing a path in the system's
+// own file manager.
+const { revealItemInDir } = window.__TAURI__.opener;
 const { listen } = window.__TAURI__.event;
+
+// Only macOS draws its window buttons *inside* the page — `titleBarStyle:
+// Transparent` makes the frame see-through and leaves the traffic lights on
+// top of our own bar. Windows and Linux ignore that setting and put a system
+// frame above the page instead, so the gutter this class turns on would be a
+// dead notch on the left of every window there.
+//
+// Set synchronously, before anything is painted: a round trip to the shell to
+// ask would mean a visible jump on the first frame.
+if (navigator.userAgent.includes('Mac')) {
+  document.documentElement.classList.add('mac');
+}
 
 const LIBRARY_KEY = 'gpp.lastLibrary';
 
@@ -28,6 +43,333 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+// ------------------------------------------------------------ preferences
+//
+// How the photographer arranged the window — panels open or shut, in what
+// order, sidebars showing, what the overlay says — is read once at boot and
+// written on every change. The reading, writing and repair of stored values
+// lives in prefs.js, apart from the DOM and under test; this half is only the
+// one path from a preference to the screen.
+
+let prefs = loadPrefs(localStorage);
+
+function persistPrefs() {
+  savePrefs(localStorage, prefs);
+}
+
+/// Human names for the overlay's rows. Keyed by the field names prefs.js knows,
+/// so a field added there without a label here is a visible blank rather than a
+/// silent omission.
+/// The keys that mean "scale the interface" when ⌘ or Ctrl is down.
+const ZOOM_KEYS = new Set(['+', '=', '-', '_', '0']);
+
+const OVERLAY_LABELS = {
+  filename: 'File',
+  captured: 'Captured',
+  camera: 'Camera',
+  lens: 'Lens',
+  exposure: 'Exposure',
+  dimensions: 'Size',
+  size: 'On disk',
+  rating: 'Rating',
+};
+
+/// Put the whole stored arrangement on screen.
+///
+/// One function, called at boot and after every change, rather than each
+/// setting updating its own corner: with two of them the second way works, and
+/// by the fifth the window is in a state no single line of code intended.
+function applyPrefs() {
+  const container = $('panels');
+  // Appending in order sorts them — the nodes are moved, never rebuilt, so a
+  // half-dragged slider or an open crop tool survives a reorder.
+  for (const name of prefs.panelOrder) {
+    const panel = container.querySelector(`[data-panel="${name}"]`);
+    if (panel) container.appendChild(panel);
+  }
+  for (const [name, open] of Object.entries(prefs.panelOpen)) {
+    const panel = container.querySelector(`[data-panel="${name}"]`);
+    if (panel) panel.open = open;
+  }
+  updatePanelMoveButtons();
+
+  $('sidebar').hidden = !prefs.sidebars.left;
+  $('toggle-left').setAttribute('aria-pressed', String(prefs.sidebars.left));
+  $('toggle-left').classList.toggle('on', prefs.sidebars.left);
+  $('toggle-right').setAttribute('aria-pressed', String(prefs.sidebars.right));
+  $('toggle-right').classList.toggle('on', prefs.sidebars.right);
+  $('overlay-btn').setAttribute('aria-pressed', String(prefs.overlay.on));
+  $('overlay-btn').classList.toggle('on', prefs.overlay.on);
+
+  applyZoom();
+  updateInspectorVisibility();
+  renderInfoOverlay();
+}
+
+// ------------------------------------------------------------------- zoom
+//
+// The webview's own page zoom, not a CSS transform: it re-lays out and
+// re-renders, so type gets bigger and stays sharp. On a 4K display that is the
+// difference between a readable interface and a magnified blurry one.
+
+/// Hand the level to the shell, and tell the stylesheet what it is.
+function applyZoom() {
+  invoke('set_zoom', { factor: prefs.zoom }).catch(() => {});
+  // The macOS traffic lights are drawn by the system and do not zoom, so the
+  // gutter reserved for them must shrink as the page grows or the window title
+  // drifts right of them. Everything else in the UI should scale, and does.
+  document.documentElement.style.setProperty('--zoom', String(prefs.zoom));
+}
+
+function setZoom(factor) {
+  prefs.zoom = factor;
+  persistPrefs();
+  applyZoom();
+  // Every box on screen just changed size, and both overlays are measured
+  // against the picture inside one of them.
+  repositionOverlays();
+  status(`Interface at ${Math.round(factor * 100)}%`);
+}
+
+/// The inspector is up when there is something to inspect *and* the
+/// photographer has not put it away. Two conditions, one place — otherwise
+/// selecting a photo silently reopens a sidebar that was deliberately closed.
+function updateInspectorVisibility() {
+  $('inspector').hidden = !prefs.sidebars.right || state.cursor < 0;
+}
+
+// ----------------------------------------------------------- panel plumbing
+
+/// An end panel cannot move further that way. Dim rather than gone, so the two
+/// buttons stay where the hand expects them.
+function updatePanelMoveButtons() {
+  const panels = [...$('panels').querySelectorAll('.panel')];
+  panels.forEach((panel, i) => {
+    panel.querySelector('[data-move="up"]').disabled = i === 0;
+    panel.querySelector('[data-move="down"]').disabled = i === panels.length - 1;
+  });
+}
+
+function movePanel(name, delta) {
+  const order = prefs.panelOrder;
+  const from = order.indexOf(name);
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= order.length) return;
+  [order[from], order[to]] = [order[to], order[from]];
+  persistPrefs();
+  applyPrefs();
+}
+
+// The buttons live inside <summary>, where a plain click would also collapse
+// the panel being moved.
+$('panels').addEventListener('click', (e) => {
+  const button = e.target.closest('.panel-move');
+  if (!button) return;
+  e.preventDefault();
+  e.stopPropagation();
+  movePanel(button.closest('.panel').dataset.panel, button.dataset.move === 'up' ? -1 : 1);
+});
+
+// `toggle` does not bubble, so it is caught on the way down instead.
+$('panels').addEventListener(
+  'toggle',
+  (e) => {
+    const panel = e.target.closest?.('.panel');
+    if (!panel) return;
+    prefs.panelOpen[panel.dataset.panel] = panel.open;
+    persistPrefs();
+    // Closing develop is the end of previewing, so let the core drop the
+    // decoded pixels it was rendering proxies from. Reopening pays one decode.
+    if (panel.dataset.panel === 'develop' && !panel.open) {
+      invoke('release_preview').catch(() => {});
+    }
+  },
+  true,
+);
+
+// ---------------------------------------------------------- info overlay
+//
+// Over the picture rather than beside it, so it can be read while culling
+// without the eye leaving the photograph — and over the *enlarged* picture too,
+// because it sits inside the frame the loupe moves.
+
+/// The rows this photo can offer, in the order the overlay draws them.
+///
+/// `null` means "leave it out". The inspector's own list writes an em dash for
+/// a value the file does not carry, which is right in a panel beside the photo
+/// and wrong in an overlay on top of it: a frame with no EXIF would be covered
+/// by a column of dashes. So the shared formatters' em dash is mapped back to
+/// nothing here.
+function overlayRows(photo) {
+  const orNothing = (text) => (text && text !== '—' ? text : null);
+  return {
+    filename: photo.filename,
+    captured: photo.captured_at || null,
+    camera: [photo.camera_make, photo.camera_model].filter(Boolean).join(' ') || null,
+    lens: photo.lens || null,
+    exposure: orNothing(formatExposure(photo)),
+    dimensions: photo.width && photo.height ? `${photo.width} × ${photo.height}` : null,
+    size: orNothing(formatBytes(photo.file_size)),
+    rating: photo.rating ? '★'.repeat(photo.rating) : null,
+  };
+}
+
+function renderInfoOverlay() {
+  const el = $('info-overlay');
+  const photo = state.cursor >= 0 ? state.photos[state.cursor] : null;
+  if (!prefs.overlay.on || !photo) {
+    el.hidden = true;
+    return;
+  }
+  const values = overlayRows(photo);
+  // A field with nothing in it is left out rather than shown as a dash: the
+  // overlay covers the photograph, so every row has to earn its place.
+  const rows = prefs.overlay.fields
+    .filter((f) => values[f])
+    .map((f) => `<dt>${escapeHtml(OVERLAY_LABELS[f] ?? f)}</dt><dd>${escapeHtml(String(values[f]))}</dd>`);
+  if (!rows.length) {
+    el.hidden = true;
+    return;
+  }
+  el.innerHTML = `<dl>${rows.join('')}</dl>`;
+  el.hidden = false;
+  positionInfoOverlay();
+}
+
+/// Inset from the corner of the *picture*, in pixels.
+const OVERLAY_INSET = 12;
+
+/// Lay the overlay on the photograph rather than on the box around it.
+///
+/// Same problem the crop rectangle has, and the same solution: `object-fit:
+/// contain` centres the picture and leaves bars on one axis, so an overlay
+/// pinned to the element sits in the black band above a wide photo in a tall
+/// frame — floating over nothing, which is where it first appeared in the
+/// loupe.
+function positionInfoOverlay() {
+  const el = $('info-overlay');
+  if (el.hidden) return;
+  const pic = drawnPictureBox();
+  if (!pic) return;
+  el.style.left = `${pic.left + OVERLAY_INSET}px`;
+  el.style.top = `${pic.top + OVERLAY_INSET}px`;
+  el.style.maxWidth = `${Math.max(120, pic.width - OVERLAY_INSET * 2)}px`;
+}
+
+function toggleOverlay(on = !prefs.overlay.on) {
+  prefs.overlay.on = on;
+  persistPrefs();
+  applyPrefs();
+}
+
+$('overlay-btn').addEventListener('click', () => toggleOverlay());
+
+// -------------------------------------------------------- sidebar toggles
+
+function toggleSidebar(side, on = !prefs.sidebars[side]) {
+  prefs.sidebars[side] = on;
+  persistPrefs();
+  applyPrefs();
+  // The picture's box changed width, and both overlays are measured against it.
+  repositionOverlays();
+}
+
+$('toggle-left').addEventListener('click', () => toggleSidebar('left'));
+$('toggle-right').addEventListener('click', () => toggleSidebar('right'));
+
+// ------------------------------------------------------ settings dialog
+
+/// Build the overlay's field checkboxes from what prefs.js says exists, so the
+/// dialog cannot drift out of step with what the overlay can actually draw.
+function renderOverlayFieldChecks() {
+  const box = $('pref-overlay-fields');
+  box.innerHTML = '';
+  for (const field of OVERLAY_FIELDS) {
+    const label = document.createElement('label');
+    label.className = 'check';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = prefs.overlay.fields.includes(field);
+    input.addEventListener('change', () => {
+      // Rebuilt from the canonical list rather than pushed and spliced, so the
+      // stored order always matches the order the overlay draws.
+      const chosen = new Set(prefs.overlay.fields);
+      input.checked ? chosen.add(field) : chosen.delete(field);
+      prefs.overlay.fields = OVERLAY_FIELDS.filter((f) => chosen.has(f));
+      persistPrefs();
+      renderInfoOverlay();
+    });
+    label.append(input, ` ${OVERLAY_LABELS[field] ?? field}`);
+    box.appendChild(label);
+  }
+}
+
+function openSettings() {
+  $('pref-overlay-on').checked = prefs.overlay.on;
+  $('pref-left').checked = prefs.sidebars.left;
+  $('pref-right').checked = prefs.sidebars.right;
+  $('zoom-readout').textContent = `${Math.round(prefs.zoom * 100)}%`;
+  renderOverlayFieldChecks();
+  openModal('settings-modal');
+}
+
+// The dialog is open while these are pressed, so the readout is updated here
+// rather than in setZoom — which also runs from the keyboard, with nothing to
+// update.
+function zoomFromDialog(factor) {
+  setZoom(factor);
+  $('zoom-readout').textContent = `${Math.round(prefs.zoom * 100)}%`;
+}
+
+$('zoom-in').addEventListener('click', () => zoomFromDialog(zoomStep(prefs.zoom, 1)));
+$('zoom-out').addEventListener('click', () => zoomFromDialog(zoomStep(prefs.zoom, -1)));
+$('zoom-reset').addEventListener('click', () => zoomFromDialog(1));
+
+$('settings-btn').addEventListener('click', openSettings);
+$('pref-overlay-on').addEventListener('change', (e) => toggleOverlay(e.target.checked));
+$('pref-left').addEventListener('change', (e) => toggleSidebar('left', e.target.checked));
+$('pref-right').addEventListener('change', (e) => toggleSidebar('right', e.target.checked));
+
+$('pref-reset-btn').addEventListener('click', () => {
+  prefs = defaultPrefs();
+  persistPrefs();
+  applyPrefs();
+  // The dialog is showing the values that just changed underneath it.
+  openSettings();
+  status('Settings back to their defaults');
+});
+
+$('shortcuts-btn').addEventListener('click', () => openModal('shortcuts-modal'));
+
+// ------------------------------------------------------------- fullscreen
+//
+// The window's own fullscreen, not the loupe: the two compose, and the pair of
+// them is what "show me this photograph" actually means.
+
+async function toggleFullscreen() {
+  try {
+    const on = await invoke('toggle_fullscreen');
+    status(on ? 'Fullscreen — F to leave' : 'Fullscreen off');
+  } catch (err) {
+    status(`Fullscreen failed: ${err}`);
+  }
+}
+
+/// macOS takes its traffic lights away in fullscreen, so the gutter the bar
+/// reserves for them has to go too — otherwise it is an empty pocket to the
+/// left of the app's own name.
+///
+/// Driven by the shell rather than by `toggleFullscreen` above, because that
+/// key is only one of four ways in: the green button, ⌃⌘F and the Window menu
+/// are the others, and none of them passes through this file.
+function setFullscreenClass(on) {
+  document.documentElement.classList.toggle('fullscreen', Boolean(on));
+}
+
+listen('fullscreen-changed', (e) => setFullscreenClass(e.payload));
+// A window restored into fullscreen is already there before the first resize.
+invoke('is_fullscreen').then(setFullscreenClass).catch(() => {});
 
 // --------------------------------------------------------------- utilities
 
@@ -71,6 +413,10 @@ document.addEventListener('keydown', (e) => {
     document.querySelectorAll('.modal:not([hidden])').forEach((m) => (m.hidden = true));
   } else if (cropMode.active) {
     cancelCrop();
+  } else if (loupe.active) {
+    // Last, because framing happens inside the loupe: one Escape puts the crop
+    // tool away and leaves the photograph up, a second goes back to the grid.
+    setLoupe(false);
   }
 });
 
@@ -82,6 +428,7 @@ async function boot() {
   try {
     const info = await invoke('library_status');
     localStorage.setItem(LIBRARY_KEY, info.root);
+    rememberLibrary(localStorage, info.root);
     await enterApp(info);
     return;
   } catch {
@@ -113,22 +460,147 @@ $('open-library-btn').addEventListener('click', async () => {
 
 async function openLibrary(path) {
   const info = await invoke('open_library', { path });
-  localStorage.setItem(LIBRARY_KEY, path);
+  // The path the core resolved, not the one that was asked for — a picker can
+  // hand over a symlink or a trailing slash, and the switcher has to offer back
+  // exactly what would open again.
+  localStorage.setItem(LIBRARY_KEY, info.root);
+  rememberLibrary(localStorage, info.root);
   await enterApp(info);
 }
+
+// ---------------------------------------------------------------- libraries
+//
+// A photographer has more than one: this shoot's card, last year's archive, the
+// drive that is only plugged in sometimes. Remembering the last one is not a
+// switcher — the list of the last few lives in prefs.js, along with the repair
+// of whatever ends up stored there.
+
+/// Open another library, leaving nothing of the last one behind.
+///
+/// Ids, album paths and the cursor all mean something only within one catalog,
+/// so every one of them is dropped rather than carried across. The album filter
+/// especially: a path that existed in the old library would quietly filter the
+/// new one down to nothing, and look like an empty import.
+async function switchLibrary(path) {
+  showError('library-error', '');
+  state.currentAlbum = '';
+  state.selected.clear();
+  state.cursor = -1;
+  setLoupe(false);
+  // The decoded preview pixels belong to a photo in the library being left.
+  invoke('release_preview').catch(() => {});
+  try {
+    await openLibrary(path);
+    closeModal('library-modal');
+    status(`Opened ${path}`);
+  } catch (err) {
+    showError('library-error', String(err));
+    // The list keeps a folder that has moved or is on an unplugged drive, so
+    // that plugging it back in is all that is needed — but say so plainly
+    // rather than leaving a row that silently does nothing.
+    renderLibraryModal();
+  }
+}
+
+function renderLibraryModal() {
+  const current = localStorage.getItem(LIBRARY_KEY) || '';
+  $('library-path').textContent = current || 'No library open';
+  $('library-reveal').disabled = !current;
+  $('library-prune').disabled = !current;
+
+  const others = loadRecent(localStorage).filter((path) => path !== current);
+  const list = $('library-recent');
+  list.innerHTML = '';
+  $('library-recent-empty').hidden = others.length > 0;
+
+  for (const path of others) {
+    const row = document.createElement('div');
+    row.className = 'library-row';
+
+    const open = document.createElement('button');
+    open.className = 'library-switch';
+    // The name identifies it; the path is context and may truncate. The whole
+    // path is on the tooltip, where truncation cannot hide it.
+    open.title = path;
+    open.innerHTML = `<strong>${escapeHtml(libraryName(path))}</strong><span class="path">${escapeHtml(path)}</span>`;
+    open.addEventListener('click', () => switchLibrary(path));
+
+    const forget = document.createElement('button');
+    forget.className = 'library-forget';
+    forget.textContent = '✕';
+    forget.title = 'Forget this library. The folder and its photos are untouched.';
+    forget.addEventListener('click', (e) => {
+      e.stopPropagation();
+      forgetLibrary(localStorage, path);
+      renderLibraryModal();
+    });
+
+    row.append(open, forget);
+    list.appendChild(row);
+  }
+}
+
+/// The last segment of a path — what the folder is called.
+function libraryName(path) {
+  return path.split('/').filter(Boolean).pop() || path;
+}
+
+$('library-btn').addEventListener('click', () => {
+  renderLibraryModal();
+  openModal('library-modal');
+});
+
+$('library-open-btn').addEventListener('click', async () => {
+  const dir = await openDialog({ directory: true, title: 'Choose a photo folder' });
+  if (dir) await switchLibrary(dir);
+});
+
+$('library-reveal').addEventListener('click', async () => {
+  const current = localStorage.getItem(LIBRARY_KEY);
+  if (!current) return;
+  try {
+    await revealItemInDir(current);
+  } catch (err) {
+    showError('library-error', String(err));
+  }
+});
+
+$('library-prune').addEventListener('click', async () => {
+  // It deletes nothing on disk, but it does change what the catalog holds, and
+  // a photographer looking at an unplugged drive would lose the whole library
+  // from the grid without being asked.
+  const ok = await askConfirm(
+    'Drop catalog entries whose photo files are no longer there?\n\n' +
+      'Nothing on disk is deleted. If a drive is unplugged, plug it back in first — ' +
+      'its photos count as missing.',
+    { title: 'Remove missing photos', kind: 'warning' },
+  );
+  if (!ok) return;
+  try {
+    const removed = await invoke('prune_missing');
+    status(removed ? `Removed ${removed} missing photo(s)` : 'Nothing was missing');
+    await refreshAll();
+  } catch (err) {
+    showError('library-error', String(err));
+  }
+});
 
 /// Swap the welcome screen for the app and load its contents.
 async function enterApp(info) {
   $('welcome').hidden = true;
   $('app').hidden = false;
+  // Before the first paint, so the window comes up arranged the way it was left
+  // rather than snapping into it a moment later.
+  applyPrefs();
   renderStatus(info);
   await Promise.all([refreshAlbums(), refreshPhotos()]);
   await loadPublishTarget();
 }
 
 function renderStatus(info) {
-  const name = info.root.split('/').filter(Boolean).pop() || info.root;
-  $('library-name').textContent = name;
+  // The sidebar names the library; the titlebar names the application.
+  $('library-name').textContent = libraryName(info.root);
+  $('library-name').title = info.root;
   $('all-count').textContent = info.photo_count;
   // Camera names come out of EXIF, which is to say out of the files — escape
   // them. A photo whose Model field is "<b>bold</b>" must not restyle the app.
@@ -213,8 +685,24 @@ async function refreshPhotos() {
   state.photos = await invoke('list_photos', { filter });
   state.selected.clear();
   state.cursor = state.photos.length ? 0 : -1;
+  // A filter that matches nothing leaves no photo to enlarge, and the loupe
+  // would otherwise stay up showing one that is no longer in the grid.
+  if (loupe.active && state.cursor < 0) setLoupe(false);
   renderGrid();
   updateSelectionUI();
+  // The cursor is already on the first photo, and the rating keys already act
+  // on it — so show it. Leaving this out put an empty inspector on screen at
+  // boot: no filename, no preview, no stars, no sliders, while pressing `3`
+  // silently rated the photo it was not showing. It went unnoticed for as long
+  // as the panel stayed hidden until the first click.
+  if (state.cursor >= 0) {
+    await showInspector(state.photos[state.cursor]);
+  } else {
+    // Nothing matches: nothing to inspect, and an overlay left up would be
+    // describing a photo that is no longer on screen.
+    updateInspectorVisibility();
+    renderInfoOverlay();
+  }
 }
 
 async function refreshAll() {
@@ -225,7 +713,7 @@ async function refreshAll() {
 function renderGrid() {
   const grid = $('grid');
   grid.innerHTML = '';
-  $('empty-state').hidden = state.photos.length > 0;
+  $('empty-state').hidden = state.photos.length > 0 || loupe.active;
 
   const frag = document.createDocumentFragment();
   state.photos.forEach((photo, index) => {
@@ -297,6 +785,14 @@ function renderGrid() {
       showInspector(photo);
     });
 
+    // The way out of the grid, and `dblclick` in the loupe is the way back —
+    // both wired here so the gesture is symmetric.
+    cell.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      state.cursor = index;
+      setLoupe(true);
+    });
+
     frag.appendChild(cell);
   });
   grid.appendChild(frag);
@@ -331,7 +827,8 @@ async function applyRating(rating) {
     if (p) p.rating = rating;
   });
   renderGrid();
-  // Keep the inspector's own star row in step with what the grid now shows.
+  // Keep the inspector's own star row — and the overlay, which can carry the
+  // rating too — in step with what the grid now shows.
   if (state.cursor >= 0) showInspector(state.photos[state.cursor]);
   status(`Rated ${ids.length} photo(s) ${rating}★`);
 }
@@ -355,7 +852,14 @@ document.addEventListener('keydown', (e) => {
   if ($('app').hidden) return;
   if (modalIsOpen()) return;
 
-  if (e.key >= '0' && e.key <= '5') {
+  // Before the digits: ⌘0 means "back to 100%", a bare 0 means "clear the
+  // rating", and the digit branch below does not look at modifiers.
+  if ((e.metaKey || e.ctrlKey) && ZOOM_KEYS.has(e.key)) {
+    e.preventDefault();
+    // `+` needs Shift on most layouts, so `=` is the key actually reported;
+    // accept both, and the numeric keypad's own signs too.
+    setZoom(e.key === '0' ? 1 : zoomStep(prefs.zoom, e.key === '-' || e.key === '_' ? -1 : 1));
+  } else if (e.key >= '0' && e.key <= '5') {
     e.preventDefault();
     applyRating(Number(e.key));
   } else if (e.key === 'p' || e.key === 'P') {
@@ -370,6 +874,27 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
     e.preventDefault();
     moveCursor(e.key === 'ArrowRight' ? 1 : -1);
+  } else if (e.key === 'e' || e.key === 'E' || e.key === 'Enter') {
+    e.preventDefault();
+    setLoupe(!loupe.active);
+  } else if (e.key === 'i' || e.key === 'I') {
+    e.preventDefault();
+    toggleOverlay();
+  } else if (e.key === 'f' || e.key === 'F') {
+    e.preventDefault();
+    toggleFullscreen();
+  } else if (e.key === '[') {
+    e.preventDefault();
+    toggleSidebar('left');
+  } else if (e.key === ']') {
+    e.preventDefault();
+    toggleSidebar('right');
+  } else if (e.key === '?') {
+    e.preventDefault();
+    openModal('shortcuts-modal');
+  } else if (e.key === ',') {
+    e.preventDefault();
+    openSettings();
   } else if (e.key === 'a' && (e.metaKey || e.ctrlKey)) {
     e.preventDefault();
     state.photos.forEach((p) => state.selected.add(p.id));
@@ -390,6 +915,62 @@ function moveCursor(delta) {
   document.querySelector('.cell.cursor')?.scrollIntoView({ block: 'nearest' });
 }
 
+// ------------------------------------------------------------------- loupe
+//
+// A 300px sidebar preview is enough to tell one frame from another and not
+// nearly enough to judge one. The loupe gives the photograph the whole of the
+// main area while leaving every control exactly where it was: the stars, the
+// sliders, the crop tool and the rating keys all still act on the same photo,
+// because none of them ever addressed the preview — they address the cursor.
+//
+// It does that by *moving* #inspector-frame onto the stage rather than drawing
+// a second copy. A second copy would mean a second crop overlay over different
+// pixels at a different scale, and the two would disagree about which part of
+// the photograph the rectangle names.
+
+const loupe = { active: false };
+
+/// Switch between the grid and the single-photo view.
+function setLoupe(on) {
+  // Nothing to enlarge: leave the grid up rather than show an empty stage.
+  if (on && state.cursor < 0) return;
+  if (loupe.active === on) return;
+  loupe.active = on;
+
+  const frame = $('inspector-frame');
+  if (on) {
+    $('loupe').appendChild(frame);
+  } else {
+    // Back to the top of the inspector, above the filename and the stars.
+    $('inspector').insertBefore(frame, $('inspector').firstChild);
+  }
+  frame.classList.toggle('in-loupe', on);
+  $('loupe').hidden = !on;
+  $('grid').hidden = on;
+  $('loupe-btn').classList.toggle('on', on);
+  $('loupe-btn').textContent = on ? '⤡ Grid' : '⤢ Enlarge';
+
+  // The preview is a different size on each side of this, and the loupe wants
+  // more pixels than the sidebar did — so repaint before re-laying the crop.
+  if (state.cursor >= 0) showInspector(state.photos[state.cursor]);
+  renderGrid();
+  repositionOverlays();
+}
+
+$('loupe-btn').addEventListener('click', () => setLoupe(!loupe.active));
+
+// Double-click enlarged a photo from the grid; double-click puts it back.
+//
+// On the picture itself, because there is nowhere else: the frame is sized to
+// fill the stage, so a guard of `e.target === stage` never matched and the
+// gesture silently did nothing. The one case it must not fire in is framing —
+// the crop rectangle is dragged on these same pixels, and a double-click while
+// adjusting a corner would throw away the loupe mid-crop.
+$('loupe').addEventListener('dblclick', () => {
+  if (cropMode.active) return;
+  setLoupe(false);
+});
+
 // --------------------------------------------------------------- inspector
 
 /// Bumped on every inspector paint. Held arrow keys start several of these at
@@ -399,8 +980,11 @@ let inspectorGeneration = 0;
 
 async function showInspector(photo) {
   const generation = ++inspectorGeneration;
-  const panel = $('inspector');
-  panel.hidden = false;
+  // Whatever was queued was for the photo being left.
+  livePreview.next = null;
+  // Whether the panel is up is now a preference as well as a question of
+  // having something to show, so it is decided in one place.
+  updateInspectorVisibility();
   $('inspector-name').textContent = photo.filename;
 
   // Framing is about one picture. Moving to another leaves the rectangle
@@ -409,7 +993,10 @@ async function showInspector(photo) {
   if (cropMode.active && photo.id !== cropMode.photoId) cancelCrop();
 
   try {
-    const p = await invoke('thumbnail_path', { id: photo.id, size: 'medium' });
+    const p = await invoke('thumbnail_path', {
+      id: photo.id,
+      size: loupe.active ? 'large' : 'medium',
+    });
     if (generation !== inspectorGeneration) return;
     $('inspector-img').src = convertFileSrc(p);
   } catch {
@@ -433,6 +1020,24 @@ async function showInspector(photo) {
     });
     rating.appendChild(star);
   }
+
+  // Triage beside the rating, because it is the same decision made twice a
+  // second — and it shows the current state rather than only offering the
+  // three choices, so a glance answers "have I done this one?".
+  const flags = $('inspector-flags');
+  flags.innerHTML = '';
+  for (const [flag, label] of [['pick', '⚑ Pick'], ['none', '○ Unpick'], ['reject', '✕ Reject']]) {
+    const button = document.createElement('button');
+    button.className = 'btn btn-sm' + (flag === 'reject' ? ' reject' : '');
+    button.classList.toggle('on', photo.flag === flag);
+    button.textContent = label;
+    // Acts on the selection, exactly as P/X/U do — the panel and the keys must
+    // not disagree about what "this photo" means.
+    button.addEventListener('click', () => applyFlag(flag));
+    flags.appendChild(button);
+  }
+
+  renderInfoOverlay();
 
   const rows = [
     ['Captured', photo.captured_at || '—'],
@@ -524,14 +1129,23 @@ async function renderDevelop(photo, generation = inspectorGeneration) {
     const out = document.createElement('output');
     out.textContent = formatAmount(value, adj);
 
-    // Update the readout while dragging, but only hit the core on release:
-    // every change re-renders thumbnails, which is far too much work per pixel
-    // of slider travel.
+    // Dragging previews; releasing commits. The core is hit either way, but
+    // with very different calls — see the live-preview section below for why
+    // the committing one cannot be used per pixel of slider travel.
     input.addEventListener('input', () => {
       out.textContent = formatAmount(Number(input.value), adj);
       row.classList.toggle('touched', Number(input.value) !== 0);
+      requestPreview(adj, Number(input.value));
     });
     input.addEventListener('change', () => applyAdjustment(adj, Number(input.value)));
+    // The label has always done this; the slider is the bigger target and the
+    // one the hand is already on. `input` fires on the way, so the readout and
+    // the preview follow without a second case.
+    input.addEventListener('dblclick', () => {
+      input.value = 0;
+      input.dispatchEvent(new Event('input'));
+      applyAdjustment(adj, 0);
+    });
 
     row.append(label, input, out);
     panel.appendChild(row);
@@ -553,6 +1167,69 @@ function opKind(op) {
 function formatAmount(value, adj) {
   const sign = value > 0 ? '+' : '';
   return adj.unit ? `${sign}${value.toFixed(2)}${adj.unit}` : `${sign}${value}`;
+}
+
+// ------------------------------------------------------- live preview
+//
+// A slider has to answer while the hand is still moving. Committing cannot do
+// that: `set_photo_edit` writes the stack, develops the frame at full size and
+// rebuilds three thumbnails — measured at ~200 ms on a 24 MP file, and a cache
+// entry for every value slid past on the way to the one that was wanted.
+//
+// So a drag asks for `preview_photo_edit` instead, which renders a small proxy
+// from pixels the core keeps decoded and writes nothing at all: ~4 ms once the
+// first call has paid for the decode. Release still calls the committing one,
+// and the true render replaces the proxy — so what a drag shows is a proxy of
+// exactly the same stack, differing only in resolution.
+//
+// One request in flight at a time, with the newest value kept. Firing per
+// `input` event would queue a dozen renders behind a fast drag and land the
+// preview several values in the past; dropping the ones in between and always
+// finishing on the latest keeps it honest and self-pacing on any machine.
+
+const livePreview = { inFlight: false, next: null };
+
+/// Show what `value` would do, without committing it.
+///
+/// The frame on screen is the one under the cursor, so that is the only frame
+/// worth previewing — and only when the adjustment would actually reach it. A
+/// selection made with cmd-click can leave the cursor on a photo that is not in
+/// it; previewing another of the targets there would put one photograph's
+/// pixels in the other one's frame, and previewing the cursor's would show a
+/// change the release is not going to make. So neither: show nothing, and let
+/// the commit repaint the grid.
+function requestPreview(adj, value) {
+  if (state.cursor < 0) return;
+  const id = state.photos[state.cursor]?.id;
+  if (id == null || !developTargets().includes(id)) return;
+  livePreview.next = { id, op: { op: adj.kind, [adj.field]: value } };
+  drainPreview();
+}
+
+async function drainPreview() {
+  if (livePreview.inFlight || !livePreview.next) return;
+  livePreview.inFlight = true;
+  try {
+    while (livePreview.next) {
+      const { id, op } = livePreview.next;
+      livePreview.next = null;
+      // The photo can change under a slow render — a held arrow key moves the
+      // cursor. Painting the result then would put one photo's pixels beside
+      // another photo's adjustments, which is the bug the generation counter
+      // exists to prevent, so it is checked here too.
+      const generation = inspectorGeneration;
+      const preview = await invoke('preview_photo_edit', { id, op });
+      if (generation !== inspectorGeneration) return;
+      $('inspector-img').src = preview.dataUrl;
+    }
+  } catch (err) {
+    // A preview is a courtesy. Losing one must not interrupt the drag or
+    // overwrite the status line with noise the commit will report anyway.
+  } finally {
+    livePreview.inFlight = false;
+    // A value that arrived while the last render was finishing.
+    if (livePreview.next) drainPreview();
+  }
 }
 
 // Adjustments are coalesced rather than sent one per keystroke; the scheduling
@@ -852,8 +1529,16 @@ if (!FEATURES.crop) $('dev-crop').hidden = true;
 // A new preview is a new picture box, and while cropping the rectangle has to
 // follow it. Without this the overlay keeps the previous photo's dimensions
 // after the tool takes an existing crop off.
-$('inspector-img').addEventListener('load', positionCropOverlay);
-window.addEventListener('resize', positionCropOverlay);
+/// Everything laid over the picture, laid again. The crop rectangle and the
+/// info overlay are both measured against the drawn photograph, so they move
+/// together or not at all.
+function repositionOverlays() {
+  positionCropOverlay();
+  positionInfoOverlay();
+}
+
+$('inspector-img').addEventListener('load', repositionOverlays);
+window.addEventListener('resize', repositionOverlays);
 
 $('crop-overlay').addEventListener('pointerdown', (e) => {
   if (!cropMode.active) return;
@@ -1043,10 +1728,87 @@ async function selectAlbum(path) {
 
 document.querySelector('.nav-item[data-album=""]').addEventListener('click', () => selectAlbum(''));
 
+// ------------------------------------------------- putting an album inside one
+//
+// Nesting has always worked — an album's path *is* its place in the tree, so
+// typing `colleccija/test` into either dialog puts it inside `colleccija` and
+// carries its sub-albums along. Nothing said so. The only hint was a line of
+// small print under a text field, and a collection created for the purpose sat
+// there with no visible way to put anything in it.
+//
+// So this is a picker over the same field rather than a second mechanism: it
+// rewrites the path's prefix, and the path stays on screen showing exactly what
+// will be created or moved. Typing a path by hand still works, still creates
+// any missing collections above it, and now moves the picker to match.
+
+/// Fill an "Inside" picker with the collections an album could sit in.
+/// `exclude` is an album being moved: an album cannot be put inside itself, and
+/// it cannot be put inside its own descendant either — that would ask the tree
+/// to hold a loop.
+function fillParentPicker(select, currentParent, exclude) {
+  select.innerHTML = '';
+  const top = document.createElement('option');
+  top.value = '';
+  top.textContent = '— top level —';
+  select.appendChild(top);
+
+  state.albums
+    .filter((a) => a.is_collection)
+    .filter((a) => !exclude || (a.path !== exclude && !a.path.startsWith(`${exclude}/`)))
+    .forEach((a) => {
+      const opt = document.createElement('option');
+      opt.value = a.path;
+      opt.textContent = a.path;
+      select.appendChild(opt);
+    });
+
+  // A parent that is not on the list — the album sits under a plain album, or
+  // under nothing that exists yet — is still where the album is, so offer it
+  // rather than silently reading as "top level" and moving the album on save.
+  if (currentParent && !select.querySelector(`option[value="${CSS.escape(currentParent)}"]`)) {
+    const opt = document.createElement('option');
+    opt.value = currentParent;
+    opt.textContent = currentParent;
+    select.appendChild(opt);
+  }
+  select.value = currentParent || '';
+}
+
+/// Everything before the last path segment, or '' at the top level.
+function parentOf(path) {
+  const parts = path.split('/').filter(Boolean);
+  return parts.slice(0, -1).join('/');
+}
+
+/// Keep the two controls telling the same story: the picker rewrites the path's
+/// prefix, and typing a path moves the picker to whatever prefix was typed.
+function linkParentPicker(selectId, inputId) {
+  const select = $(selectId);
+  const input = $(inputId);
+  select.addEventListener('change', () => {
+    const name = input.value.trim().split('/').filter(Boolean).pop() || '';
+    input.value = select.value ? `${select.value}/${name}` : name;
+  });
+  input.addEventListener('input', () => {
+    const parent = parentOf(input.value.trim());
+    // Only when the picker already offers it — a half-typed path should not add
+    // an option for a collection nobody has created.
+    if (select.querySelector(`option[value="${CSS.escape(parent)}"]`)) select.value = parent;
+  });
+}
+
+linkParentPicker('album-parent', 'album-path');
+linkParentPicker('set-parent', 'set-path');
+
 $('new-album-btn').addEventListener('click', () => {
-  $('album-path').value = '';
+  // Creating an album while looking at a collection almost always means
+  // creating it in there, so start the picker on it.
+  const here = state.albums.find((a) => a.path === state.currentAlbum);
+  const parent = here?.is_collection ? here.path : parentOf(state.currentAlbum || '');
+  $('album-path').value = parent ? `${parent}/` : '';
   $('album-title').value = '';
   $('album-collection').checked = false;
+  fillParentPicker($('album-parent'), parent, null);
   showError('album-error', '');
   openModal('album-modal');
 });
@@ -1075,6 +1837,7 @@ function openAlbumSettings(entry) {
   state.editingAlbum = entry;
   $('settings-album-title').textContent = entry.path;
   $('set-path').value = entry.path;
+  fillParentPicker($('set-parent'), parentOf(entry.path), entry.path);
   $('set-title').value = entry.title || '';
   $('set-description').value = entry.description || '';
   $('set-sort').value = entry.sort;

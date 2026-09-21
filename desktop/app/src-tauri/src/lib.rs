@@ -8,7 +8,7 @@ use gpp_core::albums::{AlbumUpdate, NewAlbum};
 use gpp_core::develop::{EditOp, EditStack};
 use gpp_core::model::{Flag, ImportSummary, Photo, PhotoFilter};
 use gpp_core::publish::PublishResult;
-use gpp_core::session::{AlbumSummary, LibraryStatus, PublishTarget, Session};
+use gpp_core::session::{AlbumSummary, LibraryStatus, PreviewImage, PublishTarget, Session};
 use gpp_core::remote::{PullOutcome, PushOutcome, RemoteAlbum};
 use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan};
 use tauri::{Emitter, Manager, State};
@@ -18,6 +18,74 @@ type CmdResult<T> = std::result::Result<T, String>;
 
 fn to_msg(e: gpp_core::Error) -> String {
     e.to_string()
+}
+
+// ------------------------------------------------------------------- window
+
+/// Scale the whole interface.
+///
+/// The webview's own page zoom, which is why this is worth doing properly: it
+/// re-lays out and re-renders text at the new size, so a 4K display gets larger
+/// *sharp* type rather than a magnified bitmap. A CSS transform would have
+/// scaled the pixels instead.
+///
+/// There is no matching getter in Tauri, so the level is the UI's to remember —
+/// it lives with the rest of the window arrangement in `prefs.js`, which also
+/// clamps it. An unclamped value applied at start-up puts the controls that
+/// would undo it past the edge of the screen.
+///
+/// Platform note: macOS 11+, Windows and Linux. Not Android; iOS 14+.
+#[tauri::command]
+fn set_zoom(window: tauri::WebviewWindow, factor: f64) -> CmdResult<()> {
+    window.set_zoom(factor).map_err(|e| e.to_string())
+}
+
+/// Whether the window was in fullscreen the last time the shell looked.
+///
+/// macOS hides its traffic lights in fullscreen, so the gutter the page
+/// reserves for them has to come and go with it. The UI cannot infer this from
+/// its own `F` key: fullscreen is entered four ways — that key, the green
+/// button, ⌃⌘F, and the Window menu — and only the shell sees all four.
+///
+/// Kept so that the resize stream can be reduced to the changes: entering
+/// fullscreen arrives as a resize, but so does every frame of dragging a window
+/// edge, and an event per frame would be a message to the webview per frame.
+struct Fullscreen(std::sync::atomic::AtomicBool);
+
+/// Where the window is now. Asked once at start-up, because a window restored
+/// into fullscreen would otherwise have to wait for its first resize.
+///
+/// Read from [`Fullscreen`] rather than from the window: measured on macOS 27
+/// with Tauri 2.11, `WebviewWindow::is_fullscreen()` answered `false` while the
+/// window was genuinely fullscreen, and the same question asked of the `Window`
+/// in the resize handler answered correctly. Whatever the cause, only one of
+/// the two readings can be trusted, so only one is used.
+#[tauri::command]
+fn is_fullscreen(state: State<'_, Fullscreen>) -> CmdResult<bool> {
+    Ok(state.0.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Turn the window's own fullscreen on or off, reporting where it ended up.
+///
+/// A Tauri command rather than the JS window API so the capability set stays as
+/// it is: every other action the UI takes is already one `invoke`, and this way
+/// there is one list of what the shell can do instead of two.
+///
+/// Composes with the loupe rather than replacing it — the loupe gives the photo
+/// the window, this gives the window the screen, and the pair is what "show me
+/// this photograph" means.
+#[tauri::command]
+fn toggle_fullscreen(
+    window: tauri::WebviewWindow,
+    state: State<'_, Fullscreen>,
+) -> CmdResult<bool> {
+    let want = !state.0.load(std::sync::atomic::Ordering::SeqCst);
+    window.set_fullscreen(want).map_err(|e| e.to_string())?;
+    // Deliberately not reported back: `set_fullscreen` returning `Ok` says the
+    // request was sent, not that the window moved. What actually happened
+    // arrives as `fullscreen-changed` off the resize, which is the same path a
+    // green-button fullscreen takes.
+    Ok(want)
 }
 
 // ------------------------------------------------------------------ library
@@ -155,6 +223,30 @@ async fn set_photo_edit(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// What an adjustment would look like, committing nothing.
+///
+/// The slider calls this while it is being dragged and `set_photo_edit` when it
+/// is let go. Blocking, like the others — the render is CPU-bound — but it
+/// writes no thumbnails and no catalog row, so it costs milliseconds.
+#[tauri::command]
+async fn preview_photo_edit(
+    app: tauri::AppHandle,
+    id: i64,
+    op: EditOp,
+) -> CmdResult<PreviewImage> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().preview_photo_edit(id, op).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Drop the decoded pixels the previews were rendering against.
+#[tauri::command]
+fn release_preview(state: State<'_, Session>) {
+    state.release_preview();
 }
 
 /// Relative, unlike `set_photo_edit`: the app's rotate buttons add a quarter
@@ -423,6 +515,22 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(Session::new())
+        .manage(Fullscreen(std::sync::atomic::AtomicBool::new(false)))
+        .on_window_event(|window, event| {
+            // Entering and leaving fullscreen both arrive as a resize; so does
+            // every frame of a window-edge drag, which is why only the changes
+            // are forwarded.
+            if !matches!(event, tauri::WindowEvent::Resized(_)) {
+                return;
+            }
+            let Ok(now) = window.is_fullscreen() else {
+                return;
+            };
+            let seen = window.state::<Fullscreen>();
+            if seen.0.swap(now, std::sync::atomic::Ordering::SeqCst) != now {
+                let _ = window.emit("fullscreen-changed", now);
+            }
+        })
         .setup(|app| {
             if let Some(path) = library_from_args() {
                 // A bad path is not fatal: the window still opens on the
@@ -448,7 +556,12 @@ pub fn run() {
             set_flag,
             set_color_label,
             photo_edits,
+            toggle_fullscreen,
+            is_fullscreen,
+            set_zoom,
             set_photo_edit,
+            preview_photo_edit,
+            release_preview,
             rotate_photos,
             toggle_photo_edit,
             clear_photo_edit,

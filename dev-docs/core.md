@@ -110,6 +110,38 @@ libraries with existing renders would otherwise have published the old bytes
 forever while new photos got the new ones. Thumbnails deliberately stay at 75 —
 they are never delivered to anyone and are redrawn constantly while culling.
 
+### The slider does not commit — it previews
+
+Committing is expensive by design: `set_photo_edit` writes the stack, develops
+the frame at full size and rebuilds three thumbnails. Measured on a 4000×1868
+JPEG in release, that is ~200 ms — fine on release of a slider, hopeless while
+one is being dragged, and it would leave a cache entry for every value the
+photographer merely slid past on the way to the one they wanted.
+
+So a drag calls `preview_photo_edit` instead, which **writes nothing at all**:
+no `edits` row, no render-cache entry, no thumbnails. It renders a small proxy
+(`develop::PREVIEW_MAX_EDGE`, 1024 px) from pixels the `Session` keeps decoded
+between calls, and hands it back inline as a data URL.
+
+```
+             decode   apply    encode
+full-res      46 ms   11 ms    + 3 thumbnails   ≈ 200 ms   ← commit, on release
+1024 proxy   cached  0.4 ms      3.6 ms         ≈   4 ms   ← preview, per drag tick
+```
+
+The decode is the expensive half, so `PreviewBase` holds one photo's decoded,
+oriented, downscaled pixels — keyed by **content hash, not id**, or an id whose
+file changed on disk would keep previewing the pixels it had at the last decode.
+
+Downscaling before developing is faithful rather than an approximation the
+commit then corrects: geometry is fractions of the frame and tone is per pixel,
+so neither reads a dimension. The proxy differs from the delivered render in
+resolution and JPEG quality and in nothing else — `a_preview_crops_the_same_fraction_the_commit_would`
+is the test that holds that true, because a crop is what would betray a mistake.
+
+One photo per call, never a selection: this feeds a preview, and there is one
+preview. A bulk adjustment shows its result when it commits.
+
 ### Orientation is canonical — do not edit ops in place
 
 Turns and mirrors do not commute. Stored orientation is **one left-to-right

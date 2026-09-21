@@ -92,12 +92,31 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 .titlebar {
   display: flex;
   align-items: center;
-  gap: 1rem;
   height: 46px;
-  padding: 0 1rem 0 88px; /* room for the macOS traffic lights */
+  padding: 0 1rem;
+  gap: 0.6rem;
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+}
+/* Only macOS puts window buttons inside our bar — see the `mac` class in
+   app.js. Windows and Linux draw their own frame above it, so reserving this
+   gutter there would be a dead notch on the left of every window.
+
+   Divided by the zoom because the lights are drawn by the system at a fixed
+   size and do not scale with the page; a constant 88px would drift right of
+   them as the interface grew. */
+html.mac .titlebar { padding-left: calc(88px / var(--zoom, 1)); }
+/* …except in fullscreen, where macOS takes the traffic lights away and the
+   gutter reserved for them is an empty pocket on the left of the bar. */
+html.mac.fullscreen .titlebar { padding-left: 1rem; }
+
+.titlebar-icon {
+  flex-shrink: 0;
+  border-radius: 4px;
+  /* The mark is a photograph's aperture, not a control — it must not read as
+     something to press. */
+  pointer-events: none;
 }
 .titlebar-title { font-weight: 600; }
 .titlebar-actions { margin-left: auto; display: flex; gap: 0.5rem; }
@@ -116,6 +135,89 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   overflow-y: auto;
 }
 .sidebar-section { padding: 0.75rem; }
+
+/* ---------------------------------------------------------------- library */
+/*
+   The open library, at the top of the sidebar holding its contents. It is a
+   button because it does something — everything about libraries is behind it —
+   and it looks like a header because that is what it is the rest of the time.
+*/
+.library-section { border-bottom: 1px solid var(--border); }
+.library-current {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "meta caret" "name caret";
+  align-items: center;
+  gap: 0 0.5rem;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+}
+.library-current:hover { background: #26262e; border-color: var(--border); }
+.library-meta {
+  grid-area: meta;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.library-name {
+  grid-area: name;
+  font-weight: 600;
+  /* A library is a folder someone named; it can be long, and the sidebar is
+     240px. Truncate rather than let it push the caret off the edge. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.library-caret { grid-area: caret; color: var(--text-dim); font-size: 0.8rem; }
+
+/* The switcher's rows: a library to open, and a way to forget one whose folder
+   has moved. Forgetting removes it from this list and from nowhere else. */
+.library-recent { display: flex; flex-direction: column; gap: 0.2rem; margin-bottom: 0.75rem; }
+.library-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: var(--radius-sm);
+}
+.library-row:hover { background: var(--bg-sunken); }
+.library-switch {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.4rem 0.55rem;
+}
+.library-switch .path {
+  display: block;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Deliberately NOT `direction: rtl`. That is the usual trick for keeping the
+     end of a path visible, and it reorders the punctuation: `/Volumes/Archive`
+     renders as `Volumes/Archive/`, with the leading slash moved to the end. The
+     folder's own name is on the line above in bold, so this line is context and
+     may truncate normally; the full path is on the row's tooltip. */
+}
+.library-forget {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  opacity: 0;
+}
+.library-row:hover .library-forget { opacity: 0.7; }
+.library-forget:hover { opacity: 1; color: var(--danger); }
 .sidebar-header {
   display: flex;
   align-items: center;
@@ -165,11 +267,37 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.toolbar input[type="search"] { max-width: 260px; min-width: 9rem; }
+
+/* Wrap rather than overflow. A toolbar that runs off the edge does not scroll
+   and has no affordance saying so, it simply loses its last controls — which at
+   150% zoom was Enlarge, the overlay toggle and the inspector toggle, all
+   silently unreachable. A taller bar costs a row; an unreachable button costs
+   the feature. The same thing happens without zoom in a narrow window, which is
+   where "Remove from album" had been clipped all along.
+
+   Only the middle wraps. The two sidebar toggles sit outside it so they stay
+   pinned to the edges however many rows this takes — inside, the right-hand one
+   reflowed to the *start* of the second row, which is the one place it must
+   never be. */
+.toolbar-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  row-gap: 0.45rem;
+}
+/* The search box is the one thing here that can give up width gracefully, so
+   it does — it shrinks before the bar is forced to take a second row. */
+.toolbar input[type="search"] { max-width: 260px; min-width: 7rem; flex: 1 1 7rem; }
 /* With the inspector open the toolbar is tight, and a wrapped "Remove from
    album" spread over three lines and dragged the whole bar taller. The search
    box gives up the width instead. */
 .toolbar .btn { white-space: nowrap; flex-shrink: 0; }
+/* The spacer pushes the right-hand group over only while there is room for it
+   to do so; once the bar wraps it must not claim a whole row of its own. */
+.toolbar .spacer { flex: 1 1 0; min-width: 0; }
 /* The count broke across two lines mid-phrase — "1" above "selected" — which
    reads as a rendering fault rather than a tight fit. */
 #selection-info { white-space: nowrap; }
@@ -195,6 +323,104 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   align-content: start;
 }
 .grid:focus-visible { outline: none; }
+
+/* ------------------------------------------------------------------ loupe */
+/*
+   One photo, as large as the window allows. The stage is only a box: the
+   picture inside it is #inspector-frame, moved here from the sidebar and moved
+   back on the way out, so the crop overlay keeps measuring the same element it
+   always did and none of its geometry needed a second case.
+*/
+.loupe {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.9rem;
+  background: #0b0b0d;
+  overflow: hidden;
+}
+/* Fill the stage and let `object-fit: contain` letterbox the picture, exactly
+   as it does at sidebar size — `drawnPictureBox()` solves for the bars, so the
+   crop rectangle lands on the photograph at either size without knowing which. */
+.inspector-frame.in-loupe { width: 100%; height: 100%; }
+.inspector-frame.in-loupe .inspector-img {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  background: transparent;
+}
+
+/* ------------------------------------------------------- info overlay */
+/*
+   Over the picture, not beside it — so it reads at a glance while culling, and
+   it is over the *enlarged* picture too, because it lives inside the frame that
+   moves into the loupe.
+
+   `pointer-events: none` is load-bearing: the crop rectangle is dragged on the
+   same pixels, and an overlay that swallowed the press would make framing
+   impossible whenever the overlay happened to be up.
+*/
+.info-overlay {
+  position: absolute;
+  /* Placed by positionInfoOverlay(), against the picture the preview actually
+     draws rather than against this box: `object-fit: contain` letterboxes a
+     wide photo in a tall frame, and an overlay pinned to the frame floats in
+     the black band above the photograph instead of sitting on it. */
+  left: 0;
+  top: 0;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius);
+  background: rgba(10, 10, 12, 0.72);
+  color: #f2f2f4;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+.info-overlay dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0 0.6rem; }
+.info-overlay dt { color: #a9a9b2; white-space: nowrap; }
+.info-overlay dd { margin: 0; word-break: break-word; }
+/* Enlarged, it can afford to be read from further away. */
+.inspector-frame.in-loupe .info-overlay { font-size: 0.82rem; }
+
+/* --------------------------------------------------- settings & shortcuts */
+.settings-head {
+  margin: 1.1rem 0 0.5rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.settings-head:first-of-type { margin-top: 0; }
+/* The overlay's fields are subordinate to the switch above them, and at the
+   same indent they read as nine peers instead of one and its eight. */
+#pref-overlay-fields { margin-left: 1.4rem; }
+kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75em;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  color: var(--text);
+}
+.shortcuts dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(6.5rem, auto) 1fr;
+  gap: 0.4rem 0.9rem;
+  align-items: baseline;
+  font-size: 0.85rem;
+}
+.zoom-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+.zoom-row #zoom-readout { min-width: 3.5rem; text-align: center; }
+
+.shortcuts dt { text-align: right; color: var(--text-dim); }
+.shortcuts dd { margin: 0; }
+.btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 
 .cell {
   position: relative;
@@ -472,13 +698,24 @@ input:focus-visible, select:focus-visible, button:focus-visible {
 
 /* ---------------------------------------------------------------- develop */
 
-.develop {
+/* ----------------------------------------------------- inspector panels */
+/*
+   Both panels are <details>, so collapsing is the element's own job rather than
+   a class and a height calculation. Which is open, and which comes first, is
+   read out of prefs.js at boot and written back on every change — app.js
+   reorders these nodes, so the order in the markup is only a starting point.
+*/
+.panels { display: flex; flex-direction: column; }
+.panel {
   margin: 0.9rem 0;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   padding: 0.6rem 0;
 }
-.develop > summary {
+/* Consecutive panels share a rule rather than drawing two. */
+.panel + .panel { margin-top: -0.9rem; border-top: none; }
+
+.panel > summary {
   cursor: pointer;
   font-size: 0.72rem;
   text-transform: uppercase;
@@ -488,8 +725,35 @@ input:focus-visible, select:focus-visible, button:focus-visible {
   align-items: center;
   gap: 0.4rem;
 }
-.develop > summary::-webkit-details-marker { display: none; }
+.panel > summary::-webkit-details-marker { display: none; }
+/* A closed panel should look closed from across the room. */
+.panel > summary .panel-title::before { content: "▾ "; }
+.panel:not([open]) > summary .panel-title::before { content: "▸ "; }
+
+/* Reordering. Small, quiet, and only meaningful at the ends — a panel that
+   cannot move that way says so by going dim rather than by disappearing, so
+   the two buttons stay where the hand expects them. */
+.panel-move {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0.15rem 0.25rem;
+  border-radius: 3px;
+}
+.panel-move:hover:not(:disabled) { background: var(--bg-sunken); color: var(--text); }
+.panel-move:disabled { opacity: 0.25; cursor: default; }
+
 .sliders { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.45rem; }
+
+/* Flags, beside the stars and reading the same way: the state is shown, not
+   just offered. */
+.flag-row { display: flex; gap: 0.3rem; margin-bottom: 0.9rem; }
+.flag-row .btn { flex: 1; }
+.flag-row .btn.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.flag-row .btn.on.reject { background: var(--danger); color: #fff; border-color: var(--danger); }
 
 /* Rotate and flip. The glyphs need a little more room than the label buttons
    elsewhere, and the state readout takes whatever is left. */

@@ -658,6 +658,97 @@ An adjustment is a row in `edits`, never a write to the original. What identifie
 
 Geometry (rotate, flip, crop) applies before tone, so a crop rectangle means the same thing regardless of exposure.
 
+**A dragged slider previews; a released one commits.** Committing writes the
+stack, develops at full size and rebuilds three thumbnails — ~200 ms on a 24 MP
+frame, and a cache entry per value slid past. So a drag calls
+`Session::preview_photo_edit`, which writes *nothing*: it renders a 1024 px
+proxy (~4 ms) from pixels the session keeps decoded and returns it inline as a
+data URL. Downscaling first is faithful, not an approximation — geometry is
+fractions of the frame and tone is per pixel, so neither reads a dimension.
+
+**The titlebar names the application; the sidebar names the library.** Which
+folder is open is a property of the work, not of the program, so it sits at the
+top of the sidebar whose albums and counts are that library's contents — and it
+is the switcher. The last few libraries live under their own key via
+`prefs.js` (`loadRecent` / `rememberLibrary` / `forgetLibrary`, order is
+meaning: newest first). Switching drops `currentAlbum`, the selection and the
+cursor before opening: ids and album paths mean something only inside one
+catalog, and a path carried across would quietly filter the new library down to
+nothing and look like a failed import. `prune_missing` was registered in the
+shell and reachable from nowhere; it is the library dialog's "Remove missing
+photos", behind a confirmation that says an unplugged drive counts as missing.
+
+**The window remembers how it was arranged.** Which inspector panels are open,
+in what order, which sidebars are showing, and what the info overlay says all
+live in `localStorage` via `desktop/app/ui/prefs.js` — a DOM-free module so the
+part that matters is testable (`tests/desktop-prefs.test.ts`). What matters is
+not the read and write but the repair: a stored order naming a panel this build
+dropped, or missing one it added, or listing one twice, each ends with a panel
+that exists in the markup and cannot be reached from the UI. `normalize` keeps
+the known panels in the stored order and appends the rest, so a downgrade and an
+upgrade are both survivable. One function, `applyPrefs()`, is the only path from
+a preference to the screen.
+
+**The window buttons are the system's, sitting in our bar.** That needs
+`titleBarStyle: Overlay`, not `Transparent`: Tauri's own doc for `Transparent`
+says it shows "the window background color" and is for when you "don't need to
+have actual HTML under the title bar" — which is the opposite of this. It shipped
+that way and it looked it: a strip of window background at the top holding the
+traffic lights, our dark bar starting *below* it, and the 88px gutter reserving
+room for buttons that were in a different strip entirely. `Overlay` puts the
+content under the bar and the lights on top of it. The setting is
+`#[cfg(target_os = "macos")]` in Tauri either way, so only macOS puts its traffic
+lights inside the page — Windows and Linux draw a system frame above it.
+That is why the gutter reserving room for them is on `html.mac` (set from the
+user agent, synchronously, before first paint) rather than on `.titlebar`: on
+the other two it would be a dead notch. In fullscreen macOS takes the lights away, so that gutter has to go with them —
+the shell watches `WindowEvent::Resized`, compares `is_fullscreen()` against an
+`AtomicBool` and emits `fullscreen-changed` only on the change (every frame of a
+window-edge drag is a resize too). It must come from the shell: fullscreen is
+entered four ways — our `F`, the green button, `⌃⌘F`, the Window menu — and only
+one of them passes through the UI.
+
+**That `AtomicBool` is also the only trustworthy answer to "are we fullscreen?"**
+Measured on macOS 27 with Tauri 2.11: `WebviewWindow::is_fullscreen()` answered
+`false` while the window was genuinely fullscreen, though the same question asked
+of the `Window` in the resize handler answered correctly. `toggle_fullscreen`
+first derived its target from the wrong one, so it asked for the state the window
+was already in — and tao returns early on exactly that (`window.rs:1147`),
+silently. The key did nothing, in both directions, while `set_fullscreen`
+returned `Ok` and the status line cheerfully reported success. Anything asking
+where the window is should read the flag, not the window.
+
+Drawing our own red/yellow/green means
+`decorations: false` and re-implementing three different conventions —
+hover glyphs, Option-click, and the right-click menu on macOS; Windows 11 snap
+layouts on hover; and `gtk-decoration-layout`, which puts the buttons on either
+side depending on the user's setting. Don't, unless the whole frame is being
+taken over deliberately.
+
+**The interface scales with `⌘`/`Ctrl` and `+` `-` `0`**, through the webview's
+own page zoom (`WebviewWindow::set_zoom`, macOS 11+/Windows/Linux) rather than a
+CSS transform — it re-lays out and re-renders, so a 4K display gets larger
+*sharp* type instead of a magnified bitmap. Tauri has no getter, so the level is
+`prefs.js`'s to remember, on a ladder rather than a multiplier (press in and out
+the same number of times and you land back on 1). `normalize` clamps it, and
+that clamp is load-bearing: the zoom is applied before anything is drawn and
+reloaded on every restart, so an unclamped value leaves the controls that would
+undo it off the edge of the screen. The macOS traffic-light gutter divides by
+`--zoom`, because the lights are drawn by the system and do not scale.
+
+**The info overlay rides inside `#inspector-frame`**, like the crop overlay and
+for the same reason — the frame is what the loupe moves, so the overlay is over
+the enlarged picture with no second case. It is `pointer-events: none` because
+the crop rectangle is dragged on those same pixels. `I` toggles it, `F` is the
+window's own fullscreen, `[` and `]` the sidebars, `?` the shortcut list, `,`
+settings.
+
+**The loupe is the sidebar preview, moved.** `E`/`Enter`/double-click gives one
+photo the whole main area; the UI *relocates* `#inspector-frame` onto the stage
+rather than drawing a second copy, because a second copy means a second crop
+overlay over different pixels at a different scale, and the two would disagree
+about which part of the photograph the rectangle names.
+
 **Where order matters, and where it cannot.** `apply` runs two passes: geometry in stack order, then tone in stack order, purely per pixel. So a tone op's position relative to a geometry op is irrelevant — measured, not assumed (`tests/geometry_order.rs`). Within tone, order matters, as in any developer: exposure-then-contrast is not contrast-then-exposure. Within geometry it matters too, and that is why the turns and mirrors are **not** edited where they lie in the stack.
 
 **Orientation is stored canonically**, as one left-to-right mirror followed by quarter turns — the eight ways a rectangle can be set down. A button composes onto the *outside* of that framing and the whole thing is written back, so a top-to-bottom flip is stored as a mirror plus a half turn, and `flip-vertical` is never written. Editing the ops in place instead gave two defects that were three presses away in the panel: "rotate right" on a flipped frame turned the photograph left, and pressing a flip again to undo it mirrored the wrong axis once a turn sat between them. Anything reading orientation must fold the whole op list (as `renderGeometry` does), never look for a particular op. The crop is held last and its rectangle is carried along by each press, so a frame drawn on the picture keeps framing the same part of it. A stack written before all this — the crop appended wherever it fell, ahead of the turns — is normalised on the next press, rectangle carried through the framing that used to follow it; without that, moving the crop to the end reads the same four fractions against a frame that has since turned and the bride is out of the picture.
