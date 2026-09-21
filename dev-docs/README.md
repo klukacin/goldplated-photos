@@ -1,7 +1,7 @@
 # Developer documentation
 
 Everything a developer needs to work on Goldplated Photos, in one folder.
-`CLAUDE.md` at the repo root stays the operational quick-reference (commands,
+`AGENTS.md` at the repo root stays the operational quick-reference (commands,
 troubleshooting, the rules an AI session must follow); the documents here are
 the long form — why the system is shaped the way it is, what invariants hold,
 and how to extend it without breaking them.

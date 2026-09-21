@@ -36,11 +36,13 @@ cd /path/to/goldplated-photos
 claude
 ```
 
-Claude will automatically read `CLAUDE.md` and understand the project structure.
+Claude will automatically read `CLAUDE.md`, a one-line import of `AGENTS.md`, and understand the project structure.
 
-## The CLAUDE.md File
+## The AGENTS.md File
 
-The project includes a comprehensive `CLAUDE.md` file that provides:
+The project's context lives in `AGENTS.md`, in the agent-neutral convention, and
+`CLAUDE.md` is a one-line import of it — so Claude Code loads it automatically
+and any other agent can read `AGENTS.md` directly. It provides:
 
 - **Development Commands** - All npm scripts and their purposes
 - **Architecture Overview** - How the application is structured
@@ -143,9 +145,9 @@ When contributing to Goldplated Photos:
 2. **Provide Context** - Explain what you're trying to achieve
 3. **Review Changes** - Always review Claude's suggestions before committing
 4. **Test Thoroughly** - Run the dev server and verify functionality
-5. **Update CLAUDE.md** - If you add new features, update the documentation
+5. **Update AGENTS.md** - If you add new features, update the documentation
 
-## Keeping CLAUDE.md Current
+## Keeping AGENTS.md Current
 
 If you add significant features:
 
@@ -160,7 +162,7 @@ This ensures future developers (and Claude) can effectively work with your addit
 
 - [Claude Code Documentation](https://claude.ai/code)
 - [Anthropic API Documentation](https://docs.anthropic.com)
-- [CLAUDE.md in this project](https://github.com/klukacin/goldplated-photos/blob/main/CLAUDE.md)
+- [AGENTS.md in this project](https://github.com/klukacin/goldplated-photos/blob/main/AGENTS.md)
 
 ---
 

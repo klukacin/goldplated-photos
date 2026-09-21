@@ -61,9 +61,9 @@ goldplated-photos/
 
 This project was built with Claude AI assistance, and we encourage contributors to use Claude Code for development.
 
-### Using CLAUDE.md
+### Using AGENTS.md
 
-The `CLAUDE.md` file contains comprehensive project context for AI-assisted development:
+The `AGENTS.md` file contains comprehensive project context for AI-assisted development. `CLAUDE.md` is a one-line import of it, so Claude Code loads it automatically and other agents can read `AGENTS.md` directly:
 
 - Architecture overview
 - Component documentation
@@ -75,7 +75,7 @@ When using Claude Code:
 
 1. Open the project in your terminal
 2. Run `claude` to start Claude Code
-3. Claude will automatically read CLAUDE.md for context
+3. Claude will automatically read `AGENTS.md`, through the `CLAUDE.md` import
 4. Ask Claude to help with your contribution
 
 ### Best Practices with Claude
@@ -201,7 +201,7 @@ const data = await fetchData();
 
 ### Documentation
 
-- Update CLAUDE.md for significant changes
+- Update AGENTS.md for significant changes
 - Keep README.md concise
 - Add JSDoc comments for public functions
 - Include examples in documentation

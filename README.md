@@ -177,13 +177,13 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ### Working with Claude AI
 
-This project includes comprehensive documentation for AI-assisted development. See [CLAUDE.md](CLAUDE.md) for project context that Claude Code uses automatically.
+This project includes comprehensive documentation for AI-assisted development. See [AGENTS.md](AGENTS.md) for project context. `CLAUDE.md` is a one-line import of it, so Claude Code picks it up automatically; other agents read `AGENTS.md` directly.
 
 ```bash
 # Start Claude Code session
 claude
 
-# Claude will read CLAUDE.md and understand the project
+# Claude reads CLAUDE.md, which imports AGENTS.md
 ```
 
 ---

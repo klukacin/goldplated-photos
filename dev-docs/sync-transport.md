@@ -179,7 +179,7 @@ The disqualifier is [`mod_dav.xml`](https://github.com/apache/httpd/blob/trunk/d
 
 `src/content/albums/**` has three non-Apache writers: the admin panel, the
 Node/PM2 process, and rsync. Handing Apache exclusive ownership would make the
-permission problems already documented in `CLAUDE.md` worse, not better.
+permission problems already documented in `AGENTS.md` worse, not better.
 
 Two further strikes: generic `mod_dav`/`cpdavd` supports **neither hashes nor
 modification times**, so sync degrades to size-only comparison
