@@ -1092,3 +1092,25 @@ const renderedCards = await Promise.all(
 chmod -R 755 public_html && find public_html -type f -exec chmod 644 {} \;
 ```
 Required permissions: directories `755`, files `644`, `.htaccess` files `644`.
+
+<!-- WS-AGENT-SKILLS:START -->
+## Agent skills
+
+Repository machine policy is defined only in `.wsagency/config.yaml`.
+
+### Issue tracker
+
+Read `tracker.primary` before tracker operations. The recommended profile uses Local Markdown under `dev-docs/tickets/`; see `dev-docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Read the five semantic mappings under `triage.labels`; see `dev-docs/agents/triage-labels.md`.
+
+### Domain documentation
+
+Read `domain.layout`, then follow `dev-docs/agents/domain.md` and either root `CONTEXT.md` for `single_context` or root `CONTEXT-MAP.md` plus the relevant context file for `multi_context` before changing domain behavior.
+
+### Runtime policy
+
+The active harness must deliver the session discipline and dangerous-git guard required by `runtime` before reporting runtime readiness.
+<!-- WS-AGENT-SKILLS:END -->
