@@ -46,7 +46,7 @@ Goldplated Photos is openly developed with AI assistance. We believe in transpar
 
 ### What This Means
 
-1. **CLAUDE.md** - The project includes a comprehensive context file that helps Claude understand the codebase
+1. **AGENTS.md** - The project includes a comprehensive context file that helps an agent understand the codebase (Claude Code reaches it through a one-line `CLAUDE.md` import)
 2. **AI-Assisted Contributions** - Contributors are encouraged to use Claude Code for development
 3. **Iterative Refinement** - Features are developed through human-AI conversation and iteration
 

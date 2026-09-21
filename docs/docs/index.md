@@ -46,7 +46,7 @@ A beautiful, secure, self-hosted photo gallery for photographers and enthusiasts
 
     ---
 
-    Crafted by Kristijan Lukacin with Claude AI assistance. Includes CLAUDE.md for AI-assisted development.
+    Crafted by Kristijan Lukacin with Claude AI assistance. Includes AGENTS.md for AI-assisted development.
 
 </div>
 
@@ -194,7 +194,7 @@ If you find Goldplated Photos useful, consider supporting its development:
 
 We welcome contributions! See the [Contributing Guide](https://github.com/klukacin/goldplated-photos/blob/main/CONTRIBUTING.md) for guidelines.
 
-This project includes [CLAUDE.md](https://github.com/klukacin/goldplated-photos/blob/main/CLAUDE.md) for AI-assisted development with Claude Code.
+This project includes [AGENTS.md](https://github.com/klukacin/goldplated-photos/blob/main/AGENTS.md) for AI-assisted development. Claude Code reaches it through a one-line `CLAUDE.md` import; other agents read it directly.
 
 ---
 
