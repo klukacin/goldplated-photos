@@ -77,3 +77,4 @@ docs/site/
 # vanished under *.png).
 !desktop/crates/gpp-core/tests/fixtures/*.heic
 !desktop/crates/gpp-core/tests/fixtures/*.webp
+docs/site

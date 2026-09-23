@@ -8,6 +8,7 @@ repo_url: https://github.com/klukacin/goldplated-photos
 
 theme:
   name: material
+  custom_dir: overrides
   palette:
     - scheme: default
       primary: black
