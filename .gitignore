@@ -78,3 +78,4 @@ docs/site/
 !desktop/crates/gpp-core/tests/fixtures/*.heic
 !desktop/crates/gpp-core/tests/fixtures/*.webp
 docs/site
+.wrangler/
