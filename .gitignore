@@ -78,5 +78,8 @@ docs/site/
 !desktop/crates/gpp-core/tests/fixtures/*.heic
 !desktop/crates/gpp-core/tests/fixtures/*.webp
 
+docs/site
+.wrangler/
+
 # Full-scope sync store (desktop app originals + metadata; never gallery content)
 .sync-full/

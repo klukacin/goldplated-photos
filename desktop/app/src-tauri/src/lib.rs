@@ -11,7 +11,7 @@ use gpp_core::model::{Flag, ImportSummary, Photo, PhotoFilter};
 use gpp_core::publish::PublishResult;
 use gpp_core::remote::{ForeignPushOutcome, PullOutcome, PushOutcome, RemoteAlbum};
 use gpp_core::remotes::{RemoteInfo, RemoteUpdate};
-use gpp_core::session::{AlbumSummary, LibraryStatus, PublishTarget, Session};
+use gpp_core::session::{AlbumSummary, LibraryStatus, PreviewImage, PublishTarget, Session};
 use gpp_core::sources::{SourceInfo, SourceKind};
 use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan, SyncScopeKind};
 use gpp_core::xmp::XmpExportOutcome;
@@ -24,107 +24,81 @@ fn to_msg(e: gpp_core::Error) -> String {
     e.to_string()
 }
 
+// ------------------------------------------------------------------- window
+
+/// Scale the whole interface.
+///
+/// The webview's own page zoom, which is why this is worth doing properly: it
+/// re-lays out and re-renders text at the new size, so a 4K display gets larger
+/// *sharp* type rather than a magnified bitmap. A CSS transform would have
+/// scaled the pixels instead.
+///
+/// There is no matching getter in Tauri, so the level is the UI's to remember —
+/// it lives with the rest of the window arrangement in `prefs.js`, which also
+/// clamps it. An unclamped value applied at start-up puts the controls that
+/// would undo it past the edge of the screen.
+///
+/// Platform note: macOS 11+, Windows and Linux. Not Android; iOS 14+.
+#[tauri::command]
+fn set_zoom(window: tauri::WebviewWindow, factor: f64) -> CmdResult<()> {
+    window.set_zoom(factor).map_err(|e| e.to_string())
+}
+
+/// Whether the window was in fullscreen the last time the shell looked.
+///
+/// macOS hides its traffic lights in fullscreen, so the gutter the page
+/// reserves for them has to come and go with it. The UI cannot infer this from
+/// its own `F` key: fullscreen is entered four ways — that key, the green
+/// button, ⌃⌘F, and the Window menu — and only the shell sees all four.
+///
+/// Kept so that the resize stream can be reduced to the changes: entering
+/// fullscreen arrives as a resize, but so does every frame of dragging a window
+/// edge, and an event per frame would be a message to the webview per frame.
+struct Fullscreen(std::sync::atomic::AtomicBool);
+
+/// Where the window is now. Asked once at start-up, because a window restored
+/// into fullscreen would otherwise have to wait for its first resize.
+///
+/// Read from [`Fullscreen`] rather than from the window: measured on macOS 27
+/// with Tauri 2.11, `WebviewWindow::is_fullscreen()` answered `false` while the
+/// window was genuinely fullscreen, and the same question asked of the `Window`
+/// in the resize handler answered correctly. Whatever the cause, only one of
+/// the two readings can be trusted, so only one is used.
+#[tauri::command]
+fn is_fullscreen(state: State<'_, Fullscreen>) -> CmdResult<bool> {
+    Ok(state.0.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Turn the window's own fullscreen on or off, reporting where it ended up.
+///
+/// A Tauri command rather than the JS window API so the capability set stays as
+/// it is: every other action the UI takes is already one `invoke`, and this way
+/// there is one list of what the shell can do instead of two.
+///
+/// Composes with the loupe rather than replacing it — the loupe gives the photo
+/// the window, this gives the window the screen, and the pair is what "show me
+/// this photograph" means.
+#[tauri::command]
+fn toggle_fullscreen(
+    window: tauri::WebviewWindow,
+    state: State<'_, Fullscreen>,
+) -> CmdResult<bool> {
+    let want = !state.0.load(std::sync::atomic::Ordering::SeqCst);
+    window.set_fullscreen(want).map_err(|e| e.to_string())?;
+    // Deliberately not reported back: `set_fullscreen` returning `Ok` says the
+    // request was sent, not that the window moved. What actually happened
+    // arrives as `fullscreen-changed` off the resize, which is the same path a
+    // green-button fullscreen takes.
+    Ok(want)
+}
+
 // ------------------------------------------------------------------ library
 
 #[tauri::command]
 fn open_library(app: tauri::AppHandle, path: String) -> CmdResult<LibraryStatus> {
     let status = app.state::<Session>().open_library(&path).map_err(to_msg)?;
     allow_reading_library(&app);
-    record_library_opened(&app, &status.root);
     Ok(status)
-}
-
-// ------------------------------------------------------- known libraries
-//
-// A small registry of every library this machine has opened, so the titlebar
-// can offer them back as a menu. It is the shell's own state — about the app
-// on this machine, not about any one library — so it lives in the app config
-// directory, not in a catalog. Forgetting an entry edits this file and
-// nothing else; the library on disk is never touched.
-
-/// One remembered library. Written to and read from `libraries.json`; the
-/// struct only ever travels *out* to the webview, so there is no unknown-field
-/// trap here, and reads stay tolerant so a field added later cannot make an
-/// older build throw the whole list away.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct KnownLibrary {
-    /// Folder basename — what the menu shows.
-    name: String,
-    /// The canonical root the core reported, not whatever was typed.
-    path: String,
-    /// Seconds since the Unix epoch; the list is kept newest-first.
-    last_opened_at: u64,
-}
-
-/// The registry file, named in exactly one place (check-shell.mjs holds it to
-/// that): every reader and writer below goes through this constant.
-const LIBRARIES_REGISTRY: &str = "libraries.json";
-
-fn registry_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    Ok(dir.join(LIBRARIES_REGISTRY))
-}
-
-/// A missing or unreadable registry is an empty one, never an error: the menu
-/// degrades to "Open other library…" instead of blocking the app.
-fn read_registry(app: &tauri::AppHandle) -> Vec<KnownLibrary> {
-    let Ok(path) = registry_path(app) else { return Vec::new() };
-    let Ok(bytes) = std::fs::read(&path) else { return Vec::new() };
-    serde_json::from_slice(&bytes).unwrap_or_default()
-}
-
-/// Write through a temp file and rename, so a crash mid-write leaves the old
-/// list rather than half a JSON document that then reads as an empty one.
-fn write_registry(app: &tauri::AppHandle, list: &[KnownLibrary]) -> Result<(), String> {
-    let path = registry_path(app)?;
-    let dir = path.parent().ok_or("registry path has no parent")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Called on every successful open — picker, menu, remembered, or command
-/// line — so the very first open is already in the list. Failure to record is
-/// only logged: the library did open, and that must not be reported as an error.
-fn record_library_opened(app: &tauri::AppHandle, root: &str) {
-    let name = std::path::Path::new(root)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.to_string());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut list = read_registry(app);
-    list.retain(|e| e.path != root);
-    list.insert(
-        0,
-        KnownLibrary { name, path: root.to_string(), last_opened_at: now },
-    );
-    list.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
-    if let Err(e) = write_registry(app, &list) {
-        eprintln!("could not record library {root} in the registry: {e}");
-    }
-}
-
-/// The registry, newest-first. Read fresh on every call — the file is tiny and
-/// a stale in-memory copy would show a forgotten library back in the menu.
-#[tauri::command]
-fn known_libraries(app: tauri::AppHandle) -> CmdResult<Vec<KnownLibrary>> {
-    Ok(read_registry(&app))
-}
-
-/// Remove one entry from the registry and return what is left. Only the list
-/// changes; the library on disk is never touched.
-#[tauri::command]
-fn forget_library(app: tauri::AppHandle, path: String) -> CmdResult<Vec<KnownLibrary>> {
-    let mut list = read_registry(&app);
-    list.retain(|e| e.path != path);
-    write_registry(&app, &list)?;
-    Ok(list)
 }
 
 /// Let the webview load images out of this library.
@@ -309,6 +283,30 @@ async fn set_photo_edit(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// What an adjustment would look like, committing nothing.
+///
+/// The slider calls this while it is being dragged and `set_photo_edit` when it
+/// is let go. Blocking, like the others — the render is CPU-bound — but it
+/// writes no thumbnails and no catalog row, so it costs milliseconds.
+#[tauri::command]
+async fn preview_photo_edit(
+    app: tauri::AppHandle,
+    id: i64,
+    op: EditOp,
+) -> CmdResult<PreviewImage> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().preview_photo_edit(id, op).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Drop the decoded pixels the previews were rendering against.
+#[tauri::command]
+fn release_preview(state: State<'_, Session>) {
+    state.release_preview();
 }
 
 /// Relative, unlike `set_photo_edit`: the app's rotate buttons add a quarter
@@ -839,16 +837,28 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(Session::new())
+        .manage(Fullscreen(std::sync::atomic::AtomicBool::new(false)))
+        .on_window_event(|window, event| {
+            // Entering and leaving fullscreen both arrive as a resize; so does
+            // every frame of a window-edge drag, which is why only the changes
+            // are forwarded.
+            if !matches!(event, tauri::WindowEvent::Resized(_)) {
+                return;
+            }
+            let Ok(now) = window.is_fullscreen() else {
+                return;
+            };
+            let seen = window.state::<Fullscreen>();
+            if seen.0.swap(now, std::sync::atomic::Ordering::SeqCst) != now {
+                let _ = window.emit("fullscreen-changed", now);
+            }
+        })
         .setup(|app| {
             if let Some(path) = library_from_args() {
                 // A bad path is not fatal: the window still opens on the
                 // welcome screen, which is where the user can pick another.
                 match app.state::<Session>().open_library(&path) {
-                    Ok(status) => {
-                        allow_reading_library(app.handle());
-                        // The first open of a fresh install can be this one.
-                        record_library_opened(app.handle(), &status.root);
-                    }
+                    Ok(_) => allow_reading_library(app.handle()),
                     Err(e) => eprintln!("could not open library {path}: {e}"),
                 }
             }
@@ -856,8 +866,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_library,
-            known_libraries,
-            forget_library,
             library_status,
             is_library_open,
             import_photos,
@@ -874,7 +882,12 @@ pub fn run() {
             set_flag,
             set_color_label,
             photo_edits,
+            toggle_fullscreen,
+            is_fullscreen,
+            set_zoom,
             set_photo_edit,
+            preview_photo_edit,
+            release_preview,
             rotate_photos,
             toggle_photo_edit,
             clear_photo_edit,

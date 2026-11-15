@@ -9,7 +9,7 @@ meet only at `src/content/albums/**`.
 `output: 'server'` with the Node standalone adapter. Public listing pages
 prerender; **anything access-controlled is SSR** so a protected album's image
 URLs never appear in page source. The route map, component list and
-keyboard-shortcut reference live in `CLAUDE.md` (they double as the operational
+keyboard-shortcut reference live in `AGENTS.md` (they double as the operational
 quick-reference); this document covers the machinery.
 
 ### The media pipeline

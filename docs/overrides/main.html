@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+
+{# Cloudflare Web Analytics beacon (NOSCO RUM site docs.goldplated.photos). #}
+{% block extrahead %}
+{{ super() }}
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js"
+  data-cf-beacon='{"token": "14fe69bd693a431bbad76c50608ef068"}'></script>
+{% endblock %}

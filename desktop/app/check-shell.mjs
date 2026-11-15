@@ -94,12 +94,13 @@ if (!existsSync(capDir) || readdirSync(capDir).filter((f) => f.endsWith('.json')
 
   // Which plugin APIs the UI actually reaches for, and what has to allow them.
   const needs = [
-    { used: /window\.__TAURI__\.event|listen\(/, perm: /^core:(default|event)/, what: 'event.listen' },
-    { used: /openDialog\(|\.dialog\b/, perm: /^dialog:/, what: 'dialog.open' },
-    { used: /askConfirm\(/, perm: /^dialog:(default|allow-confirm|allow-ask)/, what: 'dialog.confirm' },
+    { source: appJs, used: /window\.__TAURI__\.event|listen\(/, perm: /^core:(default|event)/, what: 'event.listen' },
+    { source: appJs, used: /openDialog\(|\.dialog\b/, perm: /^dialog:/, what: 'dialog.open' },
+    { source: appJs, used: /askConfirm\(/, perm: /^dialog:(default|allow-confirm|allow-ask)/, what: 'dialog.confirm' },
+    { source: indexHtml, used: /data-tauri-drag-region/, perm: /^core:window:allow-start-dragging$/, what: 'window dragging' },
   ];
-  for (const { used, perm, what } of needs) {
-    if (used.test(appJs) && !perms.some((p) => perm.test(p))) {
+  for (const { source, used, perm, what } of needs) {
+    if (used.test(source) && !perms.some((p) => perm.test(p))) {
       fail(`UI uses ${what} but no capability grants it`, `permissions: ${perms.join(', ')}`);
     }
   }
@@ -182,25 +183,6 @@ if (watched.length) {
   fail('build.rs does not watch every UI file', `missing: ${watched.join(', ')}`);
 } else {
   ok('build.rs watches the UI files');
-}
-
-// --------------------------------------------------------- library registry
-
-// The known-libraries registry (libraries.json in the app config dir) is read
-// and written from several places in lib.rs. Its filename must be one literal
-// behind one constant: a second literal is how a rename drifts — "Forget"
-// then edits a file the menu never reads, both commands still "work", and no
-// build or test notices.
-if (libRs.includes('libraries.json')) {
-  const literals = (libRs.match(/"libraries\.json"/g) || []).length;
-  if (literals !== 1) {
-    fail(
-      'the registry filename appears as more than one literal',
-      `"libraries.json" occurs ${literals} times in lib.rs — route every use through the one constant`,
-    );
-  } else {
-    ok('the registry filename is a single literal behind a constant');
-  }
 }
 
 // -------------------------------------------------------------------- done
