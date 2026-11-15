@@ -23,3 +23,10 @@ heif = ["gpp-core/heif"]
 [dependencies]
 gpp-core = { path = "../gpp-core", default-features = false }
 serde_json.workspace = true
+
+# The integration test drives the built `gpp` binary over a generated
+# Lightroom fixture: an .lrcat is a SQLite file and the photos are real JPEGs.
+[dev-dependencies]
+tempfile.workspace = true
+image.workspace = true
+rusqlite.workspace = true

@@ -45,7 +45,12 @@ shipped app switches on:
 
 | from the core | from this boundary |
 |---|---|
-| `database`, `io`, `image`, `serde`, `invalid-path`, `album-not-found`, `photo-not-found`, `album-exists`, `unsupported`, `sync-conflict`, `other` | `null-pointer`, `invalid-utf8`, `bad-arguments`, `unknown-method`, `panic` |
+| `database`, `io`, `image`, `serde`, `invalid-path`, `album-not-found`, `photo-not-found`, `album-exists`, `unsupported`, `source-offline`, `source-mismatch`, `sync-conflict`, `other` | `null-pointer`, `invalid-utf8`, `bad-arguments`, `unknown-method`, `panic` |
+
+`source-offline` is the one worth branching on rather than only showing: it
+means a registered drive is not attached, nothing is wrong with the library, and
+the remedy — plug it in — is something the person reading can act on. Its
+message names the source.
 
 ---
 
@@ -228,9 +233,19 @@ omitted; a call with no arguments accepts `NULL`, `""` or `"{}"`.
 
 | Method | Arguments | Returns |
 |---|---|---|
-| `import` | `dir` *(optional; defaults to the library root)* | `ImportSummary` |
+| `import` | `dir` *(optional; omit to walk every registered source)* | `ImportSummary` |
 | `cancel_import` | — | `null` |
 | `prune` | — | `int` — catalog rows dropped because the file is gone |
+
+A `dir` inside a registered source (see below) is catalogued **where it lies**;
+one outside every source is copied into the library first, because a catalog row
+has no way to name a file no source reaches. Omit `dir` and the run walks the
+primary and every referenced source in turn, skipping any whose drive is not
+attached — those are named in `ImportSummary.notes`, never raised as errors.
+
+`prune` only examines sources that are online. A photograph on an unplugged
+drive is exactly as present as it was yesterday, and dropping its row would take
+its rating, flags, album memberships and adjustments with it.
 
 `import` blocks for as long as the card takes. `cancel_import` is the one call
 worth making while another is still running: it raises a flag the import reads
@@ -241,6 +256,88 @@ that ignores the flag will announce a finished import that never finished. What
 had already landed stays landed, and importing the same folder again finishes
 the job. Calling it when nothing is running is harmless: the next `import`
 clears the flag before it reads a file.
+
+### Sources (schema v6)
+
+A **source** is a root a catalogued photograph may live under. The library root
+is one — the *primary* — and any folder registered here is another; files there
+are **referenced**: read, hashed, thumbnailed, developed and published, never
+copied, never moved, never written to. That is what makes a Lightroom library
+importable without migrating a terabyte.
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `sources` | — | `[SourceInfo]` (`id`, `name`, `path`, `kind`, `volume_hint`, `is_primary`, `online`, `photo_count`) |
+| `add_source` | `path`, `name` *(optional; defaults to the folder's own name)*, `kind` *(optional: `"internal"` \| `"external"` (default) \| `"network"`)* | `id` |
+| `remove_source` | `id`, `drop_photos` *(optional, default `false`)* | `int` — catalog rows dropped. **Never deletes a file.** |
+| `relocate_source` | `id`, `new_path` | `null` |
+
+`online` is probed at the moment of the call, never cached — that is the whole
+question a drive that comes and goes asks. Offline, listing and thumbnails keep
+working (thumbnails are content-addressed and live on the primary), while
+anything that must open an original fails with the `source-offline` tag and a
+message naming the source; batch operations report those per item instead
+(`PublishResult.offline`, `XmpExportOutcome.offline`, `PushOutcome.failed`).
+
+`add_source` refuses a folder that overlaps one already registered, in either
+direction — including the library root. Two roots over one file would give it
+two identities, and then a prune, a publish and a sync each disagree about what
+the library holds.
+
+`remove_source` refuses a source that still holds catalog rows unless
+`drop_photos` says so in as many words: those rows carry ratings, flags, album
+memberships and develop stacks that exist nowhere else. The primary cannot be
+removed or relocated — it is where the catalog and every thumbnail live.
+
+`relocate_source` is for a drive that mounted somewhere else. It re-hashes a
+handful of that source's own catalogued files at the new path and refuses, with
+the `source-mismatch` tag and the offending filename, if they are not there or
+differ. Pointing a source at last year's backup would otherwise re-attach every
+row to the wrong negatives, quietly.
+
+### Lightroom
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `lr_scan` | `lrcat_path` | `LrScanReport` — root folders (with per-folder `in_place` / `can_reference` verdicts and missing-file counts), collections, keyword count, catalog id. Writes nothing. |
+| `lr_import` | `lrcat_path`, `options` *(optional `LrImportOptions`)* | `LrImportReport` |
+
+`LrImportOptions` is snake_case like the rest of this door: `dest_subdir`
+(where copied files land, default `"lr"`), `collections` (paths or `*` globs
+narrowing which collections map to albums; photos import regardless),
+`album_prefix`, `collision` (`"auto"` \| `"merge"` \| `"suffix"` — what to do
+when a collection's album path is already taken by an unlinked album),
+`dry_run` (compute the full report, write nothing), and the placement pair
+below.
+
+**Placement.** `mode` says where each root folder's files end up:
+
+| `mode` | Meaning |
+|---|---|
+| `"auto"` (default) | In place where the root already lies inside a source; copy in otherwise. What every import did before referencing existed. |
+| `"reference"` | Register the root folder as a source (named after it) and catalogue its files where they lie. **Nothing is copied.** |
+| `"in-place"` | Catalogue where the files are; on a root outside every source this registers one and says so in `conflicts`. |
+| `"copy"` | Always copy into the library under `dest_subdir`. |
+
+`roots` overrides `mode` per root folder: `[{"root_id": 2, "mode": "copy"}]`,
+where `root_id` is the `AgLibraryRootFolder` id `lr_scan` reports. A
+photographer keeps this year on the laptop and eight years on a NAS; those are
+two answers, not one.
+
+`LrImportReport` gains `photos_referenced` (the subset of `photos_in_place`
+that landed on a source other than the library root — the number that answers
+"how much did I import without copying a byte") and `sources_registered`. A
+root that cannot become a source (it contains the library, or another source)
+falls back to copying, with the reason in `conflicts`.
+
+The `.lrcat` is copied under the library's `.gpp` directory and only the copy
+is read — Lightroom can stay open, and the original is never touched. Both
+calls block like `import` does; run `lr_import` on a background thread, and
+`cancel_import` stops it the same way. Re-running with the same catalog syncs
+instead of duplicating: photos and collections are remembered per source
+catalog, renames in Lightroom follow (unless the album was renamed locally too
+— reported in `conflicts`, nothing moved), and Lightroom-side deletions are
+reported in `lr_deleted`, never propagated.
 
 ### Photos
 
@@ -327,9 +424,49 @@ particular op.
 | `sync_album` | `album_path`, `direction`, `allow_deletes` *(optional)* | `SyncOutcome` |
 | `sync_all_tracked` | `allow_deletes` *(optional)* | `[[album_path, SyncOutcome]]` |
 
+Every call in this table also accepts an **optional `remote_id`** (schema v5:
+a library can know several remotes). Omitted, the default remote is used —
+which is exactly the single remote a pre-v5 catalog migrated into, so every
+old call keeps working unchanged. `track_album` additionally accepts an
+optional `scope`: `"web"` (default — the published tree, today's behaviour) or
+`"full"` (originals and per-album metadata as well, under the reserved
+`__gpp_full__/` namespace). `publish` accepts an optional `target_id` the same
+way.
+
 Deletions on the server are withheld unless `allow_deletes` is passed. What was
 withheld comes back in `withheld_deletes` so you can name the files, ask, and
 run again — see `dev-docs/sync.md`.
+
+### Remotes and publish targets (schema v5)
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `remotes` | — | `[RemoteInfo]` (`id`, `name`, `target`, `token`, `is_default`, …) |
+| `add_remote` | `name`, `target`, `token` *(optional)* | `id` — the first added becomes the default |
+| `update_remote` | `id`, `update` (`name?`, `target?`, `token?` — `null` clears) | `null` |
+| `remove_remote` | `id` | `null` — drops its subscriptions and baselines **locally**; the server is untouched |
+| `set_default_remote` | `id` | `null` |
+| `publish_targets` | — | `[PublishTargetInfo]` |
+| `add_publish_target` | `name`, `dest_root`, `min_rating` *(optional)* | `id` |
+| `update_publish_target` | `id`, `update` (`name?`, `dest_root?`, `min_rating?` — `null` clears) | `null` |
+| `remove_publish_target` | `id` | `null` |
+| `set_default_publish_target` | `id` | `null` |
+| `read_library_remotes` | `library_root` | `[RemoteInfo]` of **another** library, read-only — its catalog is never migrated |
+| `push_album_to` | `album_path`, `target`, `token` *(optional)*, `scope` *(optional)* | `ForeignPushOutcome` — a stateless push: no baselines, never deletes, names every overwrite, carries this library's `library_id`/`library_name` for provenance |
+
+### Interchange
+
+| Method | Arguments | Returns |
+|---|---|---|
+| `export_xmp` | `album_path` *(optional; omit for the whole catalog)* | `XmpExportOutcome` (`written`, `skipped_foreign`, `missing`, `offline`) |
+
+Sidecars carry `xmp:Rating`, `xmp:Label`, `dc:subject`, `tiff:Orientation` —
+the fields every serious tool reads — plus the develop stack verbatim under
+the versioned `gpp:` namespace. A sidecar without that namespace belongs to
+another tool and is never overwritten. Each one is written **beside its own
+original**, so a referenced photograph's sidecar lands on its own drive rather
+than being gathered into the library; a source that is not attached is named in
+`offline` and nothing is written for it.
 
 The Rust-side list is `gpp_ffi::METHODS`, and a test asserts that every name in
 it dispatches.
@@ -349,10 +486,13 @@ client needs a progress bar badly enough, the right shape is a separate
 `gpp_call_with_progress` taking `void (*)(const char *json, void *user)` — not a
 callback smuggled through the JSON.
 
-**`Session::remote_token`.** Settable, never readable: `has_remote_token`
-reports only whether one is on file. This is the line the Tauri shell already
-draws, and there is no reason for a secret that has been written into the
-catalog to travel back out to a caller that already had it.
+**`Session::remote_token`.** Settable, never readable through
+`has_remote_token`, which reports only whether one is on file — the line the
+Tauri shell draws for the single-remote panel. Note that `remotes` and
+`read_library_remotes` *do* include each remote's `token`: a cross-library
+push exists precisely to carry a credential out of a catalog and into a
+transport the caller builds, and the catalog stores it in plain text anyway.
+Treat those results accordingly.
 
 **Everything else on `Session` is reachable.** The table above is the whole of
 it.

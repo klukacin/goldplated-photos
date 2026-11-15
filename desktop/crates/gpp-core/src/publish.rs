@@ -47,28 +47,53 @@ use crate::error::{Error, Result};
 use crate::model::{Album, Photo};
 
 impl Library {
-    /// Filenames this library last published into `album_path`.
+    /// Filenames this library last published into `album_path`, in the
+    /// **default** publish target's tree.
     pub fn published_files(&self, album_path: &str) -> Result<BTreeSet<String>> {
+        match self.default_target_id()? {
+            Some(id) => self.published_files_for(id, album_path),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// Filenames this library last published into `album_path`, per target —
+    /// two publish destinations keep separate books (schema v5), so pruning
+    /// one tree cannot be driven by what was written into the other.
+    pub fn published_files_for(&self, target_id: i64, album_path: &str) -> Result<BTreeSet<String>> {
         self.with_conn(|c| {
-            let mut stmt =
-                c.prepare("SELECT filename FROM published_files WHERE album_path = ?1")?;
-            let rows = stmt.query_map(params![album_path], |r| r.get::<_, String>(0))?;
+            let mut stmt = c.prepare(
+                "SELECT filename FROM published_files WHERE target_id = ?1 AND album_path = ?2",
+            )?;
+            let rows = stmt.query_map(params![target_id, album_path], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<rusqlite::Result<BTreeSet<String>>>()?)
         })
     }
 
-    /// Replace the record of what an album's published folder contains.
+    /// Replace the record of what an album's published folder contains, in
+    /// the default target's books.
     pub fn record_published_files(&self, album_path: &str, files: &BTreeSet<String>) -> Result<()> {
+        let id = self.ensure_default_target()?;
+        self.record_published_files_for(id, album_path, files)
+    }
+
+    /// Replace the record of what an album's published folder contains, per
+    /// target.
+    pub fn record_published_files_for(
+        &self,
+        target_id: i64,
+        album_path: &str,
+        files: &BTreeSet<String>,
+    ) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute(
-                "DELETE FROM published_files WHERE album_path = ?1",
-                params![album_path],
+                "DELETE FROM published_files WHERE target_id = ?1 AND album_path = ?2",
+                params![target_id, album_path],
             )?;
             let mut stmt = tx.prepare(
-                "INSERT INTO published_files(album_path, filename) VALUES(?1, ?2)",
+                "INSERT INTO published_files(target_id, album_path, filename) VALUES(?1, ?2, ?3)",
             )?;
             for f in files {
-                stmt.execute(params![album_path, f])?;
+                stmt.execute(params![target_id, album_path, f])?;
             }
             Ok(())
         })
@@ -153,6 +178,13 @@ pub struct PublishResult {
     /// Catalogued photos no decoder could read, so they were not shipped: on
     /// the site they would be broken images.
     pub unrenderable: Vec<String>,
+    /// Catalogued photos whose *source* is not reachable — a referenced drive
+    /// that is not plugged in. Kept apart from
+    /// [`missing`](Self::missing) deliberately: nothing is lost, the album is
+    /// simply short until the drive is attached, and the next publish ships
+    /// them. Each entry names the source, because that is the whole of the
+    /// remedy.
+    pub offline: Vec<String>,
     /// Files removed from the published folder because this album no longer
     /// publishes them. Only ever files this library put there itself.
     pub removed: Vec<String>,
@@ -200,9 +232,22 @@ pub fn published_filename(photo: &Photo) -> String {
     format!("{stem}.jpg")
 }
 
-/// Publish one album into `dest_root` (the gallery's `src/content/albums`).
+/// Publish one album into `dest_root` (the gallery's `src/content/albums`),
+/// keeping the books under the **default** publish target.
 pub fn publish_album(
     lib: &Library,
+    album_path: &str,
+    dest_root: &Path,
+    opts: &PublishOptions,
+) -> Result<PublishResult> {
+    let target_id = lib.ensure_default_target()?;
+    publish_album_for(lib, target_id, album_path, dest_root, opts)
+}
+
+/// [`publish_album`], with the publish records kept under one specific target.
+pub fn publish_album_for(
+    lib: &Library,
+    target_id: i64,
     album_path: &str,
     dest_root: &Path,
     opts: &PublishOptions,
@@ -258,7 +303,22 @@ pub fn publish_album(
 
             // What ships is the developed photo. With no adjustments this is the
             // original file itself — no copy, no render, nothing cached.
-            let original = lib.resolve(&photo.rel_path)?;
+            //
+            // A photograph on a source that is not plugged in is named and
+            // stepped over, exactly as a missing original is: one unplugged
+            // drive must not stop an album of four hundred, and calling it
+            // "missing" would send the photographer looking for a file that is
+            // perfectly safe on a disk in the other room.
+            let original = match lib.photo_path(photo) {
+                Ok(p) => p,
+                Err(Error::SourceOffline { name, .. }) => {
+                    result
+                        .offline
+                        .push(format!("{} (source '{name}' is not available)", photo.rel_path));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let src = match crate::develop::ensure_rendered(
                 &original,
                 &lib.thumb_dir(),
@@ -299,11 +359,23 @@ pub fn publish_album(
                 src
             };
 
-            // Skip when destination already matches by size — cheap and
-            // correct enough, since a real change alters the byte count or the
-            // sync layer's hash catches it.
+            // Skip only when the destination already holds exactly these
+            // bytes. Size alone was the old test, with a comment claiming a
+            // same-length change would be caught by "the sync layer's hash" —
+            // it is not: the sync manifest hashes the *published* tree, so a
+            // develop that happened to produce the same byte count left the
+            // stale frame on the site and nothing anywhere disagreed. A size
+            // mismatch still short-circuits straight to the copy, so the
+            // common changed-file case pays no hashing; equal sizes cost one
+            // blake3 of each side, which is the price of knowing rather than
+            // guessing.
             if let (Ok(s), Ok(d)) = (std::fs::metadata(&src), std::fs::metadata(&dest)) {
-                if s.len() == d.len() {
+                let unchanged = s.len() == d.len()
+                    && matches!(
+                        (crate::import::hash_file(&src), crate::import::hash_file(&dest)),
+                        (Ok(a), Ok(b)) if a == b
+                    );
+                if unchanged {
                     result.photos_skipped += 1;
                     result.written.push(format!("{album_path}/{published}"));
                     continue;
@@ -324,7 +396,7 @@ pub fn publish_album(
             result.written.push(format!("{album_path}/{published}"));
         }
 
-        prune_published(lib, album_path, &album_dir, &photos, &mut result)?;
+        prune_published(lib, target_id, album_path, &album_dir, &photos, &mut result)?;
     }
 
     Ok(result)
@@ -338,6 +410,7 @@ pub fn publish_album(
 /// not even looked at.
 fn prune_published(
     lib: &Library,
+    target_id: i64,
     album_path: &str,
     album_dir: &Path,
     photos: &[Photo],
@@ -345,7 +418,7 @@ fn prune_published(
 ) -> Result<()> {
     let current: BTreeSet<String> = photos.iter().map(published_filename).collect();
 
-    for stale in lib.published_files(album_path)?.difference(&current) {
+    for stale in lib.published_files_for(target_id, album_path)?.difference(&current) {
         // A photo whose original vanished keeps its published copy: that is a
         // broken drive, not a decision to unpublish. Matched on the filename
         // itself — as a suffix, `my-gone.jpg` going missing also spared an
@@ -371,7 +444,7 @@ fn prune_published(
             recorded.insert(name.to_string());
         }
     }
-    lib.record_published_files(album_path, &recorded)
+    lib.record_published_files_for(target_id, album_path, &recorded)
 }
 
 /// Which photos make it into the published album.
@@ -472,12 +545,18 @@ pub fn render_frontmatter(album: &Album, photos: &[Photo]) -> String {
     out.push_str(&yaml_kv("style", &album.style));
 
     // Cover: explicit choice, else let the site fall back to the first photo.
-    if let Some(cover) = album
-        .cover_filename
-        .as_deref()
-        .filter(|c| photos.iter().any(|p| published_filename(p) == *c))
-    {
-        out.push_str(&yaml_kv("thumbnail", cover));
+    // `cover_filename` is the *library* name; what the tree holds — and what
+    // `thumbnail:` must name — is the published one, which for a HEIC differs
+    // (`x.heic` ships as `x.jpg`). Comparing the raw name against published
+    // candidates meant a HEIC cover never emitted `thumbnail:` at all. Either
+    // spelling is accepted, and the published one is what gets written.
+    if let Some(cover) = album.cover_filename.as_deref().and_then(|c| {
+        photos
+            .iter()
+            .find(|p| p.filename == c || published_filename(p) == c)
+            .map(published_filename)
+    }) {
+        out.push_str(&yaml_kv("thumbnail", &cover));
     }
 
     if !album.tags.is_empty() {
@@ -994,6 +1073,49 @@ mod tests {
         assert_eq!(r.bytes_copied, on_disk);
     }
 
+    /// The skip that spares an unchanged photo used to test size alone, on the
+    /// claim that "the sync layer's hash catches" a same-length change. It
+    /// does not — the sync manifest hashes the *published* tree, so published
+    /// bytes that differ from the source at the same byte count were simply
+    /// never refreshed, and the stale frame stayed on the site.
+    #[test]
+    fn a_published_file_with_the_same_length_but_different_bytes_is_rewritten() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write_jpeg(&src.path().join("a/one.jpg"), 60, 40);
+
+        let lib = Library::open(src.path()).unwrap();
+        import_dir(&lib, src.path(), &ImportOptions::default(), None, None).unwrap();
+        lib.create_album(&NewAlbum { path: "a".into(), ..Default::default() }).unwrap();
+        let one = lib.photo_by_rel_path("a/one.jpg").unwrap().unwrap();
+        lib.add_photos_to_album("a", &[one.id]).unwrap();
+        publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+
+        // The published copy drifts — same length, different bytes. An edit
+        // that renders to the same byte count looks exactly like this from
+        // where the copy loop stands: src and dest agree on size and on
+        // nothing else.
+        let published = dest.path().join("a/one.jpg");
+        let mut bytes = std::fs::read(&published).unwrap();
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&published, &bytes).unwrap();
+
+        let again = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(again.photos_copied, 1, "a same-length difference must be recopied");
+        assert_eq!(again.photos_skipped, 0);
+        assert_eq!(
+            std::fs::read(&published).unwrap(),
+            std::fs::read(src.path().join("a/one.jpg")).unwrap(),
+            "the published tree still holds the stale bytes"
+        );
+
+        // A genuinely unchanged file keeps its fast path.
+        let third = publish_album(&lib, "a", dest.path(), &PublishOptions::default()).unwrap();
+        assert_eq!(third.photos_copied, 0);
+        assert_eq!(third.photos_skipped, 1);
+    }
+
     #[test]
     fn respects_rating_filter_and_rejects() {
         let src = tempfile::tempdir().unwrap();
@@ -1253,9 +1375,25 @@ pub fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
     out
 }
 
-/// Strip surrounding double quotes and undo the escaping `yaml_scalar` applies.
+/// Strip surrounding quotes and undo their escaping.
+///
+/// Two quoting styles arrive here, from two different writers. This module's
+/// own [`yaml_scalar`] double-quotes with backslash escapes. The web admin
+/// writes these files with js-yaml, which prefers *single*-quoted scalars —
+/// `'Ana: the day'`, `'it''s'` — whose one and only escape is the doubled
+/// apostrophe. A pull reads both, so both have to unquote here, or a
+/// single-quoted title comes back wearing its quotes (and `''` still doubled).
 fn unquote(value: &str) -> String {
     let trimmed = value.trim();
+
+    // Single-quoted (js-yaml's style): no backslash escapes at all, `''` → `'`.
+    if let Some(inner) = trimmed
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return inner.replace("''", "'");
+    }
+
     let Some(inner) = trimmed
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
@@ -1330,7 +1468,7 @@ mod parse_tests {
         };
         let photos = vec![
             Photo {
-                id: 1, rel_path: "x/a.jpg".into(), filename: "a.jpg".into(),
+                id: 1, source_id: 1, rel_path: "x/a.jpg".into(), filename: "a.jpg".into(),
                 content_hash: "h".into(), file_size: 1, mtime_ms: 0,
                 kind: crate::model::PhotoKind::Photo, width: None, height: None,
                 orientation: None, captured_at: None, camera_make: None,
@@ -1387,6 +1525,26 @@ mod parse_tests {
                 "round trip of {value:?}"
             );
         }
+    }
+
+    /// The web admin writes these files with js-yaml, which single-quotes:
+    /// `'Ana: the day'`, `'it''s'`. This parser only ever met its own
+    /// double-quoted output, so a single-quoted title came back wearing its
+    /// quotes — and a doubled apostrophe stayed doubled.
+    #[test]
+    fn accepts_js_yaml_single_quoted_scalars() {
+        let p = parse_frontmatter(
+            "---\ntitle: 'Ana: the day'\npassword: 'tajna lozinka'\n---\n",
+        );
+        assert_eq!(p.title.as_deref(), Some("Ana: the day"));
+        assert_eq!(p.password.as_deref(), Some("tajna lozinka"));
+
+        let doubled = parse_frontmatter("---\ntitle: 'it''s the day'\n---\n");
+        assert_eq!(doubled.title.as_deref(), Some("it's the day"));
+
+        // And the double-quoted style this module writes is unaffected.
+        let ours = parse_frontmatter("---\ntitle: \"it's 'quoted'\"\n---\n");
+        assert_eq!(ours.title.as_deref(), Some("it's 'quoted'"));
     }
 
     #[test]

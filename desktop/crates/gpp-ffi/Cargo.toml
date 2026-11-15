@@ -37,3 +37,6 @@ tempfile.workspace = true
 # The boundary tests need real files to import, and a JPEG is the cheapest
 # thing the core will actually decode.
 image.workspace = true
+# The Lightroom boundary test generates a minimal .lrcat fixture, which is a
+# SQLite file. Dev-only; the shipped library gets its SQLite through gpp-core.
+rusqlite.workspace = true

@@ -621,6 +621,113 @@ fn the_newest_methods_refuse_hostile_arguments_without_panicking() {
     assert_eq!(c.ok("import", "{}")["cancelled"], json!(false));
 }
 
+/// The Lightroom door, given every argument a caller gets wrong: pointers that
+/// are not there, catalogs that are not catalogs, keys that are not the keys.
+/// Each must come back as a named error and never as `"kind":"panic"`.
+#[test]
+fn the_lightroom_methods_refuse_hostile_arguments_without_panicking() {
+    let (c, dir) = ForeignCaller::with_library();
+
+    let refused = |method: &str, args: &str, expected: &str| {
+        let reply = c.call(method, args);
+        let kind = error_kind(&reply);
+        assert_ne!(kind, "panic", "{method} panicked on {args}: {reply}");
+        assert_eq!(kind, expected, "{method} on {args} gave {reply}");
+    };
+
+    // Missing and misspelled arguments.
+    refused("lr_scan", "{}", "bad-arguments");
+    refused("lr_scan", r#"{"lrcatPath":"/x"}"#, "bad-arguments");
+    refused("lr_import", "{}", "bad-arguments");
+    refused(
+        "lr_import",
+        r#"{"lrcat_path":"/x","options":{"dryRun":true}}"#,
+        "bad-arguments",
+    );
+    refused(
+        "lr_import",
+        r#"{"lrcat_path":"/x","options":{"collision":"overwrite"}}"#,
+        "bad-arguments",
+    );
+    refused("lr_import", r#"{"lrcat_path":"/x","options":[1]}"#, "bad-arguments");
+
+    // A path that is not a catalog: no such file, and then a SQLite file that
+    // is not a Lightroom catalog at all (the library's own catalog).
+    refused("lr_scan", r#"{"lrcat_path":"/no/such/catalog.lrcat"}"#, "other");
+    let own_catalog = dir.path().join(".gpp/catalog.db").display().to_string();
+    let reply = c.call("lr_scan", &json!({ "lrcat_path": own_catalog }).to_string());
+    assert_eq!(error_kind(&reply), "other");
+    assert!(
+        reply["error"].as_str().unwrap().contains("AgLibraryRootFolder"),
+        "the refusal should name the missing table: {reply}"
+    );
+
+    // Bytes that are not text, and a session that is not there.
+    for method in ["lr_scan", "lr_import"] {
+        assert_eq!(
+            error_kind(&raw_call(c.0, Some(method.as_bytes()), Some(&[0xff, b'x']))),
+            "invalid-utf8"
+        );
+        assert_eq!(
+            error_kind(&raw_call(ptr::null_mut(), Some(method.as_bytes()), Some(b"{}"))),
+            "null-pointer"
+        );
+    }
+
+    // None of it disturbed the session.
+    assert_eq!(c.ok("is_open", "{}"), json!(true));
+}
+
+/// The happy path across the boundary: a generated fixture is scanned and
+/// imported the way a Swift shell would drive it.
+#[test]
+fn a_lightroom_catalog_crosses_the_boundary() {
+    let (c, dir) = ForeignCaller::with_library();
+    let shoot = dir.path().join("shoot");
+    write_jpeg(&shoot.join("one.jpg"), 60, 40);
+
+    // A minimal single-root catalog, written the way the core's own fixture
+    // writes one.
+    let lrcat = dir.path().join("cat.lrcat");
+    {
+        let conn = rusqlite::Connection::open(&lrcat).unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TABLE AgLibraryRootFolder (id_local INTEGER, absolutePath TEXT, name TEXT);
+            CREATE TABLE AgLibraryFolder (id_local INTEGER, pathFromRoot TEXT, rootFolder INTEGER);
+            CREATE TABLE AgLibraryFile (id_local INTEGER, idx_filename TEXT, folder INTEGER);
+            CREATE TABLE Adobe_images (id_local INTEGER, rootFile INTEGER, rating REAL,
+              colorLabels TEXT, pick REAL);
+            INSERT INTO AgLibraryRootFolder VALUES (1, '{}/', 'shoot');
+            INSERT INTO AgLibraryFolder VALUES (10, '', 1);
+            INSERT INTO AgLibraryFile VALUES (100, 'one.jpg', 10);
+            INSERT INTO Adobe_images VALUES (1000, 100, 5.0, NULL, 0.0);
+            "#,
+            shoot.display()
+        ))
+        .unwrap();
+    }
+
+    let scanned = c.ok("lr_scan", &json!({ "lrcat_path": lrcat.display().to_string() }).to_string());
+    assert_eq!(scanned["root_folders"][0]["file_count"], json!(1));
+    assert_eq!(scanned["root_folders"][0]["in_place"], json!(true));
+
+    let imported = c.ok(
+        "lr_import",
+        &json!({
+            "lrcat_path": lrcat.display().to_string(),
+            "options": {"dry_run": false}
+        })
+        .to_string(),
+    );
+    assert_eq!(imported["photos_in_place"], json!(1));
+    assert_eq!(imported["photos_copied"], json!(0));
+
+    let photos = c.ok("photos", "{}");
+    assert_eq!(photos.as_array().unwrap().len(), 1);
+    assert_eq!(photos[0]["rating"], json!(5));
+}
+
 #[test]
 fn freeing_a_null_pointer_is_a_no_op() {
     unsafe {
@@ -636,6 +743,175 @@ fn a_session_survives_being_used_after_an_error() {
     assert_eq!(error_kind(&c.call("photo", r#"{"id":1}"#)), "photo-not-found");
     // A rejected call must not have disturbed the session behind it.
     assert_eq!(c.ok("is_open", "{}"), json!(true));
+}
+
+// ----------------------------------------------------------------- sources
+
+/// The source door as a foreign client drives it: register a folder, import it
+/// in place, watch the drive leave, and get a *named* refusal rather than a
+/// path that is not there.
+#[test]
+fn a_source_is_registered_imported_in_place_and_reported_when_it_goes_dark() {
+    let (c, lib_dir) = ForeignCaller::with_library();
+    let holder = tempfile::tempdir().unwrap();
+    let drive = holder.path().join("archive");
+    write_jpeg(&drive.join("ana/a1.jpg"), 60, 40);
+
+    // Only the library itself, to begin with.
+    let listed = c.ok("sources", "{}");
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["is_primary"], json!(true));
+    assert_eq!(listed[0]["kind"], json!("primary"));
+
+    let id = c.ok(
+        "add_source",
+        &json!({ "path": drive.display().to_string(), "name": "Archive" }).to_string(),
+    );
+    let id = id.as_i64().unwrap();
+
+    // Importing that folder catalogues it where it lies: nothing copied.
+    let summary = c.ok(
+        "import",
+        &json!({ "dir": drive.join("ana").display().to_string() }).to_string(),
+    );
+    assert_eq!(summary["imported"], json!(1));
+    assert_eq!(summary["copied_in"], json!(0));
+    assert!(
+        std::fs::read_dir(lib_dir.path())
+            .unwrap()
+            .flatten()
+            .all(|e| e.file_name().to_string_lossy().starts_with('.')),
+        "the library folder must hold no photographs"
+    );
+
+    let photo = c.ok("photos", "{}")[0].clone();
+    assert_eq!(photo["source_id"], json!(id));
+    assert_eq!(photo["rel_path"], json!("ana/a1.jpg"));
+    let photo_id = photo["id"].as_i64().unwrap();
+    assert!(c.ok("photo_path", &json!({ "id": photo_id }).to_string())
+        .as_str()
+        .unwrap()
+        .ends_with("ana/a1.jpg"));
+
+    // The drive leaves.
+    std::fs::rename(&drive, holder.path().join("archive-elsewhere")).unwrap();
+
+    let listed = c.ok("sources", "{}");
+    let far = listed.as_array().unwrap().iter().find(|s| s["id"] == json!(id)).unwrap();
+    assert_eq!(far["online"], json!(false));
+    assert_eq!(far["photo_count"], json!(1), "the catalog still knows it");
+
+    // A named refusal a client can branch on — not an empty path, not "io".
+    let reply = c.call("photo_path", &json!({ "id": photo_id }).to_string());
+    assert_eq!(error_kind(&reply), "source-offline");
+    assert!(
+        reply["error"].as_str().unwrap().contains("Archive"),
+        "the message must name the source: {reply}"
+    );
+
+    // Pruning must not take the row with it, and an import of the whole
+    // library skips the source with a note instead of failing.
+    assert_eq!(c.ok("prune", "{}"), json!(0));
+    let summary = c.ok("import", "{}");
+    assert!(
+        summary["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("Archive")),
+        "a skipped source has to be named: {summary}"
+    );
+
+    // Removing it still holds a photo, so it needs an answer — and then the
+    // file it described is still on disk.
+    assert_eq!(
+        error_kind(&c.call("remove_source", &json!({ "id": id }).to_string())),
+        "other"
+    );
+    c.ok(
+        "remove_source",
+        &json!({ "id": id, "drop_photos": true }).to_string(),
+    );
+    assert_eq!(c.ok("sources", "{}").as_array().unwrap().len(), 1);
+    assert!(holder.path().join("archive-elsewhere/ana/a1.jpg").is_file());
+}
+
+/// The source methods, given every argument a caller gets wrong. Each must come
+/// back as a named error and never as `"kind":"panic"`.
+#[test]
+fn the_source_methods_refuse_hostile_arguments_without_panicking() {
+    let (c, _dir) = ForeignCaller::with_library();
+    let drive = tempfile::tempdir().unwrap();
+
+    let refused = |method: &str, args: &str, expected: &str| {
+        let reply = c.call(method, args);
+        let kind = error_kind(&reply);
+        assert_ne!(kind, "panic", "{method} panicked on {args}: {reply}");
+        assert_eq!(kind, expected, "{method} on {args} gave {reply}");
+    };
+
+    // camelCase is the misspelling most likely to be typed at a snake_case
+    // door, and dropping it silently would leave the source unregistered with
+    // nothing said.
+    refused("add_source", "{}", "bad-arguments");
+    refused("add_source", r#"{"Path":"/x"}"#, "bad-arguments");
+    refused("sources", r#"{"online":true}"#, "bad-arguments");
+    refused("remove_source", r#"{"id":1,"dropPhotos":true}"#, "bad-arguments");
+    refused("remove_source", r#"{"id":"one"}"#, "bad-arguments");
+    refused("relocate_source", r#"{"id":1}"#, "bad-arguments");
+    refused("relocate_source", r#"{"id":1,"newPath":"/x"}"#, "bad-arguments");
+
+    // A folder that is not there, and one that overlaps the library.
+    refused("add_source", r#"{"path":"/no/such/drive-12345"}"#, "io");
+    refused(
+        "add_source",
+        &json!({ "path": path_of(&_dir) }).to_string(),
+        "other",
+    );
+
+    // Ids that name nothing, and the primary, which is the library itself.
+    refused("remove_source", r#"{"id":9999}"#, "other");
+    refused("remove_source", r#"{"id":1}"#, "other");
+    refused(
+        "relocate_source",
+        &json!({ "id": 1, "new_path": drive.path().display().to_string() }).to_string(),
+        "other",
+    );
+
+    // A relocation to a folder that does not hold this source's photographs
+    // gets its own tag, so a client can say "that is the wrong drive" rather
+    // than only showing prose.
+    let real = tempfile::tempdir().unwrap();
+    write_jpeg(&real.path().join("a.jpg"), 60, 40);
+    let id = c
+        .ok(
+            "add_source",
+            &json!({ "path": real.path().display().to_string() }).to_string(),
+        )
+        .as_i64()
+        .unwrap();
+    c.ok("import", &json!({ "dir": real.path().display().to_string() }).to_string());
+    refused(
+        "relocate_source",
+        &json!({ "id": id, "new_path": drive.path().display().to_string() }).to_string(),
+        "source-mismatch",
+    );
+
+    // Bytes that are not text, and a session that is not there.
+    for method in ["sources", "add_source", "remove_source", "relocate_source"] {
+        assert_eq!(
+            error_kind(&raw_call(c.0, Some(method.as_bytes()), Some(&[0xff, b'x']))),
+            "invalid-utf8"
+        );
+        assert_eq!(
+            error_kind(&raw_call(ptr::null_mut(), Some(method.as_bytes()), Some(b"{}"))),
+            "null-pointer"
+        );
+    }
+
+    // None of it disturbed the session, and the good source is still there.
+    assert_eq!(c.ok("is_open", "{}"), json!(true));
+    assert_eq!(c.ok("sources", "{}").as_array().unwrap().len(), 2);
 }
 
 // ----------------------------------------------------------- the method list

@@ -48,6 +48,17 @@ function getSecret(): Buffer {
     return cachedSecret;
   }
 
+  if (fromEnv && fromEnv.length < 16 && !warnedAboutSecret) {
+    // Do not fall through in silence: the operator set a secret and it is not
+    // being used, which otherwise only shows up as sessions that mysteriously
+    // reset when the fallback file rotates.
+    warnedAboutSecret = true;
+    console.warn(
+      '[access] ACCESS_SECRET is set but shorter than 16 characters — it was IGNORED. ' +
+      'A generated secret is used instead. Set ACCESS_SECRET to at least 16 characters in .env.'
+    );
+  }
+
   // Fallback: persist a generated secret to .access-secret so sessions
   // survive restarts and are shared across PM2 cluster workers. Only if the
   // file cannot be written do we degrade to an ephemeral per-process secret.
@@ -112,6 +123,41 @@ function sign(payload: string): string {
 /** Generate a new random share token (URL-safe, 22 chars). */
 export function generateShareToken(): string {
   return randomBytes(16).toString('base64url');
+}
+
+// ---------------------------------------------------------------------------
+// Media path validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a client-supplied path into the albums tree — the one rule set for
+ * every media route (`/albums/*`, thumbnail, exif, video-info, watermark).
+ *
+ * Rejected:
+ * - `..` anywhere (path traversal)
+ * - a leading `/` (absolute paths)
+ * - NUL bytes
+ * - backslashes — a separator on Windows, where `album\photo.jpg` would both
+ *   escape `path.join` guards and make `resolveFileAccess` see a root-level
+ *   file (dir `""`), skipping the album access check entirely
+ * - empty segments and any segment starting with a dot (`.meta` cache,
+ *   dotfiles)
+ * - markdown files (`index.md` holds album passwords) — matched
+ *   case-insensitively, since the file system serving them may not be
+ *   case-sensitive
+ *
+ * Routes with extra rules of their own (disabled formats, feature flags) apply
+ * those on top of this.
+ */
+export function isSafeMediaPath(raw: unknown): raw is string {
+  if (typeof raw !== 'string' || raw === '') return false;
+  if (raw.includes('\0') || raw.includes('\\')) return false;
+  if (raw.startsWith('/') || raw.includes('..')) return false;
+  if (raw.toLowerCase().endsWith('.md')) return false;
+  for (const segment of raw.split('/')) {
+    if (segment === '' || segment.startsWith('.')) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -360,7 +360,7 @@ Photos are discovered by scanning the album directory for image files (see `getP
 - Public assets (`public/home/hero`, `public/home/cards`, the landing background) are served **raw**, with no conversion anywhere, so the admin refuses a HEIC/HEIF upload there and does not list one it finds.
 - WebP needs none of this; browsers decode it natively.
 
-The rule lives in one place, `src/lib/image-formats.ts` (unit-tested in `tests/image-formats.test.ts`), and `IMAGE_EXTENSIONS` is re-exported from there so adding a format cannot quietly skip the displayability question. `admin/server.js` and `admin/js/utils.js` keep hand-copies — plain JS cannot import the TS module — with comments saying so.
+The rule lives in one place, `src/lib/image-formats.ts` (unit-tested in `tests/image-formats.test.ts`), and `IMAGE_EXTENSIONS` is re-exported from there so adding a format cannot quietly skip the displayability question. `admin/server.js` imports the lists from `src/site-features.mjs`, and `admin/js/utils.js` receives them at runtime from `GET /api/config` (its literal list is only a fail-safe default).
 
 **EXIF Orientation:** Sharp's `.rotate()` is applied during thumbnail generation to auto-rotate images based on EXIF orientation metadata.
 - **IMPORTANT:** Always use thumbnails for display (not original images) to ensure correct orientation
@@ -421,7 +421,7 @@ An album can have both — the share link then skips the password form.
 **Unlock flow:**
 1. User submits password via form POST to `/api/unlock`
 2. Server validates with timing-safe comparison + rate limiting (10 attempts/15 min per real client IP — X-Forwarded-For aware behind the proxy)
-3. On success: unlocks the album + cascades to password-less descendants, sets signed cookie, redirects
+3. On success: stores only the unlocked album's token in the signed cookie and redirects — descendants are granted by chain inheritance in `resolveChainAccess`, not by extra cookie entries
 
 **Access inheritance:**
 - A locked ancestor blocks descendants until unlocked; an unlocked album grants its descendants
@@ -654,7 +654,7 @@ A library is a folder of photos the user already has. The app never moves them; 
   .gpp/thumbs/<shard>/<key>_*.jpg  content-addressed derived images
 ```
 
-Importing a folder from **outside** the library copies it in, because the catalog addresses photos by their path under the root and cannot point anywhere else.
+A photo is addressed by its path under a **source**: the library root (the primary — where `.gpp/`, copy-in imports and pulls land) plus any other root registered with `add_source`. A folder from outside can therefore be **copied in** (the default, for a camera card) or **referenced** — catalogued where it lies, nothing copied, which is what Lightroom import's `Reference` placement uses. An unreachable source is *offline*, not lost: listings and thumbnails still work from the cache, anything needing pixels returns `Error::SourceOffline`, and `prune_missing` skips it rather than deleting the record of every photo on an unplugged drive.
 
 ### Develop is non-destructive
 
@@ -759,7 +759,7 @@ about which part of the photograph the rectangle names.
 
 **HEIC and WebP are first-class.** An iPhone shoots HEIC by default and guests send it, so the core decodes HEIF with a pure-Rust HEVC decoder (`heif-oxide`) rather than libheif — libheif is LGPL, which the licence policy forbids, and linking C would cost the portability contract. It costs speed: ~9 MP/s on one core, so ~2.5 s for a 24 MP frame against a few hundred ms for JPEG, parallelised across cores at import. **A HEIF frame is published as JPEG**, developed or not (`publish::published_filename`), because Chrome and Firefox cannot display HEIC at all — only Safari can — so a HEIC in the gallery is a broken image for most visitors, and a developed one is JPEG bytes anyway. Converting either way keeps the published name stable across a develop, and the published filename is the URL. WebP needs none of this: it decodes natively and every browser shows it.
 
-**Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), and copying a photo *into* the library on import. `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
+**Nothing ever writes to the original.** The only writes in the core are: the render cache and thumbnails (`.gpp/`), the published tree (`dest_root`), copying a photo *into* the library on import, and XMP sidecars *beside* originals when `export_xmp` is asked for them (never the image file itself). `ensure_rendered` returns the original's own path when the stack is empty — no copy, no cache entry — so an untouched photo costs nothing and a Reset is instant. **A pull adds photos to the library but never overwrites one that is already there**: the sync plan compares the *published* copy against the remote, and the published copy holds developed pixels, so the library original was never part of that comparison. A photo the server disagrees on is reported in `PullOutcome.kept_originals` rather than replaced.
 
 ### Publish and sync are different things
 
@@ -1063,7 +1063,7 @@ const renderedCards = await Promise.all(
 
 **EXIF not visible in fullscreen:** Overlay should be inside PhotoSwipe container (handled automatically)
 
-**Sort not persisting:** Check localStorage for `photoGallery_sortOption` key
+**Sort not persisting:** Check localStorage for the `photo-sort-preference` key (album sort uses `photoGallery_albumSort`)
 
 **/home page not rendering:** Ensure `export const prerender = true` is set in frontmatter
 
@@ -1085,7 +1085,7 @@ const renderedCards = await Promise.all(
 
 **Admin changes not showing in gallery:** Ensure dev server is running (`npm run dev`). Hard refresh browser (Cmd+Shift+R).
 
-**Deploy failing:** Check SSH key access to server. Verify `REMOTE_USER`, `REMOTE_HOST`, `REMOTE_ROOT` in `scripts/deploy.sh`. Ensure PM2 and Node.js are installed on server.
+**Deploy failing:** Check SSH key access to server. Verify `DEPLOY_REMOTE_USER`, `DEPLOY_REMOTE_HOST`, `DEPLOY_REMOTE_ROOT` in `.env` (not in `scripts/deploy.sh` — the script only reads them). Ensure PM2 and Node.js are installed on server.
 
 **403 Forbidden after deploy:** File permissions may be wrong (rsync can set 700). Fix with:
 ```bash

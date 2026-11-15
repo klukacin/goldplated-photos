@@ -6,11 +6,15 @@
 
 use gpp_core::albums::{AlbumUpdate, NewAlbum};
 use gpp_core::develop::{EditOp, EditStack};
+use gpp_core::lightroom::{LrImportOptions, LrImportReport, LrScanReport};
 use gpp_core::model::{Flag, ImportSummary, Photo, PhotoFilter};
 use gpp_core::publish::PublishResult;
+use gpp_core::remote::{ForeignPushOutcome, PullOutcome, PushOutcome, RemoteAlbum};
+use gpp_core::remotes::{RemoteInfo, RemoteUpdate};
 use gpp_core::session::{AlbumSummary, LibraryStatus, PreviewImage, PublishTarget, Session};
-use gpp_core::remote::{PullOutcome, PushOutcome, RemoteAlbum};
-use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan};
+use gpp_core::sources::{SourceInfo, SourceKind};
+use gpp_core::sync::{AlbumSubscription, SyncDirection, SyncOutcome, SyncPlan, SyncScopeKind};
+use gpp_core::xmp::XmpExportOutcome;
 use tauri::{Emitter, Manager, State};
 
 /// Commands return `Result<T, String>`: the webview only needs the message.
@@ -165,6 +169,62 @@ fn cancel_import(state: State<'_, Session>) {
 #[tauri::command]
 fn prune_missing(state: State<'_, Session>) -> CmdResult<usize> {
     state.prune().map_err(to_msg)
+}
+
+// ------------------------------------------------------------------ sources
+
+/// Every root photographs may live under: the library itself, plus any folder
+/// registered since. `online` is probed inside the core on each call, so this
+/// is also the answer to "is that drive plugged in right now".
+#[tauri::command]
+fn list_sources(state: State<'_, Session>) -> CmdResult<Vec<SourceInfo>> {
+    state.sources().map_err(to_msg)
+}
+
+/// Register a folder as a source. Nothing is catalogued by registering; an
+/// import over that folder afterwards takes its photographs in place.
+///
+/// Widening the asset scope is the shell's own business and has to happen here:
+/// the webview loads originals straight off disk, and a source the scope does
+/// not name shows a photographer blank frames with no error anywhere.
+#[tauri::command]
+fn add_source(
+    app: tauri::AppHandle,
+    path: String,
+    name: Option<String>,
+    kind: Option<SourceKind>,
+) -> CmdResult<i64> {
+    let id = app
+        .state::<Session>()
+        .add_source(path, name, kind)
+        .map_err(to_msg)?;
+    allow_reading_library(&app);
+    Ok(id)
+}
+
+/// Forget a source. Never touches a file — `drop_photos` decides only whether
+/// its catalog rows go with it, and the core refuses the removal outright when
+/// it still holds photos and the answer was `false`.
+#[tauri::command]
+fn remove_source(
+    state: State<'_, Session>,
+    id: i64,
+    drop_photos: bool,
+) -> CmdResult<usize> {
+    state.remove_source(id, drop_photos).map_err(to_msg)
+}
+
+/// Point a source at the folder it lives in now. The core re-hashes a handful
+/// of that source's own catalogued files there first and refuses by name if
+/// they are not the same photographs; nothing changes when it does.
+#[tauri::command]
+fn relocate_source(app: tauri::AppHandle, id: i64, new_path: String) -> CmdResult<()> {
+    app.state::<Session>()
+        .relocate_source(id, new_path)
+        .map_err(to_msg)?;
+    // The source now answers with a different root, so the old grant is stale.
+    allow_reading_library(&app);
+    Ok(())
 }
 
 // ------------------------------------------------------------------- photos
@@ -500,6 +560,268 @@ async fn sync_all_tracked(
     .map_err(|e| e.to_string())?
 }
 
+// ---------------------------------------------------------- multiple remotes
+
+/// What the Servers panel shows for one remote. The stored secret never
+/// travels back into the webview — the same rule `has_remote_token` follows —
+/// only whether one is on file.
+#[derive(serde::Serialize)]
+struct RemoteRow {
+    id: i64,
+    name: String,
+    target: String,
+    has_token: bool,
+    is_default: bool,
+}
+
+impl From<RemoteInfo> for RemoteRow {
+    fn from(r: RemoteInfo) -> Self {
+        RemoteRow {
+            id: r.id,
+            name: r.name,
+            target: r.target,
+            has_token: r.token.is_some(),
+            is_default: r.is_default,
+        }
+    }
+}
+
+#[tauri::command]
+fn list_remotes(state: State<'_, Session>) -> CmdResult<Vec<RemoteRow>> {
+    Ok(state
+        .remotes()
+        .map_err(to_msg)?
+        .into_iter()
+        .map(RemoteRow::from)
+        .collect())
+}
+
+#[tauri::command]
+fn add_remote(
+    state: State<'_, Session>,
+    name: String,
+    target: String,
+    token: Option<String>,
+) -> CmdResult<i64> {
+    state.add_remote(name, target, token).map_err(to_msg)
+}
+
+#[tauri::command]
+fn update_remote(state: State<'_, Session>, id: i64, update: RemoteUpdate) -> CmdResult<()> {
+    state.update_remote(id, update).map_err(to_msg)
+}
+
+/// Drops this library's subscriptions and baselines for the remote — locally.
+/// Nothing on the server it pointed at is ever touched. The UI asks first.
+#[tauri::command]
+fn remove_remote(state: State<'_, Session>, id: i64) -> CmdResult<()> {
+    state.remove_remote(id).map_err(to_msg)
+}
+
+#[tauri::command]
+fn set_default_remote(state: State<'_, Session>, id: i64) -> CmdResult<()> {
+    state.set_default_remote(id).map_err(to_msg)
+}
+
+/// Remotes of a library that is *not* open here — the cross-library push
+/// destinations. Unlike [`list_remotes`], the tokens ride along: the whole
+/// point of listing a foreign library's remotes is to build the target/token
+/// spec `push_album_to` takes, and that library's catalog is where the
+/// credentials live.
+#[tauri::command]
+fn read_library_remotes(
+    state: State<'_, Session>,
+    library_root: String,
+) -> CmdResult<Vec<RemoteInfo>> {
+    state.read_library_remotes(library_root).map_err(to_msg)
+}
+
+// ---------------------------------------------------- per-remote sync calls
+
+#[tauri::command]
+fn remote_albums_on(
+    state: State<'_, Session>,
+    remote_id: Option<i64>,
+) -> CmdResult<Vec<RemoteAlbum>> {
+    state.remote_albums_on(remote_id).map_err(to_msg)
+}
+
+#[tauri::command]
+fn album_subscriptions_on(
+    state: State<'_, Session>,
+    remote_id: Option<i64>,
+) -> CmdResult<Vec<AlbumSubscription>> {
+    state.album_subscriptions_on(remote_id).map_err(to_msg)
+}
+
+#[tauri::command]
+fn track_album_on(
+    state: State<'_, Session>,
+    path: String,
+    direction: SyncDirection,
+    scope: Option<SyncScopeKind>,
+    remote_id: Option<i64>,
+) -> CmdResult<()> {
+    state
+        .track_album_on(path, direction, scope, remote_id)
+        .map_err(to_msg)
+}
+
+#[tauri::command]
+fn untrack_album_on(
+    state: State<'_, Session>,
+    path: String,
+    remote_id: Option<i64>,
+) -> CmdResult<()> {
+    state.untrack_album_on(path, remote_id).map_err(to_msg)
+}
+
+#[tauri::command]
+async fn pull_album_on(
+    app: tauri::AppHandle,
+    path: String,
+    remote_id: Option<i64>,
+) -> CmdResult<PullOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .pull_album_on(path, remote_id)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn push_album_on(
+    app: tauri::AppHandle,
+    path: String,
+    allow_deletes: bool,
+    remote_id: Option<i64>,
+) -> CmdResult<PushOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .push_album_on(path, allow_deletes, remote_id)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sync_album_on(
+    app: tauri::AppHandle,
+    path: String,
+    direction: SyncDirection,
+    allow_deletes: bool,
+    remote_id: Option<i64>,
+) -> CmdResult<SyncOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .sync_album_on(path, direction, allow_deletes, remote_id)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sync_all_tracked_on(
+    app: tauri::AppHandle,
+    allow_deletes: bool,
+    remote_id: Option<i64>,
+) -> CmdResult<Vec<(String, SyncOutcome)>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .sync_all_tracked_on(allow_deletes, remote_id)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stateless push to a remote this library holds no row for — typically one
+/// read out of another library via `read_library_remotes`. Never deletes.
+#[tauri::command]
+async fn push_album_to(
+    app: tauri::AppHandle,
+    path: String,
+    target: String,
+    token: Option<String>,
+    scope: Option<SyncScopeKind>,
+) -> CmdResult<ForeignPushOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>()
+            .push_album_to(path, target, token, scope)
+            .map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------- lightroom
+
+/// Read-only look inside a `.lrcat`. Off the UI thread: the catalog is copied
+/// and walked, which on a big library is seconds, not milliseconds.
+#[tauri::command]
+async fn lr_scan(app: tauri::AppHandle, lrcat_path: String) -> CmdResult<LrScanReport> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().lr_scan(lrcat_path).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Import (or, with `dry_run`, forecast) a Lightroom catalog. Progress rides
+/// the same `import-progress` event an ordinary import emits, and the same
+/// `cancel_import` stops it.
+#[tauri::command]
+async fn lr_import(
+    app: tauri::AppHandle,
+    lrcat_path: String,
+    options: LrImportOptions,
+) -> CmdResult<LrImportReport> {
+    let report = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || {
+            let state = app.state::<Session>();
+            let emitter = app.clone();
+            state
+                .lr_import(
+                    lrcat_path,
+                    options,
+                    Some(&move |p| {
+                        let _ = emitter.emit("import-progress", p);
+                    }),
+                )
+                .map_err(to_msg)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // A root imported by reference is registered as a source by the run
+    // itself, so the asset scope has to catch up the same way `add_source`
+    // makes it — otherwise those originals are outside everything the webview
+    // may read, and nothing says so.
+    if !report.sources_registered.is_empty() {
+        allow_reading_library(&app);
+    }
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------- xmp
+
+/// Write XMP sidecars for one album, or the whole catalog when `album` is
+/// absent. Never touches an image file; never overwrites a foreign sidecar.
+#[tauri::command]
+async fn export_xmp(app: tauri::AppHandle, album: Option<String>) -> CmdResult<XmpExportOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Session>().export_xmp(album).map_err(to_msg)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Library path passed on the command line: `gpp-desktop ~/Photos`.
 ///
 /// Lets the app be launched straight into a library — from a shell, a shortcut,
@@ -549,6 +871,10 @@ pub fn run() {
             import_photos,
             cancel_import,
             prune_missing,
+            list_sources,
+            add_source,
+            remove_source,
+            relocate_source,
             list_photos,
             photo_path,
             thumbnail_path,
@@ -593,6 +919,24 @@ pub fn run() {
             push_album,
             sync_album,
             sync_all_tracked,
+            list_remotes,
+            add_remote,
+            update_remote,
+            remove_remote,
+            set_default_remote,
+            read_library_remotes,
+            remote_albums_on,
+            album_subscriptions_on,
+            track_album_on,
+            untrack_album_on,
+            pull_album_on,
+            push_album_on,
+            sync_album_on,
+            sync_all_tracked_on,
+            push_album_to,
+            lr_scan,
+            lr_import,
+            export_xmp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Goldplated Photos");

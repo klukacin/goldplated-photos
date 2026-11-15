@@ -707,8 +707,8 @@ function getVideoMimeType(filename: string): string {
     }
 
     .photo-grid-masonry {
-      column-count: 2;
-      column-gap: 0.5rem;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.5rem;
     }
 
     .photo-item {
@@ -1424,7 +1424,13 @@ function getVideoMimeType(filename: string): string {
 
   // Gallery navigation state
   let currentFocusedIndex = -1; // Start at -1 so first arrow press focuses first photo
-  const photoItems = document.querySelectorAll('.photo-item');
+  // Canonical index space for grid navigation: `.photo-item` elements (photos
+  // AND videos) in their CURRENT DOM order. Sorting reorders the DOM nodes, so
+  // always re-query at use time instead of holding a NodeList from load.
+  const getPhotoItems = (): HTMLElement[] =>
+    Array.from(document.querySelectorAll<HTMLElement>('#photo-gallery .photo-item'));
+  // Static list of photo links (excludes videos) — used only to ATTACH
+  // listeners once; indexes into it are never mixed with photo-item indexes.
   const photoLinks = document.querySelectorAll('.photo-link');
 
   // Slideshow state
@@ -1924,6 +1930,7 @@ function getVideoMimeType(filename: string): string {
 
   // Helper function to update visual focus
   function updateVisualFocus(index: number) {
+    const photoItems = getPhotoItems();
     // Remove keyboard-focused class from all items
     photoItems.forEach(item => item.classList.remove('keyboard-focused'));
 
@@ -1931,6 +1938,13 @@ function getVideoMimeType(filename: string): string {
     if (index >= 0 && index < photoItems.length) {
       photoItems[index].classList.add('keyboard-focused');
     }
+  }
+
+  // Map a PhotoSwipe slide back to its grid item (photo-item index space).
+  // pswp indexes count only non-video slides, so positions cannot be reused —
+  // match by the slide's source element instead.
+  function photoItemForSlideElement(element: Element | null | undefined): HTMLElement | null {
+    return (element?.closest('.photo-item') as HTMLElement | null) || null;
   }
 
   // Initialize PhotoSwipe lightbox (exclude videos - they use video modal)
@@ -1980,8 +1994,9 @@ function getVideoMimeType(filename: string): string {
     }
   });
 
-  // Track last viewed photo index
-  let lastViewedPhotoIndex = 0;
+  // Track last viewed photo (the grid element, not an index — indexes go
+  // stale when sorting reorders the DOM)
+  let lastViewedItem: HTMLElement | null = null;
 
   // Handle keyboard shortcuts in lightbox
   lightbox.on('uiRegister', function() {
@@ -2236,8 +2251,10 @@ function getVideoMimeType(filename: string): string {
       }
     });
 
-    // Custom keyboard handler that runs before PhotoSwipe's handler
-    document.addEventListener('keydown', (event) => {
+    // Custom keyboard handler that runs before PhotoSwipe's handler.
+    // Named so it can be removed on destroy — uiRegister runs on EVERY open,
+    // and without removal the handlers pile up across open/close cycles.
+    const lightboxKeydownHandler = (event: KeyboardEvent) => {
       // Only handle when lightbox is open
       if (!pswp || !document.querySelector('.pswp--open')) {
         return;
@@ -2345,7 +2362,8 @@ function getVideoMimeType(filename: string): string {
           }
         }
       }
-    }, true); // Use capture phase to run before PhotoSwipe's handlers
+    }; // Use capture phase to run before PhotoSwipe's handlers
+    document.addEventListener('keydown', lightboxKeydownHandler, true);
 
     // Note: We always use large thumbnails (1920px) for correct EXIF orientation
     // Original images may have wrong orientation as browsers don't consistently respect EXIF metadata
@@ -2378,27 +2396,34 @@ function getVideoMimeType(filename: string): string {
       }
     }, { passive: true });
 
+    // Sync grid state (last viewed + visual focus) to the current slide by
+    // mapping the slide's element back to its photo-item — pswp.currIndex
+    // counts only non-video slides and cannot be used as a grid index.
+    function syncGridToCurrentSlide() {
+      const item = photoItemForSlideElement(pswp?.currSlide?.data?.element);
+      if (!item) return;
+      lastViewedItem = item;
+      currentFocusedIndex = getPhotoItems().indexOf(item);
+      updateVisualFocus(currentFocusedIndex);
+    }
+
     // Update current photo on slide change
     pswp.on('change', () => {
       const currentItem = pswp.currSlide;
       if (currentItem && currentItem.data && currentItem.data.element) {
         currentPhotoUrl = currentItem.data.element.getAttribute('data-photo-url') || '';
-        lastViewedPhotoIndex = pswp.currIndex;
 
         // Update visual focus in grid to match current lightbox image
-        currentFocusedIndex = pswp.currIndex;
-        updateVisualFocus(currentFocusedIndex);
+        syncGridToCurrentSlide();
 
         // Update custom UI
         updateCustomUI();
       }
     });
 
-    // Store initial index when opening and update visual focus
+    // Store initial photo when opening and update visual focus
     pswp.on('afterInit', () => {
-      lastViewedPhotoIndex = pswp.currIndex;
-      currentFocusedIndex = pswp.currIndex;
-      updateVisualFocus(currentFocusedIndex);
+      syncGridToCurrentSlide();
 
       // Initialize custom UI
       updateCustomUI();
@@ -2413,16 +2438,26 @@ function getVideoMimeType(filename: string): string {
     // Scroll to last viewed photo when closing and reset state
     pswp.on('destroy', () => {
       stopSlideshow();
+      // This open's keyboard handler dies with this pswp instance
+      document.removeEventListener('keydown', lightboxKeydownHandler, true);
       // Reset custom UI state
       isOriginalMode = false;
       isZenMode = false;
       isHelpVisible = false;
 
-      const photoItems = document.querySelectorAll('.photo-item');
-      if (photoItems[lastViewedPhotoIndex]) {
+      // PhotoSwipe removes its root element from the DOM on destroy — rescue
+      // the EXIF overlay (moved into it in uiRegister) back to the body so
+      // grid-level info and the next lightbox open keep working.
+      if (exifOverlay) {
+        exifOverlay.classList.remove('active');
+        document.body.appendChild(exifOverlay);
+      }
+
+      const itemToScroll = lastViewedItem;
+      if (itemToScroll && itemToScroll.isConnected) {
         // Slight delay to ensure lightbox is fully closed
         setTimeout(() => {
-          photoItems[lastViewedPhotoIndex].scrollIntoView({
+          itemToScroll.scrollIntoView({
             behavior: 'smooth',
             block: 'center'
           });
@@ -2443,13 +2478,18 @@ function getVideoMimeType(filename: string): string {
   // EXIF overlay handling
   const exifOverlay = document.getElementById('exif-overlay');
   const exifOverlayClose = document.querySelector('.exif-overlay-close');
-  const exifOverlayData = document.getElementById('exif-overlay-data');
 
   // Show info overlay (EXIF for photos, video info for videos)
   async function showInfoOverlay(url: string, isVideo: boolean = false) {
     if (!url) {
       return;
     }
+
+    // Re-lookup at call time — the overlay element moves between document.body
+    // and the PhotoSwipe container across lightbox opens, so references
+    // captured at load can go stale.
+    const exifOverlay = document.getElementById('exif-overlay');
+    const exifOverlayData = document.getElementById('exif-overlay-data');
 
     // Update overlay header
     const overlayHeader = document.querySelector('.exif-overlay-header h3');
@@ -2620,7 +2660,7 @@ function getVideoMimeType(filename: string): string {
 
   // Gallery keyboard navigation (when not in lightbox)
   // Add tabindex to make photos focusable
-  photoLinks.forEach((link, index) => {
+  photoLinks.forEach((link) => {
     (link as HTMLElement).setAttribute('tabindex', '0');
   });
 
@@ -2643,38 +2683,20 @@ function getVideoMimeType(filename: string): string {
   `;
   document.head.appendChild(style);
 
-  // Track focus changes
-  photoLinks.forEach((link, index) => {
+  // Track focus changes — index into the photo-item space, not the
+  // photo-link space (they diverge in albums containing videos)
+  photoLinks.forEach((link) => {
     link.addEventListener('focus', () => {
-      currentFocusedIndex = index;
+      const item = link.closest('.photo-item') as HTMLElement | null;
+      if (item) currentFocusedIndex = getPhotoItems().indexOf(item);
     });
   });
-
-  // Calculate grid layout for navigation
-  function getGridLayout() {
-    const gallery = document.getElementById('photo-gallery');
-    const isMasonry = gallery?.classList.contains('photo-grid-masonry');
-    const isGrid = gallery?.classList.contains('photo-grid-grid');
-
-    // Determine columns based on layout and screen size
-    let columns = 1;
-    if (isMasonry || isGrid) {
-      if (window.innerWidth > 768) {
-        columns = 3;
-      } else {
-        columns = 2;
-      }
-    }
-
-    const rows = Math.ceil(photoItems.length / columns);
-    return { columns, rows };
-  }
 
   // Get actual positions of photos based on their rendered location
   function getPhotoPositions() {
     const positions: Array<{index: number, x: number, y: number, rect: DOMRect}> = [];
 
-    photoItems.forEach((item, index) => {
+    getPhotoItems().forEach((item, index) => {
       const rect = item.getBoundingClientRect();
       positions.push({
         index,
@@ -2838,7 +2860,8 @@ function getVideoMimeType(filename: string): string {
       return;
     }
 
-    const totalPhotos = photoLinks.length;
+    const photoItems = getPhotoItems();
+    const totalPhotos = photoItems.length;
     let handled = false;
 
     switch(e.key) {
@@ -2887,8 +2910,10 @@ function getVideoMimeType(filename: string): string {
       case 'Enter':
         if (currentFocusedIndex >= 0) {
           e.preventDefault();
-          // Open the currently focused photo in lightbox
-          const focusedLink = photoLinks[currentFocusedIndex] as HTMLElement;
+          // Open the currently focused photo in lightbox — query the link
+          // INSIDE the focused item (videos have no .photo-link, so indexing
+          // a separate link array would open the wrong photo)
+          const focusedLink = photoItems[currentFocusedIndex]?.querySelector('.photo-link') as HTMLElement | null;
           if (focusedLink) {
             focusedLink.click();
           }

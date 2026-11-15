@@ -21,9 +21,16 @@ interface Props {
   parentToken?: string;
   isParentProtected?: boolean;
   hasParentAccess?: boolean;
+  /**
+   * Emit the share modal/toast markup. A page rendering SEVERAL AlbumGrids
+   * (e.g. /photos with its Public and Locked grids) must pass false on all
+   * but one instance — the modal carries fixed ids, and duplicates would
+   * leave the script wired to whichever copy came first.
+   */
+  showShareModal?: boolean;
 }
 
-const { albums, parentPath, parentToken, isParentProtected = false, hasParentAccess = true } = Astro.props;
+const { albums, parentPath, parentToken, isParentProtected = false, hasParentAccess = true, showShareModal = true } = Astro.props;
 const siteUrl = siteConfig.url;
 
 // Cache version - increment to bust browser cache after thumbnail changes
@@ -70,7 +77,7 @@ function formatCroatianDate(date: Date): string {
         data-protected={isProtected ? "true" : undefined}
         data-title={displayTitle}
         data-date={album.data.date ? new Date(album.data.date).getTime().toString() : ""}
-        data-order={album.data.order?.toString() ?? "999"}
+        data-order={album.data.order?.toString()}
         data-search={`${displayTitle} ${album.data.description || ''} ${(album.data.tags || []).join(' ')}`.toLowerCase()}
       >
         <div class="album-thumbnail">
@@ -130,7 +137,9 @@ function formatCroatianDate(date: Date): string {
   })}
 </div>
 
-<!-- Share Modal -->
+<!-- Share Modal + toast (single instance per page; see showShareModal) -->
+{showShareModal && (
+<Fragment>
 <div id="album-share-modal" class="share-modal-overlay" data-site-url={siteUrl}>
   <div class="share-modal">
     <div class="share-modal-header">
@@ -185,10 +194,11 @@ function formatCroatianDate(date: Date): string {
   </div>
 </div>
 
-<!-- Toast notification -->
 <div id="album-share-toast" class="album-share-toast" aria-live="polite">
   Link copied to clipboard
 </div>
+</Fragment>
+)}
 
 <style>
   .album-grid {
@@ -579,6 +589,12 @@ function formatCroatianDate(date: Date): string {
 <script>
   document.addEventListener('DOMContentLoaded', () => {
     const modal = document.getElementById('album-share-modal') as HTMLElement;
+    const toastEl = document.getElementById('album-share-toast');
+    // Hoist the modal and toast to <body> — they render inside a grid
+    // container, and on pages that toggle grid containers (display: none)
+    // a fixed-position overlay inside a hidden ancestor can never show.
+    if (modal && modal.parentElement !== document.body) document.body.appendChild(modal);
+    if (toastEl && toastEl.parentElement !== document.body) document.body.appendChild(toastEl);
     const closeBtn = modal?.querySelector('.share-modal-close');
     const warning = document.getElementById('album-share-warning');
     const nameDisplay = document.getElementById('album-share-name');

@@ -121,6 +121,81 @@ html.mac.fullscreen .titlebar { padding-left: 1rem; }
 .titlebar-title { font-weight: 600; }
 .titlebar-actions { margin-left: auto; display: flex; gap: 0.5rem; }
 
+/* -------------------------------------------------------- library switcher */
+
+.library-switcher { position: relative; }
+.library-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: none;
+  border: none;
+  padding: 0.25rem 0.45rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.library-btn:hover { background: #2c2c34; }
+.library-btn .caret { color: var(--text-dim); font-size: 0.7em; }
+.library-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60; /* over the app chrome; the modals (z-index 100) stay above */
+  min-width: 280px;
+  max-width: 420px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 0.3rem;
+}
+.library-row { display: flex; align-items: center; gap: 0.2rem; }
+.library-pick {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.library-pick:hover { background: #2c2c34; }
+.library-pick .muted {
+  font-size: 0.78em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.library-row.current .library-pick strong::after { content: " ✓"; color: var(--accent); }
+.library-forget {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-sm);
+  font-size: 1.05em;
+}
+.library-forget:hover { color: var(--danger); background: rgba(229, 72, 77, 0.12); }
+.library-open-other {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  margin-top: 0.3rem;
+  padding: 0.5rem;
+  cursor: pointer;
+}
+.library-open-other:hover { background: #2c2c34; }
+
 .body { flex: 1; display: flex; min-height: 0; }
 
 /* ---------------------------------------------------------------- sidebar */
@@ -444,6 +519,10 @@ kbd {
 /* A file the decoder could not read. The cell keeps its place in the grid —
    the file is real and still in the catalog — but says so plainly. */
 .cell.undecodable { border-color: var(--border); }
+/* Same shape, different diagnosis: nothing is wrong with this photograph, its
+   drive is simply not attached. Dashed rather than solid so the two do not
+   read as the same trouble at a glance. */
+.cell.offline { border-color: var(--border); border-style: dashed; }
 .cell-note {
   width: 100%;
   aspect-ratio: 1;
@@ -695,6 +774,96 @@ kbd {
   padding: 0.1rem 0.35rem;
   font-weight: 600;
 }
+
+/* ---------------------------------------------------------------- servers */
+
+.servers-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+.servers-header h3, .modal-card h3 {
+  margin: 0.4rem 0;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.servers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.9rem;
+}
+
+/* ---------------------------------------------------------------- sources */
+
+/* Whether a source's root is readable right now. Probed per listing, never
+   cached — an unplugged drive is the whole question this answers, so it is
+   spelled out in words as well as colour. */
+.source-state {
+  font-size: 0.7rem;
+  white-space: nowrap;
+  color: var(--text-dim);
+  margin-left: 0.35rem;
+}
+.source-state.online { color: #6fbf73; }
+/* The kind picker sits beside the Add button, not in a form column: at the
+   global 100% it squeezed "+ Add source…" onto two lines. */
+.servers-header select { width: auto; }
+.servers-header .btn { white-space: nowrap; }
+
+/* Per-server tracking chips on an album row: name, direction glyph, scope. */
+.sync-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
+.sync-chip {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sync-chip:hover { border-color: var(--accent); }
+.sync-chip.add { color: var(--text-dim); }
+.sync-chip.add:hover { color: var(--text); }
+
+/* The direction/scope popover. Above the modals (z-index 100): it is opened
+   from inside one and has to float over its card. */
+.chip-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 230px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 0.5rem;
+}
+.chip-menu-head {
+  margin-bottom: 0.4rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-menu-row { display: flex; gap: 2px; margin-top: 0.3rem; flex-wrap: wrap; }
+
+/* Wide rows in the sync modal can carry chips plus several buttons. */
+.remote-row { flex-wrap: wrap; }
+
+/* -------------------------------------------------------- lightroom wizard */
+
+.lr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-bottom: 0.75rem;
+}
+.lr-coll { font-size: 0.85rem; }
+.lr-coll .muted { font-size: 0.78em; }
 
 /* ---------------------------------------------------------------- develop */
 

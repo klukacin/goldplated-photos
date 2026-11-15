@@ -12,7 +12,11 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::error::{Error, Result};
 use crate::model::{Album, Flag, Photo, PhotoFilter, PhotoKind, PhotoSort};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 6;
+
+/// The schema version, visible to the crate — `remotes::read_library_remotes`
+/// refuses a foreign catalog from a newer build by name, same as [`migrate`].
+pub(crate) const SCHEMA_VERSION_PUBLIC: i64 = SCHEMA_VERSION;
 
 /// Directory (relative to the library root) holding all derived data.
 pub const GPP_DIR: &str = ".gpp";
@@ -30,9 +34,20 @@ impl Library {
         let gpp = root.join(GPP_DIR);
         std::fs::create_dir_all(&gpp).map_err(|e| Error::io(&gpp, e))?;
 
+        // One spelling of the root, decided once. Import both builds
+        // destinations under a canonicalized root (`bring_inside`) and strips
+        // the stored root off scanned paths — with two spellings in play, a
+        // root reached through a symlink (`/var`, `/tmp` on macOS) copied a
+        // whole card in and then catalogued none of it, failing with
+        // InvalidPath. The rel_paths in the catalog are unaffected: they are
+        // relative, and both spellings name the same files.
+        let root = root.canonicalize().unwrap_or(root);
+
         let conn = Connection::open(gpp.join("catalog.db"))?;
         Self::configure(&conn)?;
-        migrate(&conn)?;
+        migrate(&conn, &root)?;
+        ensure_library_id(&conn)?;
+        refresh_primary_source(&conn, &root)?;
 
         Ok(Self {
             root,
@@ -42,13 +57,26 @@ impl Library {
 
     /// Open an in-memory catalog rooted at `root` — used by tests.
     pub fn open_in_memory(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
-        migrate(&conn)?;
+        migrate(&conn, &root)?;
+        ensure_library_id(&conn)?;
+        refresh_primary_source(&conn, &root)?;
         Ok(Self {
-            root: root.as_ref().to_path_buf(),
+            root,
             conn: Mutex::new(conn),
         })
+    }
+
+    /// This library's stable identity: 16 random bytes, hex, generated once at
+    /// the first open on a v5 catalog and never changed. Outcomes and manifests
+    /// carry it so an aggregator (the future master catalog) can attribute
+    /// state to a library without guessing from paths.
+    pub fn library_id(&self) -> Result<String> {
+        Ok(self
+            .get_setting(SETTING_LIBRARY_ID)?
+            .unwrap_or_default())
     }
 
     fn configure(conn: &Connection) -> Result<()> {
@@ -85,26 +113,45 @@ impl Library {
         self.gpp_dir().join("thumbs")
     }
 
-    /// Resolve a library-relative path, refusing anything that escapes the root.
+    /// Resolve a path relative to the **primary** source — the library root.
+    ///
+    /// This is where albums live: a pulled album's folder, a copy-in
+    /// destination, anything the library itself lays out. A *photo* is not
+    /// necessarily here — since schema v6 a catalog row carries the source it
+    /// belongs to — so resolve one with [`photo_path`](Self::photo_path)
+    /// rather than by handing its `rel_path` to this.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf> {
-        if rel.is_empty() {
-            return Ok(self.root.clone());
+        resolve_under(&self.root, rel)
+    }
+
+    /// Resolve a path relative to one registered source.
+    ///
+    /// Pure path arithmetic plus the same escape refusal `resolve` applies —
+    /// a `rel_path` may not climb out of *its own* source — and it answers
+    /// whether the source is plugged in or not, because a path is still a
+    /// path. Use [`photo_path`](Self::photo_path) when the answer is going to
+    /// be opened.
+    pub fn resolve_in_source(&self, source_id: i64, rel: &str) -> Result<PathBuf> {
+        resolve_under(&self.source_root(source_id)?, rel)
+    }
+
+    /// Absolute path of one catalogued photo, through the source it belongs to.
+    ///
+    /// **The single accessor**: every part of the app that opens, copies,
+    /// renders or publishes a photograph goes through this, so a referenced
+    /// file on an external drive is reached exactly the way a file under the
+    /// library root is. A source that is not currently reachable fails with
+    /// [`Error::SourceOffline`] rather than handing back a path that is
+    /// missing for a reason nobody can see.
+    pub fn photo_path(&self, photo: &Photo) -> Result<PathBuf> {
+        let source = self.source_row(photo.source_id)?;
+        if !source.is_online() {
+            return Err(Error::SourceOffline {
+                name: source.name,
+                path: source.path.display().to_string(),
+            });
         }
-        if rel.contains('\0') || rel.starts_with('/') || rel.starts_with('\\') {
-            return Err(Error::InvalidPath(rel.to_string()));
-        }
-        let mut out = self.root.clone();
-        for segment in rel.split('/') {
-            match segment {
-                "" | "." => continue,
-                ".." => return Err(Error::InvalidPath(rel.to_string())),
-                s => out.push(s),
-            }
-        }
-        if !out.starts_with(&self.root) {
-            return Err(Error::InvalidPath(rel.to_string()));
-        }
-        Ok(out)
+        resolve_under(&source.path, &photo.rel_path)
     }
 
     /// Run a closure with the connection. Kept crate-visible so other modules
@@ -158,19 +205,37 @@ impl Library {
         })
     }
 
-    /// Look a photo up by its library-relative path. `Ok(None)` is an answer,
-    /// not a failure: this is how callers ask whether the library knows a file
-    /// at all.
+    /// Look a photo up by its path under the **primary** source — the library
+    /// root. `Ok(None)` is an answer, not a failure: this is how callers ask
+    /// whether the library knows a file at all.
     ///
     /// The path must be exactly as stored — '/'-separated, relative to the root,
     /// no normalisation is done here — so a Windows caller holding a `\`-path has
     /// to convert before asking or it will be told, wrongly, that the photograph
     /// is not in the library.
+    ///
+    /// Scoped to the primary because that is what every caller means: a pulled
+    /// album's folder, an album directory, a file this machine laid down. The
+    /// same relative path may name a different photograph under another source,
+    /// so ask for that one with
+    /// [`photo_by_source_rel_path`](Self::photo_by_source_rel_path).
     pub fn photo_by_rel_path(&self, rel_path: &str) -> Result<Option<Photo>> {
+        self.photo_by_source_rel_path(self.primary_source_id()?, rel_path)
+    }
+
+    /// Look a photo up by source and path — the general form of
+    /// [`photo_by_rel_path`](Self::photo_by_rel_path).
+    pub fn photo_by_source_rel_path(
+        &self,
+        source_id: i64,
+        rel_path: &str,
+    ) -> Result<Option<Photo>> {
         self.with_conn(|c| {
             Ok(c.query_row(
-                &format!("SELECT {PHOTO_COLS} FROM photos WHERE rel_path = ?1"),
-                params![rel_path],
+                &format!(
+                    "SELECT {PHOTO_COLS} FROM photos WHERE source_id = ?1 AND rel_path = ?2"
+                ),
+                params![source_id, rel_path],
                 photo_from_row,
             )
             .optional()?)
@@ -191,6 +256,16 @@ impl Library {
             );
             wheres.push("a.path = ?".into());
             args.push(Box::new(album.clone()));
+        }
+        if let Some(tag) = &filter.tag {
+            // A subquery rather than a join: joining `photo_tags` would also
+            // multiply rows for a photo carrying several tags.
+            wheres.push(
+                "p.id IN (SELECT pt.photo_id FROM photo_tags pt \
+                 JOIN tags t ON t.id = pt.tag_id WHERE t.name = ?)"
+                    .into(),
+            );
+            args.push(Box::new(tag.clone()));
         }
         if let Some(min) = filter.min_rating {
             wheres.push("p.rating >= ?".into());
@@ -356,10 +431,19 @@ impl Library {
     }
 
     /// Remove catalog entries whose files no longer exist on disk.
+    ///
+    /// **An offline source is not a missing file.** A photo on an external
+    /// drive that is not plugged in is exactly as present as it was yesterday;
+    /// pruning it would throw away its rating, its flags, its album
+    /// memberships and its develop stack because a cable was loose. So only
+    /// sources that are reachable right now are examined, and a row whose
+    /// source cannot be identified at all is left alone too — this deletes,
+    /// and a delete needs a reason it is sure of.
     pub fn prune_missing(&self) -> Result<usize> {
-        let all: Vec<(i64, String)> = self.with_conn(|c| {
-            let mut stmt = c.prepare("SELECT id, rel_path FROM photos")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let roots = self.source_roots()?;
+        let all: Vec<(i64, i64, String)> = self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT id, source_id, rel_path FROM photos")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -369,11 +453,19 @@ impl Library {
 
         let missing: Vec<i64> = all
             .into_iter()
-            .filter(|(_, rel)| match self.resolve(rel) {
-                Ok(abs) => !abs.exists(),
-                Err(_) => true,
+            .filter(|(_, source_id, rel)| {
+                let Some(root) = roots.get(source_id) else {
+                    return false; // unknown source: not our row to delete
+                };
+                if !root.is_dir() {
+                    return false; // offline: absent from this machine, not gone
+                }
+                match resolve_under(root, rel) {
+                    Ok(abs) => !abs.exists(),
+                    Err(_) => true,
+                }
             })
-            .map(|(id, _)| id)
+            .map(|(id, _, _)| id)
             .collect();
 
         if missing.is_empty() {
@@ -443,6 +535,33 @@ impl Library {
     }
 }
 
+/// Join `rel` onto `root`, refusing anything that escapes it.
+///
+/// The refusal is the security boundary: `..`, an absolute path, a NUL or a
+/// backslash never become a file operation, whichever root they were offered
+/// against. Extracted from `Library::resolve` when sources arrived, so that
+/// every source enforces the same rule rather than only the library root.
+pub(crate) fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    if rel.contains('\0') || rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(Error::InvalidPath(rel.to_string()));
+    }
+    let mut out = root.to_path_buf();
+    for segment in rel.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return Err(Error::InvalidPath(rel.to_string())),
+            s => out.push(s),
+        }
+    }
+    if !out.starts_with(root) {
+        return Err(Error::InvalidPath(rel.to_string()));
+    }
+    Ok(out)
+}
+
 /// Quote the LIKE wildcards out of a free-text search term.
 ///
 /// `_` matches any single character and `%` any run of them, and `_` is in the
@@ -464,7 +583,23 @@ fn like_literal(text: &str) -> String {
 
 // -------------------------------------------------------------------- schema
 
-fn migrate(conn: &Connection) -> Result<()> {
+fn migrate(conn: &Connection, root: &Path) -> Result<()> {
+    // Foreign keys off for the duration, and only for it.
+    //
+    // v6 rebuilds `photos` — the one table half the schema points at — and
+    // with foreign keys on, `DROP TABLE photos` runs an implicit DELETE that
+    // cascades every album membership and every edit stack into oblivion
+    // before the new table is renamed into place. The pragma is a no-op inside
+    // a transaction, so it is set around the whole thing here and restored
+    // before anything else can touch the catalog. This is SQLite's own
+    // documented procedure for altering a referenced table.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = migrate_inner(conn, root);
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result
+}
+
+fn migrate_inner(conn: &Connection, root: &Path) -> Result<()> {
     // One transaction for the whole thing. SQLite makes DDL transactional, so a
     // catalog either arrives at the new schema or stays exactly where it was.
     // Run step by step in autocommit — which is what this did — a laptop closed
@@ -486,6 +621,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V1)?;
             tx.execute_batch(SCHEMA_V2)?;
             tx.execute_batch(SCHEMA_V3)?;
+            tx.execute_batch(SCHEMA_V4)?;
+            apply_v5(&tx)?;
+            apply_v6(&tx, root)?;
             tx.execute(
                 "INSERT INTO schema_version(version) VALUES(?1)",
                 params![SCHEMA_VERSION],
@@ -512,6 +650,15 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
             if v < 3 {
                 tx.execute_batch(SCHEMA_V3)?;
+            }
+            if v < 4 {
+                tx.execute_batch(SCHEMA_V4)?;
+            }
+            if v < 5 {
+                apply_v5(&tx)?;
+            }
+            if v < 6 {
+                apply_v6(&tx, root)?;
             }
             if v < SCHEMA_VERSION {
                 tx.execute(
@@ -656,11 +803,434 @@ CREATE TABLE IF NOT EXISTS published_files (
 );
 "#;
 
-// ------------------------------------------------------------------ row glue
+/// v4 — provenance links for Lightroom Classic imports.
+///
+/// `lrcat_id` is a stable identifier of the *source catalog* (an id read from
+/// the lrcat when it offers one, else the blake3 of its canonicalized path),
+/// so two different catalogs can both be imported into one library without
+/// their image ids colliding. A link is what makes re-running an import a sync
+/// instead of a duplication: an LR image or collection that is already linked
+/// is updated in place rather than imported again.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS lr_links (
+  lrcat_id TEXT    NOT NULL,
+  lr_image INTEGER NOT NULL,
+  photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+  PRIMARY KEY (lrcat_id, lr_image)
+);
+CREATE INDEX IF NOT EXISTS idx_lr_links_photo ON lr_links(photo_id);
 
-const PHOTO_COLS: &str = "id, rel_path, filename, content_hash, file_size, mtime_ms, kind, \
+CREATE TABLE IF NOT EXISTS lr_album_links (
+  lrcat_id      TEXT    NOT NULL,
+  lr_collection INTEGER NOT NULL,
+  album_path    TEXT    NOT NULL,
+  PRIMARY KEY (lrcat_id, lr_collection)
+);
+"#;
+
+/// v5 — multiple remotes and publish targets.
+///
+/// `remotes` and `publish_targets` are new; `album_sync`, `sync_state` and
+/// `published_files` are *rebuilt* so their primary keys carry the remote or
+/// target they belong to — per-(album, remote) state is what makes a second
+/// remote possible at all, and what a future master catalog reads.
+///
+/// The data migration ([`apply_v5`]) folds today's single remote
+/// (`remote.dir` / `remote.token` settings) into remotes row #1 named "Main",
+/// and `publish.dest` / `publish.min_rating` into publish_targets row #1, then
+/// re-keys every existing subscription, baseline and publish record to those
+/// ids. A library that never configured a remote gets empty tables, and the
+/// first remote added becomes the default.
+const SCHEMA_V5_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS remotes (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  target     TEXT NOT NULL,      -- folder path, or http(s) URL of a sync API
+  token      TEXT,               -- bearer secret for an HTTP target
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS publish_targets (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  dest_root  TEXT NOT NULL,      -- the gallery's src/content/albums
+  min_rating INTEGER
+);
+"#;
+
+/// Does `table` have a column called `column`? The v5 rebuilds are guarded by
+/// this so the migration is idempotent: a catalog wedged half-way by the old
+/// non-atomic migrator is carried across rather than left unopenable.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn v5_has_rows(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
+fn v5_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+        .optional()?
+        .filter(|v: &String| !v.is_empty()))
+}
+
+/// The v5 migration: create the new tables, then rebuild the three per-remote
+/// tables around them, folding the single configured remote/destination into
+/// row #1 of each. Runs inside the caller's transaction.
+fn apply_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_V5_TABLES)?;
+
+    // --- album_sync + sync_state: keyed by remote --------------------------
+    let old_album_sync = !table_has_column(conn, "album_sync", "remote_id")?;
+    let old_sync_state = !table_has_column(conn, "sync_state", "remote_id")?;
+
+    if old_album_sync || old_sync_state {
+        // Today's remote, if one was ever configured — or a placeholder when
+        // rows exist without one, because dropping a baseline reads later as
+        // "deleted on purpose" and takes files off the server.
+        let need_remote = v5_setting(conn, "remote.dir")?.is_some()
+            || (old_album_sync && v5_has_rows(conn, "album_sync")?)
+            || (old_sync_state && v5_has_rows(conn, "sync_state")?);
+        let remote_id: Option<i64> = if need_remote {
+            let target = v5_setting(conn, "remote.dir")?.unwrap_or_default();
+            let token: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'remote.token'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            conn.execute(
+                "INSERT INTO remotes(name, target, token, created_at) VALUES('Main', ?1, ?2, ?3)",
+                params![target, token, chrono::Utc::now().to_rfc3339()],
+            )?;
+            Some(conn.last_insert_rowid())
+        } else {
+            None
+        };
+
+        if old_album_sync {
+            conn.execute_batch(
+                "CREATE TABLE album_sync_v5 (
+                   album_path     TEXT    NOT NULL,
+                   remote_id      INTEGER NOT NULL REFERENCES remotes(id) ON DELETE CASCADE,
+                   direction      TEXT    NOT NULL DEFAULT 'both',
+                   scope          TEXT    NOT NULL DEFAULT 'web',
+                   last_synced_at TEXT,
+                   PRIMARY KEY (album_path, remote_id)
+                 );",
+            )?;
+            if let Some(id) = remote_id {
+                conn.execute(
+                    "INSERT INTO album_sync_v5(album_path, remote_id, direction, scope, last_synced_at) \
+                     SELECT album_path, ?1, direction, 'web', last_synced_at FROM album_sync",
+                    params![id],
+                )?;
+            }
+            conn.execute_batch(
+                "DROP TABLE album_sync; ALTER TABLE album_sync_v5 RENAME TO album_sync;",
+            )?;
+        }
+
+        if old_sync_state {
+            conn.execute_batch(
+                "CREATE TABLE sync_state_v5 (
+                   remote_id      INTEGER NOT NULL REFERENCES remotes(id) ON DELETE CASCADE,
+                   entity_kind    TEXT NOT NULL,
+                   entity_key     TEXT NOT NULL,
+                   local_hash     TEXT,
+                   synced_hash    TEXT,
+                   remote_hash    TEXT,
+                   last_synced_at TEXT,
+                   PRIMARY KEY (remote_id, entity_kind, entity_key)
+                 );",
+            )?;
+            if let Some(id) = remote_id {
+                conn.execute(
+                    "INSERT INTO sync_state_v5(remote_id, entity_kind, entity_key, local_hash, \
+                       synced_hash, remote_hash, last_synced_at) \
+                     SELECT ?1, entity_kind, entity_key, local_hash, synced_hash, remote_hash, \
+                       last_synced_at FROM sync_state",
+                    params![id],
+                )?;
+            }
+            conn.execute_batch(
+                "DROP TABLE sync_state; ALTER TABLE sync_state_v5 RENAME TO sync_state;",
+            )?;
+        }
+    }
+
+    // --- published_files: keyed by publish target --------------------------
+    if !table_has_column(conn, "published_files", "target_id")? {
+        let need_target = v5_setting(conn, "publish.dest")?.is_some()
+            || v5_has_rows(conn, "published_files")?;
+        let target_id: Option<i64> = if need_target {
+            let dest = v5_setting(conn, "publish.dest")?.unwrap_or_default();
+            let min_rating: Option<i64> =
+                v5_setting(conn, "publish.min_rating")?.and_then(|v| v.parse().ok());
+            conn.execute(
+                "INSERT INTO publish_targets(name, dest_root, min_rating) VALUES('Main', ?1, ?2)",
+                params![dest, min_rating],
+            )?;
+            Some(conn.last_insert_rowid())
+        } else {
+            None
+        };
+
+        conn.execute_batch(
+            "CREATE TABLE published_files_v5 (
+               target_id  INTEGER NOT NULL REFERENCES publish_targets(id) ON DELETE CASCADE,
+               album_path TEXT NOT NULL,
+               filename   TEXT NOT NULL,
+               PRIMARY KEY (target_id, album_path, filename)
+             );",
+        )?;
+        if let Some(id) = target_id {
+            conn.execute(
+                "INSERT INTO published_files_v5(target_id, album_path, filename) \
+                 SELECT ?1, album_path, filename FROM published_files",
+                params![id],
+            )?;
+        }
+        conn.execute_batch(
+            "DROP TABLE published_files; ALTER TABLE published_files_v5 RENAME TO published_files;",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// v6 — sources: photos that live outside the library root.
+///
+/// Until now a `rel_path` was relative to the one folder the photographer
+/// chose, and importing anything from elsewhere had to copy it in. A **source**
+/// is a root a photo may live under; the library root becomes source #1, the
+/// *primary*, and `photos.rel_path` becomes relative to whichever source its
+/// row names. That is what makes a Lightroom import without file migration
+/// possible: the LR root folder is registered as a source and its files are
+/// catalogued where they lie.
+///
+/// `.gpp/` — catalog, thumbnails, render cache — stays on the primary, and
+/// only the primary receives copy-in imports and pulls: a referenced source is
+/// a place photographs *are*, never a place this app puts things.
+const SCHEMA_V6_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS sources (
+  id          INTEGER PRIMARY KEY,
+  name        TEXT    NOT NULL,
+  path        TEXT    NOT NULL UNIQUE,
+  kind        TEXT    NOT NULL
+              CHECK (kind IN ('primary','internal','external','network')),
+  volume_hint TEXT,
+  is_primary  INTEGER NOT NULL DEFAULT 0,
+  added_at    TEXT
+);
+-- Exactly one primary, enforced by the schema rather than by everyone
+-- remembering: the primary is where .gpp lives, and two of them is a library
+-- with two catalogs' worth of derived data and no way to say which is real.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_one_primary
+  ON sources(is_primary) WHERE is_primary = 1;
+"#;
+
+/// The `photos` table as v6 shapes it: a `source_id`, and a `rel_path` that is
+/// unique only *within* its source. Two cards can hold `DCIM/DSC_0001.jpg`
+/// under two different roots and both belong in the catalog.
+const SCHEMA_V6_PHOTOS: &str = r#"
+CREATE TABLE photos_v6 (
+  id            INTEGER PRIMARY KEY,
+  source_id     INTEGER NOT NULL DEFAULT 1 REFERENCES sources(id),
+  rel_path      TEXT    NOT NULL,
+  filename      TEXT    NOT NULL,
+  content_hash  TEXT    NOT NULL,
+  file_size     INTEGER NOT NULL,
+  mtime_ms      INTEGER NOT NULL,
+  kind          TEXT    NOT NULL DEFAULT 'photo',
+  width         INTEGER,
+  height        INTEGER,
+  orientation   INTEGER,
+  captured_at   TEXT,
+  camera_make   TEXT,
+  camera_model  TEXT,
+  lens          TEXT,
+  iso           INTEGER,
+  aperture      REAL,
+  shutter       REAL,
+  focal_length  REAL,
+  rating        INTEGER NOT NULL DEFAULT 0,
+  flag          TEXT    NOT NULL DEFAULT 'none',
+  color_label   TEXT,
+  blur_lqip     TEXT,
+  imported_at   TEXT    NOT NULL,
+  UNIQUE(source_id, rel_path)
+);
+"#;
+
+/// Rebuild the photo indexes the v1 schema declared inline.
+const SCHEMA_V6_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_photos_hash     ON photos(content_hash);
+CREATE INDEX IF NOT EXISTS idx_photos_rating   ON photos(rating);
+CREATE INDEX IF NOT EXISTS idx_photos_captured ON photos(captured_at);
+CREATE INDEX IF NOT EXISTS idx_photos_camera   ON photos(camera_model);
+CREATE INDEX IF NOT EXISTS idx_photos_kind     ON photos(kind);
+CREATE INDEX IF NOT EXISTS idx_photos_source   ON photos(source_id);
+"#;
+
+/// The v6 migration: register the library root as the primary source, then
+/// re-key every existing photo onto it.
+///
+/// Every row keeps its `rel_path` **verbatim** — the primary source's root is
+/// the library root, so the paths already mean what they meant. A single-source
+/// library therefore behaves after this migration exactly as it did before,
+/// which is what the existing test suite is the proof of.
+///
+/// Runs inside the caller's transaction, with foreign keys off (see
+/// [`migrate`]): `photos` is rebuilt to drop the old `UNIQUE(rel_path)`, and
+/// half the schema references it.
+fn apply_v6(conn: &Connection, root: &Path) -> Result<()> {
+    conn.execute_batch(SCHEMA_V6_TABLES)?;
+
+    // The library root becomes source #1. Named after its folder, because that
+    // is the word the photographer already uses for it.
+    let primary: Option<i64> = conn
+        .query_row("SELECT id FROM sources WHERE is_primary = 1", [], |r| r.get(0))
+        .optional()?;
+    let primary = match primary {
+        Some(id) => id,
+        None => {
+            conn.execute(
+                "INSERT INTO sources(name, path, kind, is_primary, added_at) \
+                 VALUES(?1, ?2, 'primary', 1, ?3)",
+                params![
+                    root_display_name(root),
+                    root.display().to_string(),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    if table_has_column(conn, "photos", "source_id")? {
+        return Ok(());
+    }
+
+    conn.execute_batch(SCHEMA_V6_PHOTOS)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO photos_v6(source_id, {V5_PHOTO_COLS}) SELECT ?1, {V5_PHOTO_COLS} FROM photos"
+        ),
+        params![primary],
+    )?;
+    conn.execute_batch("DROP TABLE photos; ALTER TABLE photos_v6 RENAME TO photos;")?;
+    conn.execute_batch(SCHEMA_V6_INDEXES)?;
+    Ok(())
+}
+
+/// The v5 photo columns, in order — what the v6 rebuild carries across. Spelled
+/// out rather than derived from [`PHOTO_COLS`], which now has `source_id` in it
+/// and would make the copy select a column the old table does not have.
+const V5_PHOTO_COLS: &str = "id, rel_path, filename, content_hash, file_size, mtime_ms, kind, \
      width, height, orientation, captured_at, camera_make, camera_model, lens, iso, \
      aperture, shutter, focal_length, rating, flag, color_label, blur_lqip, imported_at";
+
+/// A display name for a root folder: its last segment, or the whole path when
+/// it has none (a drive root, `/`).
+pub(crate) fn root_display_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// Keep the primary source row pointing at the root this library was opened
+/// from.
+///
+/// The stored path is what `sources()` shows and what a person recognises; the
+/// root itself is whatever the caller opened, canonicalized. A library carried
+/// to another machine — a different mount point, a different drive letter — has
+/// a stale spelling written in it, and resolution deliberately does not consult
+/// it (the primary always resolves against `Library::root`), so refreshing it
+/// costs one write and keeps the listing honest.
+fn refresh_primary_source(conn: &Connection, root: &Path) -> Result<()> {
+    let stored: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT path, volume_hint FROM sources WHERE is_primary = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let now = root.display().to_string();
+    match stored {
+        // Nothing to say: the spelling is current and the volume is known.
+        Some((p, Some(_))) if p == now => Ok(()),
+        Some(_) => {
+            conn.execute(
+                "UPDATE sources SET path = ?1, volume_hint = ?2 WHERE is_primary = 1",
+                params![now, crate::sources::volume_hint(root)],
+            )?;
+            Ok(())
+        }
+        // No primary row at all is only reachable if something deleted it out
+        // from under the schema's index; put one back rather than fail to open.
+        None => {
+            conn.execute(
+                "INSERT INTO sources(name, path, kind, volume_hint, is_primary, added_at) \
+                 VALUES(?1, ?2, 'primary', ?3, 1, ?4)",
+                params![
+                    root_display_name(root),
+                    now,
+                    crate::sources::volume_hint(root),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// Settings key holding this library's stable identity.
+pub(crate) const SETTING_LIBRARY_ID: &str = "library_id";
+
+/// Generate the library id once, at open, if it is absent.
+fn ensure_library_id(conn: &Connection) -> Result<()> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![SETTING_LIBRARY_ID],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.map(|v| !v.is_empty()).unwrap_or(false) {
+        return Ok(());
+    }
+    use rand::Rng;
+    let bytes: [u8; 16] = rand::thread_rng().gen();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES(?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SETTING_LIBRARY_ID, hex],
+    )?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ row glue
+
+/// `source_id` is appended rather than slotted in beside `rel_path` so the
+/// column indexes [`photo_from_row`] reads by did not all shift when v6 landed.
+const PHOTO_COLS: &str = "id, rel_path, filename, content_hash, file_size, mtime_ms, kind, \
+     width, height, orientation, captured_at, camera_make, camera_model, lens, iso, \
+     aperture, shutter, focal_length, rating, flag, color_label, blur_lqip, imported_at, \
+     source_id";
 
 fn prefixed_photo_cols(prefix: &str) -> String {
     PHOTO_COLS
@@ -695,6 +1265,7 @@ pub(crate) fn photo_from_row(row: &Row<'_>) -> rusqlite::Result<Photo> {
         color_label: row.get(20)?,
         blur_lqip: row.get(21)?,
         imported_at: row.get(22)?,
+        source_id: row.get(23)?,
     })
 }
 
@@ -909,6 +1480,281 @@ mod tests {
         // And the escape character itself is a legal byte in a Unix filename.
         insert_photo(&lib, "back\\slash.jpg");
         assert_eq!(search(&lib, "back\\slash"), vec!["back\\slash.jpg"]);
+    }
+
+    /// Build a genuine v4 catalog on disk — the schema constants are the ones
+    /// v4 builds ran, so this is the real thing, not a simulation.
+    fn write_v4_catalog(dir: &Path) -> Connection {
+        let gpp = dir.join(GPP_DIR);
+        std::fs::create_dir_all(&gpp).unwrap();
+        let conn = Connection::open(gpp.join("catalog.db")).unwrap();
+        conn.execute_batch("CREATE TABLE schema_version(version INTEGER NOT NULL);").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute("INSERT INTO schema_version(version) VALUES(4)", []).unwrap();
+        conn
+    }
+
+    /// …and a genuine v5 one: v4 plus the remotes/targets rebuild, stamped 5.
+    fn write_v5_catalog(dir: &Path) -> Connection {
+        let conn = write_v4_catalog(dir);
+        apply_v5(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 5", []).unwrap();
+        conn
+    }
+
+    /// The v6 migration puts every existing photo on source #1 — the library
+    /// root — with its `rel_path` untouched, and everything that hangs off a
+    /// photo comes across with it.
+    ///
+    /// `photos` is the one table half the schema points at, and v6 rebuilds it
+    /// to drop the old `UNIQUE(rel_path)`. With foreign keys left on, the
+    /// `DROP TABLE` in the middle of that runs an implicit DELETE and cascades
+    /// every album membership and every edit stack into oblivion — a migration
+    /// that opens cleanly and quietly empties the library. This is the test
+    /// that would have caught it.
+    #[test]
+    fn v5_photos_land_on_the_primary_source_with_everything_attached_to_them() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = write_v5_catalog(dir.path());
+            conn.execute(
+                "INSERT INTO photos(id, rel_path, filename, content_hash, file_size, \
+                 mtime_ms, rating, flag, color_label, imported_at) \
+                 VALUES(7, '2026/ana/a1.jpg', 'a1.jpg', 'hash-a1', 100, 0, 5, 'pick', \
+                 'Red', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO photos(id, rel_path, filename, content_hash, file_size, \
+                 mtime_ms, imported_at) \
+                 VALUES(8, '2026/ana/a2.jpg', 'a2.jpg', 'hash-a2', 100, 0, '')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO albums(id, path, title, token) VALUES(1, '2026/ana', 'Ana', 'tok')",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE albums SET cover_photo_id = 7 WHERE id = 1", []).unwrap();
+            conn.execute(
+                "INSERT INTO album_photos(album_id, photo_id, position) VALUES(1, 7, 0), (1, 8, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edits(photo_id, version, stack_json) \
+                 VALUES(7, 1, '{\"version\":1,\"ops\":[{\"op\":\"exposure\",\"ev\":0.5}]}')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO tags(id, name) VALUES(1, 'wedding')", []).unwrap();
+            conn.execute("INSERT INTO photo_tags(photo_id, tag_id) VALUES(7, 1)", []).unwrap();
+            conn.execute(
+                "INSERT INTO lr_links(lrcat_id, lr_image, photo_id) VALUES('cat', 1000, 7)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let lib = Library::open(dir.path()).expect("the migration must open a v5 catalog");
+
+        // One source: the library itself, named after its folder.
+        let sources = lib.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_primary);
+        assert_eq!(sources[0].path, lib.root().display().to_string());
+        assert_eq!(sources[0].photo_count, 2);
+
+        // Both photos are on it, at exactly the paths they had.
+        let primary = lib.primary_source_id().unwrap();
+        let a1 = lib.photo_by_rel_path("2026/ana/a1.jpg").unwrap().unwrap();
+        assert_eq!(a1.id, 7, "rowids are stable across the rebuild");
+        assert_eq!(a1.source_id, primary);
+        assert_eq!(a1.rating, 5);
+        assert_eq!(a1.flag, Flag::Pick);
+        assert_eq!(a1.color_label.as_deref(), Some("Red"));
+        assert_eq!(a1.content_hash, "hash-a1");
+        assert!(lib.photo_by_rel_path("2026/ana/a2.jpg").unwrap().is_some());
+        assert_eq!(lib.photo_count().unwrap(), 2);
+
+        // …and everything that hangs off a photo survived the table rebuild.
+        assert_eq!(
+            lib.album_photos("2026/ana")
+                .unwrap()
+                .into_iter()
+                .map(|p| p.filename)
+                .collect::<Vec<_>>(),
+            vec!["a1.jpg", "a2.jpg"],
+            "album memberships were cascaded away by the rebuild"
+        );
+        assert_eq!(
+            lib.album_by_path("2026/ana").unwrap().unwrap().cover_filename.as_deref(),
+            Some("a1.jpg")
+        );
+        assert!(!lib.edits(7).unwrap().is_empty(), "the develop stack was dropped");
+        assert_eq!(lib.photo_tags(7).unwrap(), vec!["wedding"]);
+        assert_eq!(lib.lr_photo_links("cat").unwrap().get(&1000), Some(&7));
+
+        // And re-opening changes nothing — the migration is not re-applied.
+        drop(lib);
+        let again = Library::open(dir.path()).unwrap();
+        assert_eq!(again.photo_count().unwrap(), 2);
+        assert_eq!(again.sources().unwrap().len(), 1);
+        assert_eq!(again.album_photos("2026/ana").unwrap().len(), 2);
+    }
+
+    /// The old uniqueness was on `rel_path` alone. It becomes
+    /// `(source_id, rel_path)`, which is the whole point: two registered cards
+    /// may each hold `DCIM/DSC_0001.jpg`, and they are two photographs.
+    #[test]
+    fn a_relative_path_is_unique_within_a_source_not_across_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let drive = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path()).unwrap();
+        let other = lib.add_source(drive.path(), Some("Card"), None).unwrap();
+        let primary = lib.primary_source_id().unwrap();
+
+        for source in [primary, other] {
+            lib.with_conn(|c| {
+                c.execute(
+                    "INSERT INTO photos(source_id, rel_path, filename, content_hash, \
+                     file_size, mtime_ms, imported_at) \
+                     VALUES(?1, 'DCIM/DSC_0001.jpg', 'DSC_0001.jpg', 'h', 0, 0, '')",
+                    params![source],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(lib.photo_count().unwrap(), 2);
+
+        // The same path twice under one source is still refused.
+        let again = lib.with_conn(|c| {
+            Ok(c.execute(
+                "INSERT INTO photos(source_id, rel_path, filename, content_hash, \
+                 file_size, mtime_ms, imported_at) \
+                 VALUES(?1, 'DCIM/DSC_0001.jpg', 'DSC_0001.jpg', 'h', 0, 0, '')",
+                params![primary],
+            )?)
+        });
+        assert!(again.is_err(), "one source cannot hold one path twice");
+
+        // And each lookup finds its own.
+        assert_eq!(
+            lib.photo_by_rel_path("DCIM/DSC_0001.jpg").unwrap().unwrap().source_id,
+            primary
+        );
+        assert_eq!(
+            lib.photo_by_source_rel_path(other, "DCIM/DSC_0001.jpg")
+                .unwrap()
+                .unwrap()
+                .source_id,
+            other
+        );
+    }
+
+    /// The v5 migration folds today's single remote and destination into row
+    /// #1 of the new tables, carries every subscription, baseline and publish
+    /// record onto those ids — and the un-suffixed APIs then behave exactly
+    /// as they did on v4.
+    #[test]
+    fn v4_with_a_configured_remote_migrates_to_row_one_of_each() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = write_v4_catalog(dir.path());
+            for (k, v) in [
+                ("remote.dir", "https://gallery.example/api/sync"),
+                ("remote.token", "sync-token-16-chars!"),
+                ("publish.dest", "/srv/gallery/albums"),
+                ("publish.min_rating", "3"),
+            ] {
+                conn.execute("INSERT INTO settings(key, value) VALUES(?1, ?2)", params![k, v])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO album_sync(album_path, direction, last_synced_at) \
+                 VALUES('2026/ana', 'push', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_state(entity_kind, entity_key, synced_hash) \
+                 VALUES('file', '2026/ana/a.jpg', 'hash-a')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO published_files(album_path, filename) VALUES('2026/ana', 'a.jpg')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let lib = Library::open(dir.path()).expect("the migration must open a v4 catalog");
+
+        // The single remote became remotes row #1 named "Main", and it is the
+        // default the compatibility APIs act on.
+        let remotes = lib.remotes().unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "Main");
+        assert_eq!(remotes[0].target, "https://gallery.example/api/sync");
+        assert_eq!(remotes[0].token.as_deref(), Some("sync-token-16-chars!"));
+        assert!(remotes[0].is_default);
+
+        let targets = lib.publish_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "Main");
+        assert_eq!(targets[0].dest_root, "/srv/gallery/albums");
+        assert_eq!(targets[0].min_rating, Some(3));
+
+        // Subscriptions, baselines and publish records survived, re-keyed —
+        // and read back identically through the old entry points.
+        let subs = lib.album_subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].album_path, "2026/ana");
+        assert_eq!(subs[0].direction, crate::sync::SyncDirection::Push);
+        assert_eq!(subs[0].scope, crate::sync::SyncScopeKind::Web);
+        assert_eq!(subs[0].last_synced_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+
+        let synced = lib.synced_manifest().unwrap();
+        assert_eq!(synced.get("2026/ana/a.jpg").map(String::as_str), Some("hash-a"));
+
+        assert_eq!(
+            lib.published_files("2026/ana").unwrap(),
+            ["a.jpg".to_string()].into_iter().collect()
+        );
+
+        // The catalog now carries a stable identity.
+        let id = lib.library_id().unwrap();
+        assert_eq!(id.len(), 32, "16 random bytes, hex: {id:?}");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // …and it survives a re-open unchanged, as does everything above.
+        drop(lib);
+        let again = Library::open(dir.path()).unwrap();
+        assert_eq!(again.library_id().unwrap(), id);
+        assert_eq!(again.remotes().unwrap().len(), 1);
+    }
+
+    /// A library that never configured a remote migrates to empty tables, and
+    /// the first remote added becomes the default.
+    #[test]
+    fn v4_without_a_remote_migrates_to_empty_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(write_v4_catalog(dir.path()));
+
+        let lib = Library::open(dir.path()).unwrap();
+        assert!(lib.remotes().unwrap().is_empty());
+        assert!(lib.publish_targets().unwrap().is_empty());
+        assert_eq!(lib.default_remote_id().unwrap(), None);
+
+        let id = lib.add_remote("Studio", "/srv/studio", None).unwrap();
+        assert_eq!(lib.default_remote_id().unwrap(), Some(id), "the first add is the default");
     }
 
     #[test]

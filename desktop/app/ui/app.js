@@ -40,6 +40,19 @@ const state = {
   filter: { minRating: null, flag: null, text: '' },
   editingAlbum: null,
   remoteAlbums: [],
+  /// Servers this library knows (tokens never travel here — only has_token).
+  remotes: [],
+  /// The server the sync modal is browsing.
+  syncRemoteId: null,
+  /// remoteId -> Map(albumPath -> subscription), for the per-server chips.
+  subsByRemote: new Map(),
+  /// Every root this library catalogues photographs under, the primary first.
+  /// Held outside the Sources panel because `online` is what tells a grid cell
+  /// "that drive is in the other room" rather than "this file is corrupt".
+  sources: [],
+  /// Canonical root of the open library, as the core reports it — what the
+  /// switcher menu compares against to mark the current entry.
+  libraryRoot: '',
 };
 
 const $ = (id) => document.getElementById(id);
@@ -407,9 +420,11 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  // A dialog is in front of everything, so it goes first; only once nothing is
-  // open does Escape mean "stop framing".
-  if (modalIsOpen()) {
+  // Topmost first: the chip popover floats over the modals; then a dialog;
+  // only once nothing is open does Escape mean "stop framing".
+  if (!$('chip-menu').hidden) {
+    $('chip-menu').hidden = true;
+  } else if (modalIsOpen()) {
     document.querySelectorAll('.modal:not([hidden])').forEach((m) => (m.hidden = true));
   } else if (cropMode.active) {
     cancelCrop();
@@ -448,15 +463,23 @@ async function boot() {
   $('welcome').hidden = false;
 }
 
-$('open-library-btn').addEventListener('click', async () => {
+/// The folder-picker flow — the welcome button and the switcher menu's "Open
+/// other library…" both land here, so there is one boot path, not two.
+async function pickAndOpenLibrary() {
   const dir = await openDialog({ directory: true, title: 'Choose a photo folder' });
   if (!dir) return;
   try {
     await openLibrary(dir);
   } catch (err) {
-    showError('welcome-error', String(err));
+    // Report where the user is: the welcome card's error line before a library
+    // is open, the status bar once one is — a failed switch leaves the current
+    // library on screen, and the welcome card is not.
+    if ($('app').hidden) showError('welcome-error', String(err));
+    else status(`Could not open library: ${err}`);
   }
-});
+}
+
+$('open-library-btn').addEventListener('click', pickAndOpenLibrary);
 
 async function openLibrary(path) {
   const info = await invoke('open_library', { path });
@@ -487,6 +510,9 @@ async function switchLibrary(path) {
   state.selected.clear();
   state.cursor = -1;
   setLoupe(false);
+  // Servers, sources and the Lightroom wizard all describe the library being
+  // left; cleared here so none of it labels the next one's photos.
+  resetLibraryState();
   // The decoded preview pixels belong to a photo in the library being left.
   invoke('release_preview').catch(() => {});
   try {
@@ -585,6 +611,32 @@ $('library-prune').addEventListener('click', async () => {
   }
 });
 
+/// Clear per-library UI state. The rating/flag/text filters stay: their chips
+/// are on screen and still mean what they say against any library.
+function resetLibraryState() {
+  if (cropMode.active) closeCrop();
+  state.currentAlbum = '';
+  state.selected.clear();
+  state.cursor = -1;
+  state.editingAlbum = null;
+  state.remoteAlbums = [];
+  // Servers and subscriptions belong to the library that is being left.
+  state.remotes = [];
+  state.syncRemoteId = null;
+  state.subsByRemote = new Map();
+  // Sources belong to the library too — a stale list would label the new
+  // library's photos with the old one's drives.
+  state.sources = [];
+  $('sources-list').innerHTML = '';
+  showError('sources-error', '');
+  // A scan describes where photos would land in the library that was open when
+  // it ran. Left standing, the wizard would offer to import it into the new one.
+  resetLrWizard();
+  document.querySelectorAll('.nav-item').forEach((n) =>
+    n.classList.toggle('active', (n.dataset.album || '') === ''));
+  $('inspector').hidden = true;
+}
+
 /// Swap the welcome screen for the app and load its contents.
 async function enterApp(info) {
   $('welcome').hidden = true;
@@ -593,12 +645,15 @@ async function enterApp(info) {
   // rather than snapping into it a moment later.
   applyPrefs();
   renderStatus(info);
+  // Sources first: the grid asks which of them are attached while it paints.
+  await refreshSources();
   await Promise.all([refreshAlbums(), refreshPhotos()]);
   await loadPublishTarget();
 }
 
 function renderStatus(info) {
   // The sidebar names the library; the titlebar names the application.
+  state.libraryRoot = info.root;
   $('library-name').textContent = libraryName(info.root);
   $('library-name').title = info.root;
   $('all-count').textContent = info.photo_count;
@@ -607,6 +662,219 @@ function renderStatus(info) {
   $('library-stats').innerHTML =
     `${info.photo_count} photos · ${info.album_count} albums` +
     (info.cameras.length ? `<br>${escapeHtml(info.cameras.join(', '))}` : '');
+}
+
+// ----------------------------------------------------------------- sources
+//
+// A library is one folder by default, and its own root is source #1 — the
+// primary, where the catalog and every thumbnail live. Any number of other
+// folders may be registered: their photographs are catalogued *where they
+// are*, never copied and never moved, which is what makes a decade of work on
+// an external drive importable without migrating a terabyte first.
+//
+// A source that is not attached right now is offline, not missing. The core
+// says so per source (`online`, probed on every listing) and refuses the
+// operations that need the original by name, so this panel is also where the
+// answer to a blank frame in the grid — plug that drive in — is on screen.
+
+async function refreshSources() {
+  try {
+    state.sources = await invoke('list_sources');
+    showError('sources-error', '');
+  } catch (err) {
+    state.sources = [];
+    // Only worth reporting where it was asked for; at boot a failure here just
+    // leaves the grid without source names, which it renders fine without.
+    if (!$('sources-modal').hidden) showError('sources-error', String(err));
+  }
+  renderSources();
+}
+
+/// One source by id, or null — a photo's row may name a source this listing
+/// has not caught up with.
+function sourceById(id) {
+  return state.sources.find((s) => s.id === id) || null;
+}
+
+/// The registered sources that are not reachable right now, by name. This is
+/// what a count of skipped photos is actually waiting for, and naming it is
+/// the whole of the remedy.
+function offlineSourceNames() {
+  return state.sources.filter((s) => !s.online).map((s) => s.name);
+}
+
+/// "3 waiting on Archive 2019" — the phrase batch reports use for work that
+/// was stepped over because a drive is elsewhere. Nothing is wrong with those
+/// photographs, so this never reads as a failure.
+function offlineNote(count) {
+  const names = offlineSourceNames();
+  return `${count} waiting on ${names.length ? names.join(', ') : 'a source that is not attached'}`;
+}
+
+const SOURCE_KIND_LABELS = {
+  primary: 'library root',
+  internal: 'internal disk',
+  external: 'external drive',
+  network: 'network share',
+};
+
+function openSources() {
+  showError('sources-error', '');
+  openModal('sources-modal');
+  refreshSources();
+}
+
+function renderSources() {
+  const list = $('sources-list');
+  list.innerHTML = '';
+  if (!state.sources.length) {
+    list.innerHTML = '<p class="muted">No sources — open a library first.</p>';
+    return;
+  }
+
+  state.sources.forEach((s) => {
+    const row = document.createElement('div');
+    row.className = 'remote-row';
+
+    const info = document.createElement('div');
+    info.className = 'remote-info';
+    const title = document.createElement('strong');
+    title.textContent = s.name;
+    info.appendChild(title);
+
+    if (s.is_primary) {
+      const badge = document.createElement('span');
+      badge.className = 'badge-new';
+      badge.textContent = 'primary';
+      info.appendChild(badge);
+    }
+
+    // Probed at the moment of the listing, so it is worth saying plainly
+    // rather than leaving the photographer to infer it from an empty grid.
+    const dot = document.createElement('span');
+    dot.className = 'source-state' + (s.online ? ' online' : '');
+    dot.textContent = s.online ? '● attached' : '○ not attached';
+    info.appendChild(dot);
+
+    const sub = document.createElement('div');
+    sub.className = 'remote-sub muted';
+    sub.title = s.path;
+    // Kind and count lead: the row ellipsizes a long path, and the count is
+    // the number the Remove dialog is about — losing it off the end of the
+    // line is how "forget this folder" reads as harmless when it is not.
+    sub.textContent =
+      `${SOURCE_KIND_LABELS[s.kind] || s.kind} · ${s.photo_count} photo(s) · ${s.path}`;
+    info.appendChild(sub);
+    row.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+
+    // The primary is the library itself: it moves by opening the library
+    // somewhere else, and it cannot be forgotten at all.
+    if (!s.is_primary) {
+      const relocate = document.createElement('button');
+      relocate.className = 'btn btn-sm';
+      relocate.textContent = 'Relocate…';
+      relocate.title = 'Point this source at the folder it lives in now';
+      relocate.addEventListener('click', () => relocateSource(s));
+      actions.appendChild(relocate);
+
+      const remove = document.createElement('button');
+      remove.className = 'btn btn-sm btn-danger';
+      remove.textContent = 'Remove';
+      remove.addEventListener('click', () => removeSource(s));
+      actions.appendChild(remove);
+    }
+
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+$('source-add-btn').addEventListener('click', async () => {
+  const dir = await openDialog({
+    directory: true,
+    title: 'Choose a folder to catalogue in place',
+  });
+  if (!dir) return;
+  showError('sources-error', '');
+  status('Registering source…');
+  try {
+    await invoke('add_source', { path: dir, name: null, kind: $('source-kind').value });
+    await refreshSources();
+    status(`Added source ${dir} — import it to catalogue its photos in place`);
+  } catch (err) {
+    // Overlap with the library or another source comes back as a sentence
+    // naming the source it clashes with. Show it as it is.
+    showError('sources-error', String(err));
+    status('Source not added');
+  }
+});
+
+async function relocateSource(s) {
+  const dir = await openDialog({
+    directory: true,
+    title: `Where is "${s.name}" now?`,
+  });
+  if (!dir) return;
+  showError('sources-error', '');
+  status(`Relocating ${s.name}…`);
+  try {
+    await invoke('relocate_source', { id: s.id, newPath: dir });
+    await refreshSources();
+    await refreshPhotos();
+    status(`${s.name} now points at ${dir}`);
+  } catch (err) {
+    // A folder that does not hold this source's photographs is refused with
+    // the file that gave it away named in the message, and nothing changed.
+    // That sentence is the whole diagnosis — show it, and leave the row alone.
+    showError('sources-error', String(err));
+    status(`${s.name} unchanged`);
+  }
+}
+
+async function removeSource(s) {
+  // The count is the difference between forgetting an empty folder and
+  // discarding a shoot's worth of ratings, so it decides the question asked —
+  // and the answer to it is what travels as `drop_photos`. Either way no file
+  // on disk is touched, which is the sentence a photographer needs to read
+  // before pressing this.
+  const holdsPhotos = s.photo_count > 0;
+  const sure = await askConfirm(
+    holdsPhotos
+      ? `"${s.name}" holds ${s.photo_count} catalogued photo(s). Removing it drops ` +
+        'those catalog rows — their ratings, flags, album memberships and ' +
+        'adjustments go with them.\n\n' +
+        'The photographs themselves are never touched: every file stays exactly ' +
+        'where it is on disk, and adding the folder back re-imports them.'
+      : `"${s.name}" holds no catalogued photos.\n\n` +
+        'Removing it only makes this library stop looking there. No file on disk ' +
+        'is touched.',
+    {
+      title: `Remove source "${s.name}"?`,
+      kind: 'warning',
+      okLabel: holdsPhotos ? `Remove and drop ${s.photo_count} row(s)` : 'Remove',
+    }
+  );
+  if (!sure) return;
+
+  showError('sources-error', '');
+  try {
+    const dropped = await invoke('remove_source', { id: s.id, dropPhotos: holdsPhotos });
+    await refreshSources();
+    await refreshAll();
+    status(
+      dropped
+        ? `Removed ${s.name} · ${dropped} catalog row(s) dropped, no file touched`
+        : `Removed ${s.name} — no file touched`
+    );
+  } catch (err) {
+    // Reached when the count this panel held was stale and the core found
+    // photos on it after all. Its message says so; nothing was removed.
+    showError('sources-error', String(err));
+    status(`${s.name} unchanged`);
+  }
 }
 
 // ------------------------------------------------------------------ import
@@ -640,8 +908,14 @@ $('import-btn').addEventListener('click', async () => {
       `imported ${summary.imported} · updated ${summary.updated} · ` +
       `unchanged ${summary.skipped}` +
       (summary.undecodable.length ? ` · ${summary.undecodable.length} without a preview` : '') +
-      (summary.failed.length ? ` · ${summary.failed.length} failed` : '')
+      (summary.failed.length ? ` · ${summary.failed.length} failed` : '') +
+      // A registered source that was not attached is skipped rather than
+      // failed, and the note names it. Dropping these turns "your external
+      // drive was not there" into a run that read as complete.
+      (summary.notes.length ? ` · ${summary.notes.join(' · ')}` : '')
     );
+    // A source may have come back — or gone — while the import ran.
+    await refreshSources();
     await refreshAll();
   } catch (err) {
     status(`Import failed: ${err}`);
@@ -734,12 +1008,18 @@ function renderGrid() {
     // A file no decoder can read — a corrupt JPEG, a RAW format this build
     // does not develop — gets a named tile. A broken-image icon tells the
     // photographer nothing about which file is the problem.
+    //
+    // A photo on a source that is not attached is neither of those things:
+    // nothing is wrong with it, the drive is simply in the other room. Calling
+    // that "No preview" sends someone looking for a corrupt file that is
+    // perfectly safe, so it names the drive instead.
     const undecodable = () => {
-      cell.classList.add('undecodable');
+      const offline = state.sources.find((s) => s.id === photo.source_id && !s.online);
+      cell.classList.add(offline ? 'offline' : 'undecodable');
       img.remove();
       const note = document.createElement('div');
       note.className = 'cell-note';
-      note.textContent = 'No preview';
+      note.textContent = offline ? `${offline.name} not attached` : 'No preview';
       cell.prepend(note);
     };
     img.addEventListener('error', undecodable, { once: true });
@@ -1046,6 +1326,9 @@ async function showInspector(photo) {
     ['Exposure', formatExposure(photo)],
     ['Dimensions', photo.width && photo.height ? `${photo.width} × ${photo.height}` : '—'],
     ['Size', formatBytes(photo.file_size)],
+    // rel_path is relative to this photo's own source, so it does not name a
+    // place on its own once a library catalogues more than one root.
+    ['Source', describeSourceOf(photo)],
     ['Path', photo.rel_path],
   ];
   $('inspector-meta').innerHTML = rows
@@ -1633,6 +1916,14 @@ async function afterDevelop() {
   if (state.cursor >= 0) await showInspector(state.photos[state.cursor]);
 }
 
+/// The source a photo's path is relative to, and whether it is attached —
+/// what turns "develop failed" into "the Card drive is not plugged in".
+function describeSourceOf(photo) {
+  const s = sourceById(photo.source_id);
+  if (!s) return '—';
+  return s.name + (s.online ? '' : ' — not attached');
+}
+
 function formatExposure(p) {
   const bits = [];
   if (p.focal_length) bits.push(`${Math.round(p.focal_length)}mm`);
@@ -1850,6 +2141,7 @@ function openAlbumSettings(entry) {
   $('share-link').value = entry.share_token
     ? `/photos/${entry.path}?token=${entry.share_token}`
     : '';
+  $('export-xmp-result').textContent = '';
   showError('settings-error', '');
   openModal('settings-album-modal');
 }
@@ -2086,6 +2378,10 @@ $('publish-run-btn').addEventListener('click', async () => {
       target: { dest, min_rating: minRating ? Number(minRating) : null },
     });
     const results = await invoke('publish', { album });
+    // Photos stepped over because their drive is elsewhere are named against
+    // the source they are waiting on, and `online` is only true as of the last
+    // listing — re-probe before saying which drive it is.
+    if (results.some((r) => r.offline.length)) await refreshSources();
     const total = results.reduce((n, r) => n + r.photos_copied, 0);
     $('publish-output').hidden = false;
     $('publish-output').textContent = results
@@ -2094,10 +2390,17 @@ $('publish-run-btn').addEventListener('click', async () => {
         const notes = [];
         if (r.missing.length) notes.push(`${r.missing.length} missing from disk`);
         if (r.unrenderable.length) notes.push(`${r.unrenderable.length} without a preview, not published`);
+        // Not a failure and not a loss: the album is simply short until the
+        // drive is attached, and the next publish ships them. Left unsaid, an
+        // album that quietly went up without a third of its frames looks
+        // exactly like one that went up whole.
+        if (r.offline.length) notes.push(offlineNote(r.offline.length));
         if (r.removed.length) notes.push(`${r.removed.length} removed`);
         if (r.collisions.length) notes.push(`${r.collisions.length} name clash(es)`);
         let line = `${r.album_path}: ${r.photos_copied} copied, ${r.photos_skipped} unchanged` +
           (notes.length ? ` · ${notes.join(' · ')}` : '');
+        // Each entry already names the photo and the source it is waiting on.
+        for (const o of r.offline) line += `\n  not published yet: ${o}`;
         // A clash needs both filenames spelled out — renaming one would change
         // a URL the client may already hold, so this is the photographer's call.
         for (const c of r.collisions) {
@@ -2116,92 +2419,241 @@ $('publish-run-btn').addEventListener('click', async () => {
 
 // -------------------------------------------------------------------- sync
 //
-// One album at a time, in the direction chosen for that album. Albums with no
-// direction set are never touched — not pushed, not pulled, not deleted.
+// One album at a time, in the direction chosen for that album, per server.
+// Albums with no direction set are never touched — not pushed, not pulled,
+// not deleted. A library can know several servers; each keeps its own
+// subscriptions and baselines, so a conflict on one is not a conflict on
+// another.
 
 $('sync-btn').addEventListener('click', async () => {
   showError('sync-error', '');
   $('sync-output').hidden = true;
   openModal('sync-modal');
-  try {
-    $('remote-dir').value = (await invoke('get_remote_dir')) || '';
-    await refreshTokenRow();
-  } catch { /* no library open */ }
-  if ($('remote-dir').value) await refreshRemote();
+  await refreshServers();
+  if (state.syncRemoteId != null) {
+    await refreshRemote();
+  } else {
+    $('remote-list').innerHTML = '<p class="muted">Add a server to begin.</p>';
+  }
 });
+
+/// The remote the modal is browsing, or null while none is configured.
+function currentRemote() {
+  return state.remotes.find((r) => r.id === state.syncRemoteId) || null;
+}
+
+const DIRECTION_GLYPHS = { push: '↑', pull: '↓', both: '⇅' };
+
+/// This machine's subscription for one album on one remote, or null.
+function subFor(remoteId, albumPath) {
+  return state.subsByRemote.get(remoteId)?.get(albumPath) || null;
+}
+
+// ---------------------------------------------------------------- servers
+
+async function refreshServers() {
+  try {
+    state.remotes = await invoke('list_remotes');
+  } catch (err) {
+    state.remotes = [];
+    showError('sync-error', String(err));
+  }
+  // Keep the browsed server if it survived; otherwise fall to the default.
+  if (!state.remotes.some((r) => r.id === state.syncRemoteId)) {
+    const fallback = state.remotes.find((r) => r.is_default) || state.remotes[0];
+    state.syncRemoteId = fallback ? fallback.id : null;
+  }
+  await refreshSubscriptions();
+  renderServers();
+}
+
+/// Subscriptions per remote, so an album row can show one chip per server
+/// without a round trip per row.
+async function refreshSubscriptions() {
+  state.subsByRemote = new Map();
+  for (const r of state.remotes) {
+    try {
+      const subs = await invoke('album_subscriptions_on', { remoteId: r.id });
+      state.subsByRemote.set(r.id, new Map(subs.map((s) => [s.album_path, s])));
+    } catch {
+      state.subsByRemote.set(r.id, new Map());
+    }
+  }
+}
+
+function renderServers() {
+  const list = $('servers-list');
+  list.innerHTML = '';
+  if (!state.remotes.length) {
+    list.innerHTML =
+      '<p class="muted">No servers yet — add a folder (network share, external ' +
+      'drive) or the gallery’s sync URL.</p>';
+  }
+
+  state.remotes.forEach((r) => {
+    const row = document.createElement('div');
+    row.className = 'remote-row';
+
+    const info = document.createElement('div');
+    info.className = 'remote-info';
+    const title = document.createElement('strong');
+    title.textContent = r.name;
+    info.appendChild(title);
+    if (r.is_default) {
+      const badge = document.createElement('span');
+      badge.className = 'badge-new';
+      badge.textContent = 'default';
+      info.appendChild(badge);
+    }
+    const sub = document.createElement('div');
+    sub.className = 'remote-sub muted';
+    sub.textContent = r.target + (r.has_token ? ' · token stored' : '');
+    info.appendChild(sub);
+    row.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+
+    if (!r.is_default) {
+      const mkDefault = document.createElement('button');
+      mkDefault.className = 'btn btn-sm';
+      mkDefault.textContent = 'Make default';
+      mkDefault.addEventListener('click', async () => {
+        try {
+          await invoke('set_default_remote', { id: r.id });
+          await refreshServers();
+        } catch (err) {
+          showError('sync-error', String(err));
+        }
+      });
+      actions.appendChild(mkDefault);
+    }
+
+    const edit = document.createElement('button');
+    edit.className = 'btn btn-sm';
+    edit.textContent = 'Edit';
+    edit.addEventListener('click', () => openServerModal(r));
+    actions.appendChild(edit);
+
+    const remove = document.createElement('button');
+    remove.className = 'btn btn-sm btn-danger';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', async () => {
+      const sure = await askConfirm(
+        'This library forgets the server: its subscriptions and sync baselines ' +
+        `for "${r.name}" are dropped — locally. Nothing on the server itself ` +
+        'is touched.',
+        { title: `Remove server "${r.name}"?`, kind: 'warning', okLabel: 'Remove' }
+      );
+      if (!sure) return;
+      try {
+        await invoke('remove_remote', { id: r.id });
+        await refreshServers();
+        if (state.syncRemoteId != null) await refreshRemote();
+        else $('remote-list').innerHTML = '<p class="muted">Add a server to begin.</p>';
+      } catch (err) {
+        showError('sync-error', String(err));
+      }
+    });
+    actions.appendChild(remove);
+
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+
+  // The browse selector mirrors the same list.
+  const select = $('sync-remote-select');
+  select.innerHTML = '';
+  state.remotes.forEach((r) => {
+    const opt = document.createElement('option');
+    opt.value = r.id;
+    opt.textContent = r.name;
+    select.appendChild(opt);
+  });
+  if (state.syncRemoteId != null) select.value = String(state.syncRemoteId);
+  select.disabled = !state.remotes.length;
+  $('sync-all-scope').disabled = !state.remotes.length;
+}
+
+$('sync-remote-select').addEventListener('change', async () => {
+  state.syncRemoteId = Number($('sync-remote-select').value);
+  await refreshRemote();
+});
+
+// One modal for add and edit; which it is lives here.
+let editingRemoteId = null;
+
+$('server-add-btn').addEventListener('click', () => openServerModal(null));
+
+function openServerModal(remote) {
+  editingRemoteId = remote ? remote.id : null;
+  $('server-modal-title').textContent = remote ? `Edit "${remote.name}"` : 'Add server';
+  $('server-name').value = remote ? remote.name : '';
+  $('server-target').value = remote ? remote.target : '';
+  $('server-token').value = '';
+  // The token itself never comes back out of the catalog — only whether one
+  // is stored, so the field can say so without echoing a secret.
+  $('server-token').placeholder = remote?.has_token
+    ? 'stored — type to replace'
+    : 'paste once — it is kept in the catalog';
+  syncServerTokenRow();
+  showError('server-error', '');
+  openModal('server-modal');
+}
 
 /// A URL remote authenticates with a token; a folder does not.
-function remoteIsUrl() {
-  return /^https?:\/\//i.test($('remote-dir').value.trim());
+function syncServerTokenRow() {
+  $('server-token-row').hidden = !/^https?:\/\//i.test($('server-target').value.trim());
 }
+$('server-target').addEventListener('input', syncServerTokenRow);
 
-async function refreshTokenRow() {
-  const row = $('remote-token-row');
-  row.hidden = !remoteIsUrl();
-  if (row.hidden) return;
-  try {
-    // The token itself never comes back out of the catalog — only whether one
-    // is stored, so the field can say so without echoing a secret.
-    $('remote-token').placeholder = (await invoke('has_remote_token'))
-      ? 'stored — type to replace'
-      : 'paste once — it is kept in the catalog';
-  } catch { /* no library open */ }
-}
-
-$('remote-dir').addEventListener('input', () => refreshTokenRow());
-
-$('remote-token').addEventListener('change', async () => {
-  const token = $('remote-token').value.trim();
-  if (!token) return;
-  try {
-    await invoke('set_remote_token', { token });
-    $('remote-token').value = '';
-    $('remote-token').placeholder = 'stored — type to replace';
-    showError('sync-error', '');
-  } catch (err) {
-    showError('sync-error', String(err));
-  }
-});
-
-$('pick-remote-btn').addEventListener('click', async () => {
+$('server-pick-btn').addEventListener('click', async () => {
   const dir = await openDialog({ directory: true, title: 'Choose the shared album folder' });
   if (!dir) return;
-  $('remote-dir').value = dir;
-  await refreshTokenRow();
-  await saveRemoteDir();
-  await refreshRemote();
+  $('server-target').value = dir;
+  syncServerTokenRow();
 });
 
-/// Typing a path by hand is allowed too — persist it on blur.
-$('remote-dir').addEventListener('change', () => saveRemoteDir());
-
-async function saveRemoteDir() {
-  const dir = $('remote-dir').value.trim();
-  if (!dir) return;
+$('server-save-btn').addEventListener('click', async () => {
+  const name = $('server-name').value.trim();
+  const target = $('server-target').value.trim();
+  const token = $('server-token').value.trim();
   try {
-    await invoke('set_remote_dir', { dir });
-    showError('sync-error', '');
+    if (editingRemoteId != null) {
+      // An empty token box means "leave the stored secret alone".
+      const update = { name, target, ...(token ? { token } : {}) };
+      await invoke('update_remote', { id: editingRemoteId, update });
+    } else {
+      await invoke('add_remote', { name, target, token: token || null });
+    }
+    closeModal('server-modal');
+    await refreshServers();
+    await refreshRemote();
   } catch (err) {
-    showError('sync-error', String(err));
+    showError('server-error', String(err));
   }
-}
-
-$('remote-refresh-btn').addEventListener('click', async () => {
-  await saveRemoteDir();
-  await refreshRemote();
 });
+
+// ------------------------------------------------------------- album list
+
+$('remote-refresh-btn').addEventListener('click', () => refreshRemote());
 
 async function refreshRemote() {
   const list = $('remote-list');
+  if (state.syncRemoteId == null) {
+    list.innerHTML = '<p class="muted">Add a server to begin.</p>';
+    return;
+  }
   list.innerHTML = '<p class="muted">Reading…</p>';
   try {
-    state.remoteAlbums = await invoke('remote_albums');
+    state.remoteAlbums = await invoke('remote_albums_on', { remoteId: state.syncRemoteId });
   } catch (err) {
     list.innerHTML = '';
     showError('sync-error', String(err));
     return;
   }
   showError('sync-error', '');
+  await refreshSubscriptions();
   renderRemoteList();
 }
 
@@ -2210,7 +2662,7 @@ function renderRemoteList() {
   list.innerHTML = '';
 
   if (!state.remoteAlbums.length) {
-    list.innerHTML = '<p class="muted">No albums here or on the remote yet.</p>';
+    list.innerHTML = '<p class="muted">No albums here or on the server yet.</p>';
     return;
   }
 
@@ -2249,41 +2701,41 @@ function renderRemoteList() {
       ? `${album.path} · folder · ${where}`
       : `${album.path} · ${where}`;
     info.appendChild(sub);
-    row.appendChild(info);
 
-    const direction = document.createElement('select');
-    direction.title = album.is_collection
-      ? 'How this folder and everything under it syncs'
-      : 'How this album syncs';
-    [
-      ['', 'Not tracked'],
-      ['both', 'Both ways'],
-      ['push', 'Push only'],
-      ['pull', 'Pull only'],
-    ].forEach(([value, label]) => {
-      const opt = document.createElement('option');
-      opt.value = value;
-      opt.textContent = label;
-      direction.appendChild(opt);
-    });
-    direction.value = album.tracked || '';
-    direction.addEventListener('change', async () => {
-      try {
-        if (direction.value) {
-          await invoke('track_album', { path: album.path, direction: direction.value });
-        } else {
-          await invoke('untrack_album', { path: album.path });
-        }
-        album.tracked = direction.value || null;
-        status(direction.value
-          ? `${album.path} syncs ${direction.value}`
-          : `${album.path} is no longer synced`);
-      } catch (err) {
-        showError('sync-error', String(err));
-        direction.value = album.tracked || '';
+    // One chip per server the album is tracked on: name, direction glyph,
+    // scope. Untracked everywhere leaves only the ＋ affordance.
+    const chips = document.createElement('div');
+    chips.className = 'sync-chips';
+    let untracked = [];
+    state.remotes.forEach((r) => {
+      const s = subFor(r.id, album.path);
+      if (!s) {
+        untracked.push(r);
+        return;
       }
+      const chip = document.createElement('button');
+      chip.className = 'sync-chip';
+      chip.textContent = `${r.name} ${DIRECTION_GLYPHS[s.direction] || '?'} ${s.scope}`;
+      chip.title = `${r.name}: ${s.direction} · ${s.scope} — click to change`;
+      chip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openChipMenu(chip, album, r);
+      });
+      chips.appendChild(chip);
     });
-    row.appendChild(direction);
+    if (untracked.length && state.remotes.length) {
+      const add = document.createElement('button');
+      add.className = 'sync-chip add';
+      add.textContent = '＋';
+      add.title = 'Track this album on a server';
+      add.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openChipAddMenu(add, album, untracked);
+      });
+      chips.appendChild(add);
+    }
+    info.appendChild(chips);
+    row.appendChild(info);
 
     const actions = document.createElement('div');
     actions.className = 'remote-actions';
@@ -2296,7 +2748,7 @@ function renderRemoteList() {
       ? 'Download this path — its folders, itself, and everything under it'
       : 'The server does not have this path';
     pull.addEventListener('click', () => runSync(row, album.path, () =>
-      invoke('pull_album', { path: album.path })));
+      invoke('pull_album_on', { path: album.path, remoteId: state.syncRemoteId })));
     actions.appendChild(pull);
 
     const push = document.createElement('button');
@@ -2305,23 +2757,166 @@ function renderRemoteList() {
     push.disabled = !album.local;
     push.title = 'Upload this path — its folders, itself, and everything under it';
     push.addEventListener('click', () => runSync(row, album.path, () =>
-      pushWithDeleteCheck('push_album', album.path)));
+      pushWithDeleteCheck('push_album_on', album.path, { remoteId: state.syncRemoteId })));
     actions.appendChild(push);
 
-    // Both-ways in one click, only for albums that are tracked both ways.
-    if (album.tracked === 'both') {
+    // Any destination at all — this library's other servers, or a remote a
+    // different known library holds the credentials for.
+    if (album.local) {
+      const pushTo = document.createElement('button');
+      pushTo.className = 'btn btn-sm';
+      pushTo.textContent = 'Push to…';
+      pushTo.title = 'Push this path to any server — including one of another library’s';
+      pushTo.addEventListener('click', () => openPushTo(album.path));
+      actions.appendChild(pushTo);
+    }
+
+    // Both-ways in one click, only for albums tracked both ways here.
+    if (subFor(state.syncRemoteId, album.path)?.direction === 'both') {
       const sync = document.createElement('button');
       sync.className = 'btn btn-sm btn-primary';
       sync.textContent = 'Sync';
       sync.title = 'Pull the server’s changes for this whole path, then push this machine’s';
       sync.addEventListener('click', () => runSync(row, album.path, () =>
-        pushWithDeleteCheck('sync_album', album.path, { direction: 'both' })));
+        pushWithDeleteCheck('sync_album_on', album.path, {
+          direction: 'both',
+          remoteId: state.syncRemoteId,
+        })));
       actions.appendChild(sync);
     }
 
     row.appendChild(actions);
     list.appendChild(row);
   });
+}
+
+// ---------------------------------------------------------------- chip menu
+//
+// One small popover for "how does this album sync on that server": direction
+// (untracked / push / pull / both) and scope (web / full). Filled per click,
+// positioned by the chip that asked for it.
+
+function closeChipMenu() {
+  $('chip-menu').hidden = true;
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.chip-menu')) closeChipMenu();
+});
+
+function placeChipMenu(anchor) {
+  const menu = $('chip-menu');
+  menu.hidden = false;
+  const at = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth || 240;
+  const height = menu.offsetHeight || 120;
+  menu.style.left = `${Math.min(at.left, window.innerWidth - width - 8)}px`;
+  menu.style.top = at.bottom + height + 8 > window.innerHeight
+    ? `${at.top - height - 4}px`
+    : `${at.bottom + 4}px`;
+}
+
+async function applyTracking(album, remote, direction, scope) {
+  try {
+    if (!direction) {
+      await invoke('untrack_album_on', { path: album.path, remoteId: remote.id });
+      status(`${album.path} is no longer synced with ${remote.name}`);
+    } else {
+      await invoke('track_album_on', {
+        path: album.path,
+        direction,
+        scope,
+        remoteId: remote.id,
+      });
+      status(`${album.path} syncs ${direction} (${scope || 'web'}) with ${remote.name}`);
+    }
+    await refreshSubscriptions();
+    renderRemoteList();
+  } catch (err) {
+    showError('sync-error', String(err));
+  }
+}
+
+function openChipMenu(anchor, album, remote) {
+  const menu = $('chip-menu');
+  menu.innerHTML = '';
+  const s = subFor(remote.id, album.path);
+
+  const head = document.createElement('div');
+  head.className = 'chip-menu-head muted';
+  head.textContent = `${album.path} on ${remote.name}`;
+  menu.appendChild(head);
+
+  const dirRow = document.createElement('div');
+  dirRow.className = 'chip-menu-row';
+  [
+    ['', 'Untracked'],
+    ['push', '↑ Push'],
+    ['pull', '↓ Pull'],
+    ['both', '⇅ Both'],
+  ].forEach(([value, label]) => {
+    const b = document.createElement('button');
+    b.className = 'chip' + ((s?.direction || '') === value ? ' active' : '');
+    b.textContent = label;
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      closeChipMenu();
+      // Changing direction keeps the scope the subscription already carries.
+      await applyTracking(album, remote, value, value ? (s?.scope || 'web') : null);
+    });
+    dirRow.appendChild(b);
+  });
+  menu.appendChild(dirRow);
+
+  const scopeRow = document.createElement('div');
+  scopeRow.className = 'chip-menu-row';
+  [
+    ['web', 'Web — published tree'],
+    ['full', 'Full — plus originals'],
+  ].forEach(([value, label]) => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (s?.scope === value ? ' active' : '');
+    b.textContent = label;
+    b.disabled = !s;
+    b.title = s ? '' : 'Pick a direction first';
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      closeChipMenu();
+      await applyTracking(album, remote, s.direction, value);
+    });
+    scopeRow.appendChild(b);
+  });
+  menu.appendChild(scopeRow);
+
+  placeChipMenu(anchor);
+}
+
+/// The ＋ chip: pick which of the still-untracked servers to track on, then
+/// fall into the same direction/scope menu.
+function openChipAddMenu(anchor, album, untracked) {
+  const menu = $('chip-menu');
+  menu.innerHTML = '';
+
+  const head = document.createElement('div');
+  head.className = 'chip-menu-head muted';
+  head.textContent = `Track ${album.path} on…`;
+  menu.appendChild(head);
+
+  untracked.forEach((r) => {
+    const row = document.createElement('div');
+    row.className = 'chip-menu-row';
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.textContent = r.name;
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openChipMenu(anchor, album, r);
+    });
+    row.appendChild(b);
+    menu.appendChild(row);
+  });
+
+  placeChipMenu(anchor);
 }
 
 /// Upload an album, then ask about anything the server still holds that the
@@ -2377,36 +2972,59 @@ async function runSync(row, path, fn) {
 }
 
 $('sync-all-btn').addEventListener('click', async () => {
-  await saveRemoteDir();
   showError('sync-error', '');
+  // One server, or every server this library knows — the selector says which.
+  const targets = $('sync-all-scope').value === 'all'
+    ? state.remotes
+    : state.remotes.filter((r) => r.id === state.syncRemoteId);
+  if (!targets.length) {
+    showError('sync-error', 'Add a server first.');
+    return;
+  }
   status('Syncing tracked albums…');
   $('sync-all-btn').disabled = true;
   try {
-    const results = await invoke('sync_all_tracked', { allowDeletes: false });
-    if (!results.length) {
-      $('sync-output').hidden = false;
-      $('sync-output').textContent =
-        'Nothing is tracked yet. Pick a direction for an album first.';
-      status('Nothing to sync');
-      return;
+    const lines = [];
+    let albums = 0;
+    let failedAlbums = 0;
+    for (const r of targets) {
+      // One server being unreachable must not stop the others, same as one
+      // album's failure never stops the batch.
+      let results;
+      try {
+        results = await invoke('sync_all_tracked_on', {
+          allowDeletes: false,
+          remoteId: r.id,
+        });
+      } catch (err) {
+        lines.push(`${r.name}: ${err}`);
+        failedAlbums += 1;
+        continue;
+      }
+      if (!results.length) {
+        lines.push(`${r.name}: nothing tracked yet — pick a direction for an album first.`);
+        continue;
+      }
+      albums += results.length;
+      failedAlbums += results.filter(([, o]) => o.failed?.length).length;
+      // One album failing no longer stops the others, so the reason has to be
+      // shown per album — a count alone would leave the photographer knowing
+      // something went wrong and not which album or why.
+      lines.push(
+        ...results.map(([path, o]) =>
+          [
+            `${r.name} · ${path}: ${describeOutcome(o)}`,
+            ...(o.failed || []).map(([file, why]) => `    ${file} — ${why}`),
+          ].join('\n')
+        )
+      );
     }
     $('sync-output').hidden = false;
-    // One album failing no longer stops the others, so the reason has to be
-    // shown per album — a count alone would leave the photographer knowing
-    // something went wrong and not which album or why.
-    $('sync-output').textContent = results
-      .map(([path, o]) =>
-        [
-          `${path}: ${describeOutcome(o)}`,
-          ...(o.failed || []).map(([file, why]) => `    ${file} — ${why}`),
-        ].join('\n')
-      )
-      .join('\n');
-    const failedAlbums = results.filter(([, o]) => o.failed?.length).length;
+    $('sync-output').textContent = lines.join('\n');
     status(
       failedAlbums
-        ? `Synced ${results.length - failedAlbums} of ${results.length} album(s)`
-        : `Synced ${results.length} album(s)`
+        ? `Synced ${albums - failedAlbums} of ${albums} album(s)`
+        : `Synced ${albums} album(s)`
     );
     await refreshAll();
     await refreshRemote();
@@ -2454,6 +3072,13 @@ function reportOutcome(path, o) {
       ? `\n\nThe server has a different version of these — your originals were kept:\n  ` +
         `${o.kept_originals.join('\n  ')}`
       : '') +
+    // The read twin of a push's failures, and the same rule: one item failing
+    // never stops a transfer, so a run that drops this list has turned a
+    // partial pull into something that looks exactly like a complete one.
+    (o.failed?.length
+      ? `\n\nCould not be done — the rest of the transfer still happened:\n  ` +
+        `${o.failed.map(([file, why]) => `${file} — ${why}`).join('\n  ')}`
+      : '') +
     // A parent folder someone else configured is not this push's to rewrite.
     (o.folders_left_alone?.length
       ? `\n\nAlready on the server and configured elsewhere — left as they are:\n  ` +
@@ -2462,5 +3087,523 @@ function reportOutcome(path, o) {
       : '');
   status(summary);
 }
+
+// ----------------------------------------------------------------- push to…
+//
+// Push one album anywhere: this library's own servers first, then remotes
+// read out of the other libraries this machine knows — their catalogs hold
+// the credentials, so nothing has to be retyped. A foreign push is stateless:
+// no subscription, no baseline, never a delete.
+
+let pushToAlbum = null;
+
+async function openPushTo(albumPath) {
+  pushToAlbum = albumPath;
+  $('push-to-album').textContent = albumPath;
+  $('push-to-scope').value = 'web';
+  showError('push-to-error', '');
+  $('push-to-output').hidden = true;
+  openModal('push-to-modal');
+
+  const list = $('push-to-list');
+  list.innerHTML = '<p class="muted">Reading destinations…</p>';
+  const rows = [];
+
+  const destRow = (label, target, note, onPush) => {
+    const row = document.createElement('div');
+    row.className = 'remote-row';
+    const info = document.createElement('div');
+    info.className = 'remote-info';
+    const title = document.createElement('strong');
+    title.textContent = label;
+    info.appendChild(title);
+    const sub = document.createElement('div');
+    sub.className = 'remote-sub muted';
+    sub.textContent = target + (note ? ` · ${note}` : '');
+    info.appendChild(sub);
+    row.appendChild(info);
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+    const push = document.createElement('button');
+    push.className = 'btn btn-sm btn-primary';
+    push.textContent = 'Push';
+    push.addEventListener('click', async () => {
+      push.disabled = true;
+      showError('push-to-error', '');
+      status(`Pushing ${albumPath}…`);
+      try {
+        await onPush();
+        await refreshAll();
+      } catch (err) {
+        showError('push-to-error', String(err));
+        status('Push failed');
+      } finally {
+        push.disabled = false;
+      }
+    });
+    actions.appendChild(push);
+    row.appendChild(actions);
+    return row;
+  };
+
+  const noteRow = (text) => {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = text;
+    return p;
+  };
+
+  // This library's own servers, default first.
+  [...state.remotes]
+    .sort((a, b) => Number(b.is_default) - Number(a.is_default))
+    .forEach((r) => {
+      rows.push(destRow(
+        r.name + (r.is_default ? ' (default)' : ''),
+        r.target,
+        'this library',
+        async () => {
+          const outcome = await pushWithDeleteCheck('push_album_on', albumPath, {
+            remoteId: r.id,
+          });
+          reportForeignish(`${r.name}: ${describeOutcome(outcome)}`);
+          await refreshSubscriptions();
+        }
+      ));
+    });
+
+  // Other known libraries' remotes. An unreadable library — unplugged drive,
+  // newer schema — is skipped with a note; the rest still show.
+  const libraries = loadRecent(localStorage)
+    .filter((path) => path !== state.libraryRoot)
+    .map((path) => ({ path, name: libraryName(path) }));
+  for (const lib of libraries) {
+    let foreign;
+    try {
+      foreign = await invoke('read_library_remotes', { libraryRoot: lib.path });
+    } catch (err) {
+      rows.push(noteRow(`Library "${lib.name}" skipped — ${err}`));
+      continue;
+    }
+    foreign.forEach((fr) => {
+      rows.push(destRow(
+        `${fr.name} — library ${lib.name}`,
+        fr.target,
+        'stateless — never deletes',
+        async () => {
+          const outcome = await invoke('push_album_to', {
+            path: albumPath,
+            target: fr.target,
+            token: fr.token ?? null,
+            scope: $('push-to-scope').value,
+          });
+          reportForeignPush(outcome);
+        }
+      ));
+    });
+  }
+
+  list.innerHTML = '';
+  if (!rows.length) {
+    list.appendChild(noteRow('No destination yet — add a server first.'));
+  }
+  rows.forEach((r) => list.appendChild(r));
+}
+
+function reportForeignish(text) {
+  $('push-to-output').hidden = false;
+  $('push-to-output').textContent = text;
+  status(text);
+}
+
+/// A foreign push names its provenance and every overwrite — with no baseline
+/// there is no way to know whose copy was newer, so the photographer gets the
+/// list rather than silence.
+function reportForeignPush(o) {
+  const lines = [
+    `${o.album_path}: ${o.files_pushed} pushed · ${o.skipped_unchanged} unchanged` +
+      (o.albums?.length > 1 ? ` · ${o.albums.length} albums` : ''),
+    `Pushed from library "${o.library_name}" (${o.library_id})`,
+  ];
+  if (o.overwritten?.length) {
+    lines.push('', 'Replaced a differing copy on the server:',
+      ...o.overwritten.map((f) => `  ${f}`));
+  }
+  if (o.failed?.length) {
+    lines.push('', 'Never reached the server:',
+      ...o.failed.map(([f, why]) => `  ${f} — ${why}`));
+  }
+  $('push-to-output').hidden = false;
+  $('push-to-output').textContent = lines.join('\n');
+  status(`Pushed ${o.files_pushed} file(s)` +
+    (o.overwritten?.length ? ` · replaced ${o.overwritten.length}` : '') +
+    (o.failed?.length ? ` · ${o.failed.length} failed` : ''));
+}
+
+// --------------------------------------------------------- lightroom import
+//
+// Wizard: pick a .lrcat → scan (read-only) → choose options → dry run or
+// import. Progress and cancel ride the same statusbar affordances an ordinary
+// import uses — the core emits the same event and honours the same flag.
+
+const lrState = { path: null, report: null };
+
+/// Put the wizard back to "no catalog chosen". Called on a library switch:
+/// a scan is only meaningful against the library it was read for.
+function resetLrWizard() {
+  lrState.path = null;
+  lrState.report = null;
+  $('lr-path').value = '';
+  // The per-root selects go with the report; this one is markup, so it has to
+  // be put back by hand or it would describe a scan that is no longer here.
+  $('lr-placement-all').value = '';
+  $('lr-report').hidden = true;
+  $('lr-output').hidden = true;
+  $('lr-dry-run-btn').disabled = true;
+  $('lr-run-btn').disabled = true;
+  showError('lr-error', '');
+}
+
+$('lr-import-btn').addEventListener('click', () => {
+  showError('lr-error', '');
+  $('lr-output').hidden = true;
+  openModal('lr-modal');
+});
+
+$('lr-pick-btn').addEventListener('click', async () => {
+  const file = await openDialog({
+    title: 'Choose a Lightroom Classic catalog',
+    filters: [{ name: 'Lightroom catalog', extensions: ['lrcat'] }],
+  });
+  if (!file) return;
+  lrState.path = file;
+  $('lr-path').value = file;
+  showError('lr-error', '');
+  $('lr-output').hidden = true;
+  $('lr-report').hidden = true;
+  $('lr-dry-run-btn').disabled = true;
+  $('lr-run-btn').disabled = true;
+  status('Reading catalog…');
+  try {
+    lrState.report = await invoke('lr_scan', { lrcatPath: file });
+    renderLrReport(lrState.report);
+    $('lr-report').hidden = false;
+    $('lr-dry-run-btn').disabled = false;
+    $('lr-run-btn').disabled = false;
+    status('Catalog read — nothing imported yet');
+  } catch (err) {
+    showError('lr-error', String(err));
+    status('Could not read catalog');
+  }
+});
+
+function renderLrReport(report) {
+  const bits = [
+    `${report.root_folders.length} folder(s)`,
+    `${report.collections.length} collection(s)`,
+    `${report.keyword_count} keyword(s)`,
+  ];
+  if (report.images_without_files) {
+    bits.push(`${report.images_without_files} image(s) without files`);
+  }
+  $('lr-summary').textContent =
+    bits.join(' · ') + (report.notes.length ? `\n${report.notes.join(' · ')}` : '');
+
+  const roots = $('lr-roots');
+  roots.innerHTML = '';
+  report.root_folders.forEach((root) => {
+    const row = document.createElement('div');
+    row.className = 'remote-row';
+    const info = document.createElement('div');
+    info.className = 'remote-info';
+    const title = document.createElement('strong');
+    title.textContent = root.name;
+    info.appendChild(title);
+    const badge = document.createElement('span');
+    badge.className = 'badge-new';
+    // In place: the folder already lives under a registered source, so its
+    // files are catalogued where they lie rather than copied.
+    badge.textContent = root.in_place ? 'in place' : 'outside the library';
+    info.appendChild(badge);
+    const sub = document.createElement('div');
+    sub.className = 'remote-sub muted';
+    sub.title = root.path;
+    sub.textContent = `${root.path} · ${root.file_count} file(s)` +
+      (root.missing_files ? ` · ${root.missing_files} missing on disk` : '');
+    info.appendChild(sub);
+    row.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'remote-actions';
+    actions.appendChild(placementSelect(root));
+    row.appendChild(actions);
+
+    roots.appendChild(row);
+  });
+
+  const coll = $('lr-collections');
+  coll.innerHTML = '';
+  if (!report.collections.length) {
+    coll.innerHTML = '<p class="muted">No collections — photos and keywords still import.</p>';
+  }
+  report.collections.forEach((c) => {
+    const row = document.createElement('label');
+    row.className = 'check lr-coll';
+    const depth = c.path.split('/').length - 1;
+    row.style.marginLeft = `${depth * 1.1}rem`;
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = true;
+    box.dataset.path = c.path;
+    row.appendChild(box);
+    const name = document.createElement('span');
+    name.textContent = c.path.split('/').pop();
+    row.appendChild(name);
+    const sub = document.createElement('span');
+    sub.className = 'muted';
+    sub.textContent = `${c.kind} · ${c.member_count}`;
+    row.appendChild(sub);
+    coll.appendChild(row);
+  });
+}
+
+/// Where one Lightroom root folder's files should end up. Values are
+/// `LrPlacement`'s own serde spellings (kebab-case) — the core reads them
+/// straight off the wire, so a re-spelling here is a rejected import, not a
+/// silently ignored option.
+const LR_PLACEMENTS = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'in-place', label: 'In place' },
+  { value: 'copy', label: 'Copy' },
+  { value: 'reference', label: 'Reference' },
+];
+
+/// The placement dropdown for one scanned root, with the choices that root
+/// cannot honour disabled — and each disabled one saying why, since "greyed
+/// out" on its own is only a puzzle.
+function placementSelect(root) {
+  const sel = document.createElement('select');
+  sel.title = 'Where this folder\'s photos end up';
+  LR_PLACEMENTS.forEach(({ value, label }) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    if (value === 'in-place' && !root.in_place) {
+      // The scan reports in_place only for a root that already lies under a
+      // registered source. Anywhere else, importing in place would have to
+      // register the folder as a source first — which is Reference, and is
+      // worth choosing deliberately rather than arriving at by accident.
+      opt.disabled = true;
+      opt.textContent = `${label} — outside every source; use Reference`;
+    }
+    if (value === 'reference' && !root.can_reference && !root.in_place) {
+      opt.disabled = true;
+      opt.textContent = `${label} — the folder is not readable from here`;
+    }
+    sel.appendChild(opt);
+  });
+  sel.value = 'auto';
+  return sel;
+}
+
+// One choice for every folder — the shape a mixed selection cannot currently
+// take (see lrPlacementProblem), and the quick way to say "reference all of it".
+$('lr-placement-all').addEventListener('change', () => {
+  const pick = $('lr-placement-all').value;
+  if (!pick) return;
+  document.querySelectorAll('#lr-roots select').forEach((sel) => {
+    const option = [...sel.options].find((o) => o.value === pick);
+    if (option && !option.disabled) sel.value = pick;
+  });
+  showError('lr-error', '');
+});
+
+/// What each scanned root is set to, paired with the id `LrRootPlacement` is
+/// keyed by — `AgLibraryRootFolder.id_local`.
+function lrRootChoices() {
+  const roots = lrState.report?.root_folders || [];
+  return [...document.querySelectorAll('#lr-roots select')].map((sel, i) => ({
+    // `LrRootReport` carries path, name, counts, in_place and can_reference —
+    // and no id. Read whichever name it grows for one, so per-root choices
+    // start travelling the moment the core hands them over.
+    rootId: roots[i]?.root_id ?? roots[i]?.id ?? null,
+    mode: sel.value,
+  }));
+}
+
+/// Why the chosen placements cannot be sent as picked, or null when they can.
+///
+/// `roots` is a list of `{ root_id, mode }` keyed by the id the scan reports
+/// per folder, so normally every selection travels as picked. The guard is for
+/// a scan that named no ids — an older core — where one answer for every
+/// folder still travels exactly (the core falls back to the run-wide `mode`),
+/// and only a mixed selection is stuck: inventing an id there would hand some
+/// folder another folder's answer without a word.
+function lrPlacementProblem() {
+  const choices = lrRootChoices();
+  if (choices.length < 2) return null;
+  if (choices.every((c) => c.rootId != null)) return null;
+  if (new Set(choices.map((c) => c.mode)).size <= 1) return null;
+  return (
+    'Different folders are set to different placements, and this catalog scan ' +
+    'did not name the folder ids the core needs to tell them apart. Set every ' +
+    'folder to the same placement to run it, or import the folders in ' +
+    'separate runs.'
+  );
+}
+
+$('lr-coll-all-btn').addEventListener('click', () => {
+  document.querySelectorAll('#lr-collections input[type=checkbox]')
+    .forEach((b) => (b.checked = true));
+});
+$('lr-coll-none-btn').addEventListener('click', () => {
+  document.querySelectorAll('#lr-collections input[type=checkbox]')
+    .forEach((b) => (b.checked = false));
+});
+
+/// The options the form currently describes. Field names are the core's own
+/// (`LrImportOptions` is deny_unknown_fields — a stray name would be an
+/// error, not a silently dropped filter).
+function lrOptions(dryRun) {
+  const boxes = [...document.querySelectorAll('#lr-collections input[type=checkbox]')];
+  const chosen = boxes.filter((b) => b.checked).map((b) => b.dataset.path);
+  const choices = lrRootChoices();
+
+  // Per-root overrides when the report names its roots; otherwise the one
+  // answer they all share, which the core applies to every root it holds no
+  // override for. lrPlacementProblem() has already refused anything else.
+  const named = choices.length > 0 && choices.every((c) => c.rootId != null);
+  const modes = [...new Set(choices.map((c) => c.mode))];
+
+  return {
+    dest_subdir: $('lr-dest-subdir').value.trim() || null,
+    album_prefix: $('lr-album-prefix').value.trim() || null,
+    // Everything ticked means no filter at all — new collections in a later
+    // re-run are then included rather than silently skipped.
+    collections: chosen.length === boxes.length ? null : chosen,
+    collision: $('lr-collision').value,
+    mode: named ? 'auto' : (modes[0] || 'auto'),
+    roots: named ? choices.map((c) => ({ root_id: c.rootId, mode: c.mode })) : null,
+    dry_run: dryRun,
+  };
+}
+
+function describeLrReport(r) {
+  const lines = [];
+  if (r.dry_run) lines.push('Dry run — nothing was written. This is a forecast:');
+  if (r.cancelled) lines.push('Stopped on request — every count is a partial tally.');
+  lines.push(
+    // photos_referenced is the subset of photos_in_place that lives on a
+    // source other than the library root — the number that answers "how much
+    // of my Lightroom library did I take in without copying a byte".
+    `photos: ${r.photos_copied} copied · ${r.photos_in_place} in place ` +
+    `(${r.photos_referenced} referenced) · ` +
+    `${r.photos_linked_existing} already here · ${r.skipped_missing_files} missing on disk`,
+    `albums: ${r.albums_created} created · ${r.albums_updated} updated · ` +
+    `${r.memberships_added} membership(s) · ${r.tags_added} tag(s)`,
+  );
+  if (r.bytes_copied) lines.push(`${formatBytes(r.bytes_copied)} copied`);
+  // A source is a lasting change to the library — it is what makes those files
+  // findable again next time — so a run that adds one has to say so.
+  if (r.sources_registered.length) {
+    lines.push('', 'Registered as sources — their photos stay where they are:',
+      ...r.sources_registered.map((s) => `  ${s}`));
+  }
+  if (r.collisions.length) {
+    lines.push('', 'Album paths already taken:', ...r.collisions.map((c) => `  ${c}`));
+  }
+  if (r.conflicts.length) {
+    lines.push('', 'Left untouched — diverged on both sides:',
+      ...r.conflicts.map((c) => `  ${c}`));
+  }
+  if (r.lr_deleted.length) {
+    lines.push('', 'Gone from Lightroom, kept here (deletions never propagate):',
+      ...r.lr_deleted.map((d) => `  ${d}`));
+  }
+  return lines.join('\n');
+}
+
+async function runLrImport(dryRun) {
+  if (!lrState.path) return;
+  const problem = lrPlacementProblem();
+  if (problem) {
+    showError('lr-error', problem);
+    return;
+  }
+  showError('lr-error', '');
+  $('lr-dry-run-btn').disabled = true;
+  $('lr-run-btn').disabled = true;
+  if (!dryRun) {
+    importReach = { processed: 0, total: 0 };
+    $('progress').hidden = false;
+    $('import-cancel').hidden = false;
+    $('import-cancel').disabled = false;
+    status('Importing from Lightroom…');
+  } else {
+    status('Computing dry run…');
+  }
+  try {
+    const report = await invoke('lr_import', {
+      lrcatPath: lrState.path,
+      options: lrOptions(dryRun),
+    });
+    $('lr-output').hidden = false;
+    $('lr-output').textContent = describeLrReport(report);
+    status(dryRun
+      ? 'Dry run complete — nothing was written'
+      : (report.cancelled ? 'Lightroom import stopped' : 'Lightroom import complete'));
+    if (!dryRun) {
+      // A referenced root is registered as a source by the run itself.
+      await refreshSources();
+      await refreshAll();
+    }
+  } catch (err) {
+    showError('lr-error', String(err));
+    status('Lightroom import failed');
+  } finally {
+    $('lr-dry-run-btn').disabled = false;
+    $('lr-run-btn').disabled = false;
+    $('progress').hidden = true;
+    $('import-cancel').hidden = true;
+    $('progress-fill').style.width = '0';
+  }
+}
+
+$('lr-dry-run-btn').addEventListener('click', () => runLrImport(true));
+$('lr-run-btn').addEventListener('click', () => runLrImport(false));
+
+// ------------------------------------------------------------------- xmp
+//
+// Sidecars for interchange: standard fields plus the develop stack under the
+// gpp: namespace. Never touches an image file; a sidecar another tool wrote
+// is left strictly alone and reported, not replaced.
+
+async function runXmpExport(album, resultEl) {
+  status('Writing XMP sidecars…');
+  try {
+    const o = await invoke('export_xmp', { album });
+    // Same as publish: name the drive the skipped sidecars are waiting on,
+    // from a listing taken now rather than whenever the panel last looked.
+    if (o.offline.length) await refreshSources();
+    const text = `${o.written} sidecar(s) written` +
+      (o.skipped_foreign.length
+        ? ` · ${o.skipped_foreign.length} from other tools left alone`
+        : '') +
+      (o.missing.length ? ` · ${o.missing.length} original(s) missing on disk` : '') +
+      // A sidecar sits beside its original, so a photo whose drive is elsewhere
+      // has nowhere to put one yet. Name the drive: "missing on disk" would be
+      // the wrong diagnosis and the wrong remedy.
+      (o.offline.length ? ` · ${offlineNote(o.offline.length)}` : '');
+    if (resultEl) resultEl.textContent = text;
+    status(`XMP: ${text}`);
+  } catch (err) {
+    if (resultEl) resultEl.textContent = String(err);
+    status(`XMP export failed: ${err}`);
+  }
+}
+
+$('export-xmp-all-btn').addEventListener('click', () => runXmpExport(null, null));
+$('export-xmp-btn').addEventListener('click', () => {
+  if (state.editingAlbum) runXmpExport(state.editingAlbum.path, $('export-xmp-result'));
+});
 
 boot();

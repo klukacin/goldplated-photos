@@ -15,7 +15,8 @@ use gpp_core::develop::EditOp;
 use gpp_core::import::{import_dir, ImportOptions};
 use gpp_core::model::{Flag, PhotoFilter, PhotoSort};
 use gpp_core::publish::{publish_album, PublishOptions};
-use gpp_core::sync::SyncDirection;
+use gpp_core::remotes::RemoteUpdate;
+use gpp_core::sync::{SyncDirection, SyncScopeKind};
 use gpp_core::{remote, sync, Library, Result};
 
 fn main() -> ExitCode {
@@ -45,12 +46,17 @@ fn run(args: &[String]) -> Result<()> {
         "rate" => cmd_rate(rest),
         "flag" => cmd_flag(rest),
         "album" => cmd_album(rest),
+        "lr" => cmd_lr(rest),
         "develop" => cmd_develop(rest),
         "publish" => cmd_publish(rest),
         "sync" => cmd_sync(rest),
         "remote" => cmd_remote(rest),
+        "remotes" => cmd_remotes(rest),
+        "sources" => cmd_sources(rest),
         "pull" => cmd_pull(rest),
         "push" => cmd_push(rest),
+        "push-to" => cmd_push_to(rest),
+        "xmp" => cmd_xmp(rest),
         "stats" => cmd_stats(rest),
         other => Err(gpp_core::Error::other(format!(
             "unknown command '{other}' — run `gpp help`"
@@ -87,7 +93,7 @@ fn positional(args: &[String]) -> Option<&str> {
                     | "--share-link" | "--no-share-link" | "--proofing" | "--no-proofing"
                     | "--allow-download" | "--metadata-only" | "--include-rejected"
                     | "--no-recursive" | "--bw" | "--no-bw" | "--flip-h" | "--flip-v"
-                    | "--reset" | "--show"
+                    | "--reset" | "--show" | "--dry-run" | "--drop-photos"
             );
             skip_next = takes_value;
             continue;
@@ -175,6 +181,12 @@ fn cmd_import(args: &[String]) -> Result<()> {
     );
     for (path, err) in &summary.failed {
         eprintln!("  failed: {path}: {err}");
+    }
+    // A registered source that is not attached is skipped, not failed — and a
+    // run that says nothing about it looks exactly like one that found nothing
+    // new there.
+    for note in &summary.notes {
+        eprintln!("  note: {note}");
     }
 
     // Catalogued but with no readable pixels — a corrupt file, or a RAW format
@@ -485,6 +497,139 @@ fn cmd_album(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `gpp lr <scan|import> <catalog.lrcat>` — Lightroom Classic catalogs.
+fn cmd_lr(args: &[String]) -> Result<()> {
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp lr <scan|import> <catalog.lrcat>"))?;
+    let rest = &args[1..];
+    let session = open_session(rest)?;
+    let lrcat = positional(rest)
+        .ok_or_else(|| gpp_core::Error::other("usage: gpp lr <scan|import> <catalog.lrcat>"))?
+        .to_string();
+
+    match sub {
+        "scan" => {
+            let report = session.lr_scan(lrcat)?;
+            println!("catalog id: {}", report.catalog_id);
+            println!("\nroot folders:");
+            for r in &report.root_folders {
+                println!(
+                    "  {:<40} {:>5} files, {} missing — {}",
+                    r.path,
+                    r.file_count,
+                    r.missing_files,
+                    if r.in_place {
+                        "inside a source (imports in place)".to_string()
+                    } else if r.can_reference {
+                        "outside every source (copies in, or --mode reference \
+                         to catalogue it where it is)"
+                            .to_string()
+                    } else {
+                        "outside every source, and not a readable folder".to_string()
+                    }
+                );
+            }
+            if !report.collections.is_empty() {
+                println!("\ncollections:");
+                for c in &report.collections {
+                    println!("  {:<40} {:<10} {:>5} members", c.path, c.kind, c.member_count);
+                }
+            }
+            println!("\nkeywords: {}", report.keyword_count);
+            if report.images_without_files > 0 {
+                println!("images without files: {}", report.images_without_files);
+            }
+            for note in &report.notes {
+                eprintln!("note: {note}");
+            }
+        }
+        "import" => {
+            let options = gpp_core::lightroom::LrImportOptions {
+                dest_subdir: opt(rest, "--dest-subdir").map(String::from),
+                collections: opt(rest, "--collections")
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).collect()),
+                album_prefix: opt(rest, "--prefix").map(String::from),
+                collision: match opt(rest, "--collision") {
+                    Some("merge") => gpp_core::lightroom::MergePolicy::Merge,
+                    Some("suffix") => gpp_core::lightroom::MergePolicy::Suffix,
+                    Some(other) => {
+                        return Err(gpp_core::Error::other(format!(
+                            "--collision wants merge or suffix, not '{other}'"
+                        )))
+                    }
+                    None => gpp_core::lightroom::MergePolicy::Auto,
+                },
+                mode: placement_from(rest)?,
+                // Per-root placement is a UI affordance (tick a box per root
+                // folder); on the command line `--mode` covers every root, and
+                // a root-by-root list would be unreadable as a flag.
+                roots: None,
+                dry_run: has(rest, "--dry-run"),
+            };
+
+            let last = std::sync::Mutex::new(0usize);
+            let report = session.lr_import(
+                lrcat,
+                options,
+                Some(&|p| {
+                    let mut last = last.lock().unwrap();
+                    if p.processed == p.total || p.processed >= *last + 25 {
+                        *last = p.processed;
+                        eprintln!("  [{}/{}] {}", p.processed, p.total, p.current);
+                    }
+                }),
+            )?;
+
+            if report.dry_run {
+                println!("dry run — nothing was written; this is what an import would do:");
+            }
+            println!(
+                "photos: {} copied ({} bytes) · {} in place ({} referenced) · \
+                 {} linked to existing · {} missing",
+                report.photos_copied,
+                report.bytes_copied,
+                report.photos_in_place,
+                report.photos_referenced,
+                report.photos_linked_existing,
+                report.skipped_missing_files
+            );
+            // Registering a source is a lasting change to the library — it is
+            // what makes those files findable next time — so never let it pass
+            // unremarked.
+            for s in &report.sources_registered {
+                println!("  registered as a source (nothing copied): {s}");
+            }
+            println!(
+                "albums: {} created · {} updated · {} memberships · {} tag links",
+                report.albums_created,
+                report.albums_updated,
+                report.memberships_added,
+                report.tags_added
+            );
+            for c in &report.collisions {
+                println!("  collision: {c}");
+            }
+            for c in &report.conflicts {
+                println!("  conflict: {c}");
+            }
+            for d in &report.lr_deleted {
+                println!("  deleted in Lightroom, kept here: {d}");
+            }
+            if report.cancelled {
+                println!("stopped early — every count above is a partial tally");
+            }
+        }
+        other => {
+            return Err(gpp_core::Error::other(format!(
+                "unknown lr subcommand '{other}' — scan or import"
+            )))
+        }
+    }
+    Ok(())
+}
+
 fn cmd_publish(args: &[String]) -> Result<()> {
     let lib = open_library(args)?;
     let dest = opt(args, "--dest").ok_or_else(|| {
@@ -523,6 +668,12 @@ fn cmd_publish(args: &[String]) -> Result<()> {
             println!("    missing: {m}");
         }
 
+        // Not missing — on a drive that is not plugged in. The album is short
+        // until it is, and the next publish ships them.
+        for o in &r.offline {
+            eprintln!("    not published, source unavailable: {o}");
+        }
+
         // A frame the developer could not render is left out of the album, and
         // a publish that says nothing about it looks exactly like a clean one —
         // the photographer finds out from a client asking where the photo went.
@@ -549,6 +700,11 @@ fn cmd_sync(args: &[String]) -> Result<()> {
     let root = published_root_for(&lib, args)?;
     let direction = direction_from(args);
     let allow_deletes = has(args, "--allow-deletes");
+    // `--scope full` re-tracks the named album with full scope before syncing.
+    if let (Some(album), Some(scope)) = (positional(args), scope_from(args)?) {
+        let id = lib.ensure_default_remote()?;
+        lib.track_album_for(album, direction, Some(scope), id)?;
+    }
 
     // With an album named, sync just that one. Without, sync everything this
     // machine has subscribed to — each album in its own direction.
@@ -626,37 +782,29 @@ fn print_plan(plan: &sync::SyncPlan) {
     }
 }
 
-/// Remote directory: `--remote <dir>`, else the value stored in the catalog.
-/// Persist an HTTP remote's access token, if one was given.
+/// Persist an HTTP remote's access token onto the default remote, if given.
 fn store_remote_token(args: &[String], lib: &Library) -> Result<()> {
     if let Some(token) = opt(args, "--remote-token") {
-        lib.set_setting("remote.token", token)?;
+        let id = lib.ensure_default_remote()?;
+        lib.update_remote(
+            id,
+            &RemoteUpdate { token: Some(Some(token.to_string())), ..Default::default() },
+        )?;
     }
     Ok(())
 }
 
-/// The remote, chosen by what it looks like: a path is a directory, an
+/// Build a transport for a bare target/token pair — a path is a directory, an
 /// `http(s)` URL is the sync API. Same rule the desktop app uses, so a library
 /// configured by one is configured for the other.
-fn transport_for(
-    lib: &Library,
-    args: &[String],
+fn transport_for_spec(
+    target: &str,
+    token: Option<&str>,
 ) -> Result<Box<dyn gpp_core::sync::RemoteTransport>> {
-    let target = match opt(args, "--remote") {
-        Some(d) => {
-            lib.set_setting("remote.dir", d)?;
-            d.to_string()
-        }
-        None => lib.get_setting("remote.dir")?.ok_or_else(|| {
-            gpp_core::Error::other("no remote set — pass --remote <dir-or-url> once")
-        })?,
-    };
-    store_remote_token(args, lib)?;
-
     if target.starts_with("http://") || target.starts_with("https://") {
-        let token = lib.get_setting("remote.token")?.ok_or_else(|| {
+        let token = token.filter(|t| !t.is_empty()).ok_or_else(|| {
             gpp_core::Error::other(
-                "this remote needs an access token — pass --remote-token <token> once",
+                "this remote needs an access token — pass --token (or --remote-token) once",
             )
         })?;
         return Ok(Box::new(gpp_core::sync::HttpTransport::new(target, token)));
@@ -664,17 +812,299 @@ fn transport_for(
     Ok(Box::new(gpp_core::sync::FsTransport::new(target)))
 }
 
-fn published_root_for(lib: &Library, args: &[String]) -> Result<PathBuf> {
-    match opt(args, "--dest") {
-        Some(d) => {
-            lib.set_setting("publish.dest", d)?;
-            Ok(PathBuf::from(d))
-        }
-        None => lib
-            .get_setting("publish.dest")?
-            .map(PathBuf::from)
-            .ok_or_else(|| gpp_core::Error::other("no publish destination — pass --dest <dir> once")),
+/// The default remote's transport: `--remote <dir-or-url>` updates it in the
+/// catalog first (remotes row #1 after migration), so the setting survives.
+fn transport_for(
+    lib: &Library,
+    args: &[String],
+) -> Result<Box<dyn gpp_core::sync::RemoteTransport>> {
+    if let Some(d) = opt(args, "--remote") {
+        let id = lib.ensure_default_remote()?;
+        lib.update_remote(id, &RemoteUpdate { target: Some(d.to_string()), ..Default::default() })?;
     }
+    store_remote_token(args, lib)?;
+
+    let info = lib
+        .default_remote_id()?
+        .and_then(|id| lib.remote_by_id(id).transpose())
+        .transpose()?
+        .filter(|r| !r.target.is_empty())
+        .ok_or_else(|| {
+            gpp_core::Error::other("no remote set — pass --remote <dir-or-url> once")
+        })?;
+    transport_for_spec(&info.target, info.token.as_deref())
+}
+
+/// Chosen sync scope: `--scope web|full`, defaulting to web.
+fn scope_from(args: &[String]) -> Result<Option<SyncScopeKind>> {
+    match opt(args, "--scope") {
+        None => Ok(None),
+        Some("web") => Ok(Some(SyncScopeKind::Web)),
+        Some("full") => Ok(Some(SyncScopeKind::Full)),
+        Some(other) => Err(gpp_core::Error::other(format!(
+            "--scope wants web or full, not '{other}'"
+        ))),
+    }
+}
+
+/// `gpp remotes` — manage this library's remotes, or list another library's.
+fn cmd_remotes(args: &[String]) -> Result<()> {
+    // Another library's remotes: read-only, no session swap, no migration.
+    if let Some(root) = opt(args, "--of") {
+        let listed = gpp_core::remotes::read_library_remotes(root)?;
+        if listed.is_empty() {
+            println!("No remotes configured in {root}.");
+            return Ok(());
+        }
+        for r in &listed {
+            println!(
+                "{:>3}  {:<20} {}{}{}",
+                r.id,
+                r.name,
+                r.target,
+                if r.token.is_some() { "  [token]" } else { "" },
+                if r.is_default { "  (default)" } else { "" },
+            );
+        }
+        return Ok(());
+    }
+
+    let lib = open_library(args)?;
+    match args.first().map(|s| s.as_str()) {
+        Some("add") => {
+            let target = opt(args, "--target")
+                .or_else(|| positional(&args[1..]))
+                .ok_or_else(|| {
+                    gpp_core::Error::other("usage: gpp remotes add <dir-or-url> [--name N] [--token T]")
+                })?;
+            let name = opt(args, "--name").unwrap_or("Remote");
+            let id = lib.add_remote(name, target, opt(args, "--token"))?;
+            println!("added remote #{id} ({name}) -> {target}");
+        }
+        Some("rm") => {
+            let id: i64 = positional(&args[1..])
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| gpp_core::Error::other("usage: gpp remotes rm <id>"))?;
+            lib.remove_remote(id)?;
+            println!("removed remote #{id} (its subscriptions and baselines here; the server is untouched)");
+        }
+        Some("default") => {
+            let id: i64 = positional(&args[1..])
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| gpp_core::Error::other("usage: gpp remotes default <id>"))?;
+            lib.set_default_remote(id)?;
+            println!("default remote is now #{id}");
+        }
+        _ => {
+            let listed = lib.remotes()?;
+            if listed.is_empty() {
+                println!("No remotes yet. Add one with:  gpp remotes add <dir-or-url> --name N");
+                return Ok(());
+            }
+            for r in &listed {
+                let subs = lib.album_subscriptions_for(r.id)?.len();
+                println!(
+                    "{:>3}  {:<20} {:<40} {:>3} tracked{}{}",
+                    r.id,
+                    r.name,
+                    // Never empty: `remotes()` lists destinations, not the
+                    // anchor row baselines hang off before one is chosen.
+                    r.target,
+                    subs,
+                    if r.token.is_some() { "  [token]" } else { "" },
+                    if r.is_default { "  (default)" } else { "" },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Chosen Lightroom placement: `--mode auto|in-place|copy|reference`.
+fn placement_from(args: &[String]) -> Result<gpp_core::lightroom::LrPlacement> {
+    use gpp_core::lightroom::LrPlacement;
+    match opt(args, "--mode") {
+        None | Some("auto") => Ok(LrPlacement::Auto),
+        Some("in-place") => Ok(LrPlacement::InPlace),
+        Some("copy") => Ok(LrPlacement::Copy),
+        Some("reference") => Ok(LrPlacement::Reference),
+        Some(other) => Err(gpp_core::Error::other(format!(
+            "--mode wants auto, in-place, copy or reference, not '{other}'"
+        ))),
+    }
+}
+
+/// `gpp sources` — the roots photographs may live under.
+///
+/// Registering one is what makes "import without moving my files" possible:
+/// afterwards an import of that folder catalogues it where it lies. Nothing
+/// here ever writes to, moves or deletes a photograph.
+fn cmd_sources(args: &[String]) -> Result<()> {
+    let lib = open_library(args)?;
+    let rest = if args.is_empty() { args } else { &args[1..] };
+
+    match args.first().map(|s| s.as_str()) {
+        Some("add") => {
+            let path = opt(args, "--path")
+                .or_else(|| positional(rest))
+                .ok_or_else(|| {
+                    gpp_core::Error::other(
+                        "usage: gpp sources add <folder> [--name N] [--kind internal|external|network]",
+                    )
+                })?;
+            let kind = match opt(args, "--kind") {
+                None => None,
+                Some("internal") => Some(gpp_core::SourceKind::Internal),
+                Some("external") => Some(gpp_core::SourceKind::External),
+                Some("network") => Some(gpp_core::SourceKind::Network),
+                Some(other) => {
+                    return Err(gpp_core::Error::other(format!(
+                        "--kind wants internal, external or network, not '{other}'"
+                    )))
+                }
+            };
+            let id = lib.add_source(Path::new(path), opt(args, "--name"), kind)?;
+            println!("added source #{id} -> {path}");
+            println!("nothing was catalogued — run:  gpp import {path}");
+        }
+        Some("rm") => {
+            let id: i64 = positional(rest)
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| {
+                    gpp_core::Error::other("usage: gpp sources rm <id> [--drop-photos]")
+                })?;
+            let dropped = lib.remove_source(id, has(args, "--drop-photos"))?;
+            println!("removed source #{id} — {dropped} catalog row(s) dropped, no files touched");
+        }
+        Some("relocate") => {
+            let id: i64 = positional(rest)
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| {
+                    gpp_core::Error::other("usage: gpp sources relocate <id> --to <folder>")
+                })?;
+            let to = opt(args, "--to")
+                .ok_or_else(|| gpp_core::Error::other("--to <folder> is required"))?;
+            lib.relocate_source(id, Path::new(to))?;
+            println!("source #{id} now at {to}");
+        }
+        _ => {
+            for s in lib.sources()? {
+                println!(
+                    "{:>3}  {:<20} {:<10} {:>6} photos  {:<8} {}",
+                    s.id,
+                    s.name,
+                    if s.is_primary { "primary" } else { "referenced" },
+                    s.photo_count,
+                    if s.online { "online" } else { "OFFLINE" },
+                    s.path,
+                );
+            }
+            println!("\nAdd one with:  gpp sources add <folder> --name N");
+        }
+    }
+    Ok(())
+}
+
+/// `gpp push-to` — stateless push to an arbitrary remote (typically another
+/// library's, listed with `gpp remotes --of <root>`). Never deletes; names
+/// every overwrite.
+fn cmd_push_to(args: &[String]) -> Result<()> {
+    let lib = open_library(args)?;
+    let root = published_root_for(&lib, args)?;
+    let album = positional(args).ok_or_else(|| {
+        gpp_core::Error::other(
+            "usage: gpp push-to --target <url|dir> [--token T] [--scope web|full] <album>",
+        )
+    })?;
+    let target = opt(args, "--target")
+        .ok_or_else(|| gpp_core::Error::other("--target <url|dir> is required"))?;
+    let transport = transport_for_spec(target, opt(args, "--token"))?;
+
+    let opts = PublishOptions {
+        min_rating: opt(args, "--min-rating").and_then(|v| v.parse().ok()),
+        ..Default::default()
+    };
+    let outcome = remote::push_album_to(
+        &lib,
+        transport.as_ref(),
+        album,
+        &root,
+        &opts,
+        scope_from(args)?.unwrap_or_default(),
+    )?;
+    println!(
+        "pushed {} file(s) from {} album(s) to {target} (as library {} '{}'), {} unchanged",
+        outcome.files_pushed,
+        outcome.albums.len(),
+        outcome.library_id,
+        outcome.library_name,
+        outcome.skipped_unchanged
+    );
+    if !outcome.overwritten.is_empty() {
+        println!(
+            "{} file(s) on that remote held a DIFFERENT version and were overwritten:",
+            outcome.overwritten.len()
+        );
+        for p in &outcome.overwritten {
+            println!("  {p}");
+        }
+    }
+    if !outcome.failed.is_empty() {
+        println!("{} file(s) did NOT reach the remote:", outcome.failed.len());
+        for (path, why) in &outcome.failed {
+            println!("  {path}: {why}");
+        }
+    }
+    Ok(())
+}
+
+/// `gpp xmp export [album]` — write XMP sidecars beside the originals.
+fn cmd_xmp(args: &[String]) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str());
+    if sub != Some("export") {
+        return Err(gpp_core::Error::other("usage: gpp xmp export [album]"));
+    }
+    let rest = &args[1..];
+    let lib = open_library(rest)?;
+    let outcome = lib.export_xmp(positional(rest))?;
+    println!("wrote {} sidecar(s)", outcome.written);
+    if !outcome.skipped_foreign.is_empty() {
+        println!(
+            "{} sidecar(s) from another tool were left alone:",
+            outcome.skipped_foreign.len()
+        );
+        for p in &outcome.skipped_foreign {
+            println!("  {p}");
+        }
+    }
+    for m in &outcome.missing {
+        println!("  original missing, no sidecar written: {m}");
+    }
+    for o in &outcome.offline {
+        println!("  source unavailable, no sidecar written: {o}");
+    }
+    Ok(())
+}
+
+fn published_root_for(lib: &Library, args: &[String]) -> Result<PathBuf> {
+    if let Some(d) = opt(args, "--dest") {
+        let id = lib.ensure_default_target()?;
+        lib.update_publish_target(
+            id,
+            &gpp_core::remotes::PublishTargetUpdate {
+                dest_root: Some(d.to_string()),
+                ..Default::default()
+            },
+        )?;
+        return Ok(PathBuf::from(d));
+    }
+    lib.default_target_id()?
+        .and_then(|id| lib.publish_target_by_id(id).transpose())
+        .transpose()?
+        .map(|t| t.dest_root)
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| gpp_core::Error::other("no publish destination — pass --dest <dir> once"))
 }
 
 fn direction_from(args: &[String]) -> SyncDirection {
@@ -752,6 +1182,15 @@ fn cmd_pull(args: &[String]) -> Result<()> {
         println!("refused (the server named files this machine will not write):");
         for c in &outcome.rejected {
             println!("  {c}");
+        }
+    }
+    // Per-item failures: a develop stack this build cannot read, a metadata
+    // document that would not parse, a frame the full namespace cannot carry.
+    // The rest of the album arrived, which is exactly why these have to be said.
+    if !outcome.failed.is_empty() {
+        println!("not applied:");
+        for (what, why) in &outcome.failed {
+            println!("  {what}: {why}");
         }
     }
     Ok(())
@@ -843,6 +1282,18 @@ COMMANDS
   init [path]                     Create/open a library
   import [dir] [--force]          Scan, hash, extract metadata, build thumbnails
                                   [--no-thumbs] [--no-recursive]
+                                  A dir inside a registered source is catalogued
+                                  where it lies; one outside every source is
+                                  copied in. With no dir: every source in turn.
+
+  sources                         Roots photographs may live under
+  sources add <folder> [--name N] [--kind internal|external|network]
+                                  Register a folder: its photographs are
+                                  catalogued where they are, never copied
+  sources rm <id> [--drop-photos] Forget a source (never deletes a file)
+  sources relocate <id> --to <folder>
+                                  The drive moved. Validated by re-hashing a
+                                  few of that source's own files at the new path
   ls [filters]                    List photos
                                   [--min-rating N] [--flag pick|reject]
                                   [--album PATH] [--camera NAME] [--search TEXT]
@@ -871,16 +1322,43 @@ COMMANDS
   album move <from> --to <to>
   album rm <path>
 
+  lr scan <catalog.lrcat>         Look inside a Lightroom Classic catalog:
+                                  root folders (copy vs in-place), collections,
+                                  keywords, missing files. Writes nothing.
+  lr import <catalog.lrcat>       Import it: collections -> albums, keywords ->
+                                  tags. Idempotent: re-running syncs, never
+                                  duplicates.
+                                  [--mode auto|in-place|copy|reference]
+                                    auto      (default) in place where the root
+                                              already sits in a source, else copy
+                                    reference register each outside root as a
+                                              source and catalogue it where it
+                                              is — nothing copied, nothing moved
+                                    copy      always copy into the library
+                                  [--dry-run] [--collections a,b/*] [--prefix p]
+                                  [--dest-subdir d] [--collision merge|suffix]
+
   publish [album] --dest <dir>    Write the gallery content tree
                                   [--min-rating N] [--metadata-only]
                                   [--include-rejected]
 
   remote [--remote <dir>]         List albums on the remote and what you track
+  remotes                         List this library's remotes (id, name, target)
+  remotes add <dir-or-url> [--name N] [--token T]
+  remotes rm <id>                 Forget a remote (local state only)
+  remotes default <id>            Choose the default remote
+  remotes --of <library-root>     List ANOTHER library's remotes (read-only)
+  push-to --target <url|dir> [--token T] [--scope web|full] <album>
+                                  Stateless push to an arbitrary remote:
+                                  never deletes, names every overwrite
+  xmp export [album]              Write XMP sidecars (rating, label, keywords,
+                                  orientation, develop stack) beside originals
   pull <path>                     Adopt a path (album or folder) and everything
                                   under it, plus the folders above it
   push <path> [--allow-deletes]   Publish a path and upload it, folders and all
-  sync [path] [--push|--pull|--both] [--plan] [--allow-deletes]
-                                  Sync one path, or every tracked path
+  sync [path] [--push|--pull|--both] [--plan] [--allow-deletes] [--scope web|full]
+                                  Sync one path, or every tracked path;
+                                  --scope full also moves originals + metadata
 
 EXAMPLES
   gpp init ~/Photos

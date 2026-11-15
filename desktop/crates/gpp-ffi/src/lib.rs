@@ -118,7 +118,7 @@ pub extern "C" fn gpp_session_new() -> *mut GppSession {
 ///
 /// `method` is a NUL-terminated UTF-8 name — the list is in [`METHODS`] and the
 /// README. `args_json` is a NUL-terminated UTF-8 JSON **object** whose keys are
-/// that method's parameter names in `camelCase`; it may be `NULL` or empty for
+/// that method's parameter names in `snake_case`; it may be `NULL` or empty for
 /// a method that takes no arguments.
 ///
 /// # Ownership

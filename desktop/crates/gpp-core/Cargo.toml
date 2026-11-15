@@ -30,6 +30,7 @@ kamadak-exif.workspace = true
 heif-oxide = { version = "0.1", optional = true }
 rayon.workspace = true
 walkdir.workspace = true
+quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

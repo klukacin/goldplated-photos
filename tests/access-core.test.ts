@@ -1,9 +1,12 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { existsSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   _resetSecretForTests,
   generateShareToken,
   getClientIp,
   isAlbumLocked,
+  isSafeMediaPath,
   parseAccessCookie,
   resolveChainAccess,
   resolveChainVisibility,
@@ -39,6 +42,95 @@ describe('safeCompare', () => {
     expect(safeCompare('abc', 'abd')).toBe(false);
     expect(safeCompare('abc', 'abcd')).toBe(false);
     expect(safeCompare('', 'a')).toBe(false);
+  });
+});
+
+describe('secret handling', () => {
+  it('warns when a configured ACCESS_SECRET is too short to be used', () => {
+    const secretFile = join(process.cwd(), '.access-secret');
+    const hadSecretFile = existsSync(secretFile);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      process.env.ACCESS_SECRET = 'too-short';
+      _resetSecretForTests();
+      // Force secret resolution
+      serializeAccessCookie(['x']);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('shorter than 16 characters')
+      );
+    } finally {
+      warn.mockRestore();
+      // Do not leave behind a fallback secret file this test generated
+      if (!hadSecretFile) rmSync(secretFile, { force: true });
+      process.env.ACCESS_SECRET = 'test-secret-at-least-16-chars';
+      _resetSecretForTests();
+    }
+  });
+});
+
+describe('isSafeMediaPath', () => {
+  it('accepts ordinary photo and video paths', () => {
+    for (const path of [
+      'photo.jpg',
+      '2025/wedding/ana-ivan/IMG_0001.jpg',
+      'friends/trip/video.mp4',
+      'a-b_c/photo (1).jpeg'
+    ]) {
+      expect(isSafeMediaPath(path), path).toBe(true);
+    }
+  });
+
+  it('rejects traversal, absolute paths and NUL bytes', () => {
+    for (const path of [
+      '../secret.jpg',
+      'a/../../etc/passwd',
+      '/etc/passwd',
+      'a/b..jpg/..',
+      'a\0b.jpg'
+    ]) {
+      expect(isSafeMediaPath(path), path).toBe(false);
+    }
+  });
+
+  it('rejects backslashes, which are separators on Windows', () => {
+    // `album\photo.jpg` passes a forward-slash-only guard whole, and
+    // resolveFileAccess would see it as a root-level file (dir "") — skipping
+    // the album's access check — while path.join on Windows still resolves it
+    // into the album. Same rule as sync-auth's safeRelPath.
+    for (const path of [
+      'album\\photo.jpg',
+      '..\\..\\x.jpg',
+      'a/b\\..\\c.jpg',
+      '\\etc\\passwd',
+      'locked-album\\photo.jpg'
+    ]) {
+      expect(isSafeMediaPath(path), path).toBe(false);
+    }
+  });
+
+  it('rejects dot segments and empty segments', () => {
+    for (const path of [
+      '.meta/thumbnails/small/x.jpg',
+      'album/.meta/proofing/sub.json',
+      'album/.hidden.jpg',
+      'album//photo.jpg',
+      '.env'
+    ]) {
+      expect(isSafeMediaPath(path), path).toBe(false);
+    }
+  });
+
+  it('rejects markdown (album passwords live in index.md), case-insensitively', () => {
+    for (const path of ['album/index.md', 'album/INDEX.MD', 'index.md']) {
+      expect(isSafeMediaPath(path), path).toBe(false);
+    }
+  });
+
+  it('rejects non-strings and the empty string', () => {
+    expect(isSafeMediaPath('')).toBe(false);
+    expect(isSafeMediaPath(null)).toBe(false);
+    expect(isSafeMediaPath(undefined)).toBe(false);
+    expect(isSafeMediaPath(42)).toBe(false);
   });
 });
 

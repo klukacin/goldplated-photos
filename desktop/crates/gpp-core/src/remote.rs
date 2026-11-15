@@ -45,7 +45,7 @@ use crate::error::{Error, Result};
 use crate::import::{import_dir, ImportOptions};
 use crate::publish::{self, parse_frontmatter, PublishOptions};
 use crate::sync::{
-    self, Action, Manifest, RemoteTransport, SyncDirection, SyncPlan, SyncScope,
+    self, Action, Manifest, RemoteTransport, SyncDirection, SyncPlan, SyncScope, SyncScopeKind,
 };
 
 /// One album seen from this machine: where it exists, and how it syncs.
@@ -106,6 +106,19 @@ pub struct PullOutcome {
     /// than silent: a well-behaved server never names one, so a name here is
     /// worth a photographer's attention even though the album still arrived.
     pub rejected: Vec<String>,
+    /// Metadata fields a full-scope pull found changed on both sides — a
+    /// rating, flag, label, tag set or develop stack that is non-default here
+    /// and different there. Reported, never resolved by guessing; the web
+    /// scope never produces one.
+    pub metadata_conflicts: Vec<String>,
+    /// Work this pull could not do, named with the reason — the read twin of
+    /// [`PushOutcome::failed`]. A develop stack carrying an op this build does
+    /// not know, a metadata document that would not parse, two photographs of
+    /// one album that would publish the same full-scope key. Each is one item's
+    /// failure and none of them stops the rest of the transfer; a caller that
+    /// drops this list has turned a partial pull into something that looks
+    /// exactly like a complete one.
+    pub failed: Vec<(String, String)>,
     /// Every album this operation touched, shallowest first: the folders above
     /// the path, the path itself, and everything under it.
     pub albums: Vec<String>,
@@ -152,8 +165,18 @@ pub struct PushOutcome {
 /// (in my catalog, `remote == false`). Albums present on both sides appear
 /// once. Nothing here writes anything.
 pub fn remote_albums(lib: &Library, transport: &dyn RemoteTransport) -> Result<Vec<RemoteAlbum>> {
+    let remote_id = lib.ensure_default_remote()?;
+    remote_albums_for(lib, remote_id, transport)
+}
+
+/// [`remote_albums`], against one specific remote's subscriptions.
+pub fn remote_albums_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+) -> Result<Vec<RemoteAlbum>> {
     let manifest = transport.manifest()?;
-    let subs = lib.album_subscriptions()?;
+    let subs = lib.album_subscriptions_for(remote_id)?;
     let mut out = Vec::new();
 
     for path in sync::albums_in_manifest(&manifest) {
@@ -218,8 +241,21 @@ pub fn plan_album_sync(
     direction: SyncDirection,
     published_root: &Path,
 ) -> Result<SyncPlan> {
+    let remote_id = lib.ensure_default_remote()?;
+    plan_album_sync_for(lib, remote_id, transport, album_path, direction, published_root)
+}
+
+/// [`plan_album_sync`], against one specific remote's baselines.
+pub fn plan_album_sync_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    album_path: &str,
+    direction: SyncDirection,
+    published_root: &Path,
+) -> Result<SyncPlan> {
     let local = publish::manifest_of(published_root)?;
-    let synced = lib.synced_manifest()?;
+    let synced = lib.synced_manifest_for(remote_id)?;
     let remote = transport.manifest()?;
     Ok(sync::plan_album(album_path, direction, &local, &synced, &remote))
 }
@@ -236,9 +272,57 @@ pub fn pull_album(
     album_path: &str,
     published_root: &Path,
 ) -> Result<PullOutcome> {
-    let outcome = pull_one(lib, transport, album_path, published_root)?;
-    track_default(lib, album_path, SyncDirection::Both)?;
+    let remote_id = lib.ensure_default_remote()?;
+    pull_album_for(lib, remote_id, transport, album_path, published_root, SyncScopeKind::Web)
+}
+
+/// [`pull_album`] against one remote, in a chosen scope. `Full` additionally
+/// pulls the album's originals and metadata from the `__gpp_full__/`
+/// namespace — see [`crate::full`].
+pub fn pull_album_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    album_path: &str,
+    published_root: &Path,
+    scope: SyncScopeKind,
+) -> Result<PullOutcome> {
+    let full_roots = lib.full_scope_albums()?;
+    let mut outcome = pull_one(
+        lib, remote_id, transport, album_path, published_root,
+        may_adopt_media(scope, &full_roots, album_path),
+    )?;
+    if scope == SyncScopeKind::Full {
+        crate::full::pull_full(lib, remote_id, transport, album_path, &mut outcome)?;
+    }
+    track_default(lib, remote_id, album_path, SyncDirection::Both, scope)?;
     Ok(outcome)
+}
+
+/// Whether a pull of `album_path` may make the published bytes this library's
+/// copy of a photo it does not hold.
+///
+/// Only a web-scope pass ever may, and only where no full-scope subscription
+/// covers the album — its own or an ancestor's (`full_roots` comes from
+/// [`Library::full_scope_albums`], which spans every remote because the file
+/// under the library root does too).
+///
+/// The answer is read from the subscription table rather than from whatever the
+/// current pass happens to be doing, because the two are not the same thing and
+/// the difference cost originals. `sync_tracked_albums_for` runs each
+/// subscription separately: a folder tracked `web` and an album inside it
+/// tracked `full` are two passes, and the subscriptions come back `ORDER BY
+/// album_path`, so the folder — the shallower path — always runs first. Its web
+/// pull adopted the gallery's published bytes as the library's copy of every
+/// photo underneath, and the album's own full pull then found the file present
+/// and quite correctly refused to overwrite it. The library's "originals" were
+/// the gallery's developed, HEIC→JPEG-converted, rating-filtered pixels, the
+/// RAW never landed at all, and the only thing said about it was a
+/// `kept_originals` entry that reads like a safety message. Deciding per album
+/// from what is stored is what makes the answer independent of which pass runs
+/// first: no ordering of subscriptions can reintroduce the substitution.
+fn may_adopt_media(scope: SyncScopeKind, full_roots: &[String], album_path: &str) -> bool {
+    scope == SyncScopeKind::Web && !full_roots.iter().any(|root| at_or_under(root, album_path))
 }
 
 /// Pull one album without subscribing to it.
@@ -248,9 +332,17 @@ pub fn pull_album(
 /// subscription on `2026` would drag in every album of the year.
 fn pull_one(
     lib: &Library,
+    remote_id: i64,
     transport: &dyn RemoteTransport,
     album_path: &str,
     published_root: &Path,
+    // Whether the web tree's media may become the *library's* copy of a photo
+    // the library does not hold. True for a web-scope pull — the published
+    // pixels are the best available stand-in for a negative that machine will
+    // never see. False under full scope, where the genuine original follows
+    // through the `__gpp_full__/` namespace and writing the gallery's
+    // developed pixels into the library first would block it.
+    adopt_media_into_library: bool,
 ) -> Result<PullOutcome> {
     let mut outcome = PullOutcome {
         album_path: album_path.to_string(),
@@ -265,42 +357,58 @@ fn pull_one(
     }
 
     // --- 1. Album settings ------------------------------------------------
+    //
+    // A failed fetch of the settings must not read as "the album has none".
+    // The update below writes `Some(None)` / `Some(false)` clear-values for
+    // every field the parse did not find, so treating a transport error as an
+    // empty frontmatter stripped password, shareToken and tags off the local
+    // album — and a Both-direction sync then pushed the stripped `index.md`
+    // back to the server. So: a fetch of an `index.md` the manifest names is
+    // allowed to fail the album, exactly as a failed photo fetch below does —
+    // the error rides out to the same per-album failure reporting
+    // (`sync_tracked_albums` catches it against this album's path). An album
+    // the manifest holds no `index.md` for simply has no settings to adopt,
+    // and the local ones are left alone.
     let index_key = format!("{album_path}/index.md");
-    let parsed = match transport.get(&index_key) {
-        Ok(bytes) => parse_frontmatter(&String::from_utf8_lossy(&bytes)),
-        Err(_) => Default::default(),
+    let parsed = if remote.contains_key(&index_key) {
+        let bytes = transport.get(&index_key)?;
+        Some(parse_frontmatter(&String::from_utf8_lossy(&bytes)))
+    } else {
+        None
     };
 
     if lib.album_by_path(album_path)?.is_none() {
         lib.create_album(&NewAlbum {
             path: album_path.to_string(),
-            title: parsed.title.clone(),
-            description: parsed.description.clone(),
-            date: parsed.date.clone(),
-            is_collection: parsed.is_collection,
+            title: parsed.as_ref().and_then(|p| p.title.clone()),
+            description: parsed.as_ref().and_then(|p| p.description.clone()),
+            date: parsed.as_ref().and_then(|p| p.date.clone()),
+            is_collection: parsed.as_ref().is_some_and(|p| p.is_collection),
         })?;
     }
-    lib.update_album(
-        album_path,
-        &AlbumUpdate {
-            title: parsed.title.clone(),
-            // Adopt the server's id: it is what the access cookie references.
-            token: parsed.token.clone(),
-            description: Some(parsed.description.clone()),
-            date: Some(parsed.date.clone()),
-            password: Some(parsed.password.clone()),
-            share_token: Some(parsed.share_token.clone()),
-            sort: parsed.sort.clone(),
-            style: parsed.style.clone(),
-            is_collection: Some(parsed.is_collection),
-            hidden: Some(parsed.hidden),
-            allow_download: Some(parsed.allow_download),
-            proofing: Some(parsed.proofing),
-            sort_order: Some(parsed.order),
-            tags: Some(parsed.tags.clone()),
-            ..Default::default()
-        },
-    )?;
+    if let Some(parsed) = &parsed {
+        lib.update_album(
+            album_path,
+            &AlbumUpdate {
+                title: parsed.title.clone(),
+                // Adopt the server's id: it is what the access cookie references.
+                token: parsed.token.clone(),
+                description: Some(parsed.description.clone()),
+                date: Some(parsed.date.clone()),
+                password: Some(parsed.password.clone()),
+                share_token: Some(parsed.share_token.clone()),
+                sort: parsed.sort.clone(),
+                style: parsed.style.clone(),
+                is_collection: Some(parsed.is_collection),
+                hidden: Some(parsed.hidden),
+                allow_download: Some(parsed.allow_download),
+                proofing: Some(parsed.proofing),
+                sort_order: Some(parsed.order),
+                tags: Some(parsed.tags.clone()),
+                ..Default::default()
+            },
+        )?;
+    }
 
     // --- 2. Files ---------------------------------------------------------
     // Photos land at their album path inside the library, so a pulled album has
@@ -309,7 +417,7 @@ fn pull_one(
     let album_dir = lib.resolve(album_path)?;
     std::fs::create_dir_all(&album_dir).map_err(|e| Error::io(&album_dir, e))?;
 
-    let synced = lib.synced_manifest()?;
+    let synced = lib.synced_manifest_for(remote_id)?;
     let local = publish::manifest_of(published_root)?;
     let plan = sync::plan_album(album_path, SyncDirection::Pull, &local, &synced, &remote);
 
@@ -347,7 +455,7 @@ fn pull_one(
                 let bytes = transport.get(&change.path)?;
                 let hash = blake3::hash(&bytes).to_hex().to_string();
 
-                if !is_metadata {
+                if !is_metadata && adopt_media_into_library {
                     let dest = album_dir.join(filename);
                     // Only ever *add* a photo to the library. Bringing an album
                     // this machine has never seen is the point of a pull, and
@@ -374,7 +482,7 @@ fn pull_one(
                 }
                 std::fs::write(&published, &bytes).map_err(|e| Error::io(&published, e))?;
 
-                lib.record_synced(&change.path, &hash)?;
+                lib.record_synced_for(remote_id, &change.path, &hash)?;
                 outcome.files_pulled += 1;
             }
             Action::Conflict => outcome.conflicts.push(change.path.clone()),
@@ -386,9 +494,9 @@ fn pull_one(
                 match std::fs::read(&published) {
                     Ok(bytes) => {
                         let hash = blake3::hash(&bytes).to_hex().to_string();
-                        lib.record_synced(&change.path, &hash)?;
+                        lib.record_synced_for(remote_id, &change.path, &hash)?;
                     }
-                    Err(_) => lib.forget_synced(&change.path)?,
+                    Err(_) => lib.forget_synced_for(remote_id, &change.path)?,
                 }
                 outcome.skipped_unchanged += 1;
             }
@@ -408,9 +516,14 @@ fn pull_one(
         text: None,
         ..Default::default()
     })?;
+    // The primary source only: a pull lays its files down under the library
+    // root, and a referenced photo on another drive could carry a rel_path
+    // that reads like this album's folder while being an entirely different
+    // shoot on an entirely different disk.
+    let primary = lib.primary_source_id()?;
     let own: Vec<&crate::model::Photo> = photos
         .iter()
-        .filter(|p| is_direct_child(album_path, &p.rel_path))
+        .filter(|p| p.source_id == primary && is_direct_child(album_path, &p.rel_path))
         .collect();
 
     // A folder in the chain has no photos of its own, and asking to add none
@@ -419,16 +532,26 @@ fn pull_one(
         lib.add_photos_to_album(album_path, &own.iter().map(|p| p.id).collect::<Vec<_>>())?;
     }
 
-    if !parsed.photo_order.is_empty() {
+    if let Some(parsed) = parsed.as_ref().filter(|p| !p.photo_order.is_empty()) {
+        // The server's photoOrder names *published* files, and a published
+        // name is not always the library one: a HEIC ships as `.jpg`
+        // (`publish::published_filename`). Matching on the library filename
+        // alone missed every HEIC frame, so a pull reordered the album as if
+        // those photos had not been named at all. The library filename stays
+        // as a fallback for entries that predate the rename rule.
         let ordered: Vec<i64> = parsed
             .photo_order
             .iter()
-            .filter_map(|name| own.iter().find(|p| &p.filename == name).map(|p| p.id))
+            .filter_map(|name| {
+                own.iter()
+                    .find(|p| &publish::published_filename(p) == name || &p.filename == name)
+                    .map(|p| p.id)
+            })
             .collect();
         lib.reorder_album(album_path, &ordered)?;
     }
 
-    lib.mark_album_synced(album_path)?;
+    lib.mark_album_synced_for(remote_id, album_path)?;
     outcome.albums.push(album_path.to_string());
     Ok(outcome)
 }
@@ -469,6 +592,19 @@ pub fn pull_path(
     path: &str,
     published_root: &Path,
 ) -> Result<PullOutcome> {
+    let remote_id = lib.ensure_default_remote()?;
+    pull_path_for(lib, remote_id, transport, path, published_root, SyncScopeKind::Web)
+}
+
+/// [`pull_path`] against one remote, in a chosen scope.
+pub fn pull_path_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    published_root: &Path,
+    scope: SyncScopeKind,
+) -> Result<PullOutcome> {
     let remote = transport.manifest()?;
     let on_server = sync::albums_in_manifest(&remote);
 
@@ -488,26 +624,38 @@ pub fn pull_path(
         album_path: path.to_string(),
         ..Default::default()
     };
+    let full_roots = lib.full_scope_albums()?;
     for album in targets {
-        let one = pull_one(lib, transport, &album, published_root)?;
+        let one = pull_one(
+            lib, remote_id, transport, &album, published_root,
+            may_adopt_media(scope, &full_roots, &album),
+        )?;
         total.files_pulled += one.files_pulled;
         total.photos_imported += one.photos_imported;
         total.skipped_unchanged += one.skipped_unchanged;
         total.conflicts.extend(one.conflicts);
-        // Both of these are warnings, and this is the form the UI calls, so
-        // dropping them here is the same as never producing them: a kept
+        // All three of these are warnings, and this is the form the UI calls,
+        // so dropping them here is the same as never producing them: a kept
         // original said the server disagrees about a negative there is only one
-        // copy of, and a rejected path said the server asked for something no
-        // honest one asks for. Neither reached a screen.
+        // copy of, a rejected path said the server asked for something no
+        // honest one asks for, and a failure said part of the album is not
+        // here. None of them reached a screen.
         total.kept_originals.extend(one.kept_originals);
         total.rejected.extend(one.rejected);
+        total.failed.extend(one.failed);
         total.albums.push(album);
+    }
+
+    // Full scope: the originals and metadata ride in after the web tree, so
+    // album rows and memberships already exist for them to land on.
+    if scope == SyncScopeKind::Full {
+        crate::full::pull_full(lib, remote_id, transport, path, &mut total)?;
     }
 
     // Only the path the caller named is subscribed. Its folders came along
     // because the gallery needs them, not because this machine wants the rest
     // of what lives under them.
-    track_default(lib, path, SyncDirection::Both)?;
+    track_default(lib, remote_id, path, SyncDirection::Both, scope)?;
     Ok(total)
 }
 
@@ -519,6 +667,29 @@ pub fn push_path(
     published_root: &Path,
     publish_opts: &PublishOptions,
     allow_deletes: bool,
+) -> Result<PushOutcome> {
+    let remote_id = lib.ensure_default_remote()?;
+    push_path_for(
+        lib, remote_id, transport, path, published_root, publish_opts, allow_deletes,
+        SyncScopeKind::Web,
+    )
+}
+
+/// [`push_path`] against one remote, in a chosen scope. `Full` additionally
+/// pushes every catalogued original of the subtree's albums (RAW included)
+/// and a metadata document per album, under `__gpp_full__/` — with the same
+/// three-manifest planning, per-remote baselines and `allow_deletes`
+/// semantics as the web half.
+#[allow(clippy::too_many_arguments)]
+pub fn push_path_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+    scope: SyncScopeKind,
 ) -> Result<PushOutcome> {
     let mut total = PushOutcome {
         album_path: path.to_string(),
@@ -534,7 +705,7 @@ pub fn push_path(
         }
         publish::publish_album(lib, &ancestor, published_root, publish_opts)?;
         match create_remote_index_if_absent(
-            lib, transport, &ancestor, published_root,
+            lib, remote_id, transport, &ancestor, published_root,
         )? {
             AncestorResult::Created => {
                 total.files_pushed += 1;
@@ -564,17 +735,10 @@ pub fn push_path(
     // One plan for the whole subtree: the scope is the path, so nothing outside
     // it is even considered, let alone deleted.
     let local = publish::manifest_of(published_root)?;
-    let synced = lib.synced_manifest()?;
+    let synced = lib.synced_manifest_for(remote_id)?;
     let remote = transport.manifest()?;
     let plan = sync::plan_album(path, SyncDirection::Push, &local, &synced, &remote);
-    let applied = sync::apply(lib, transport, &plan, published_root, allow_deletes)?;
-
-    for album in &subtree {
-        lib.mark_album_synced(album)?;
-    }
-    // One subscription, for the path that was asked for — not one per album
-    // underneath it.
-    track_default(lib, path, SyncDirection::Push)?;
+    let applied = sync::apply_for(lib, remote_id, transport, &plan, published_root, allow_deletes)?;
 
     total.files_pushed += applied.pushed;
     total.deleted_remote = applied.deleted;
@@ -582,6 +746,21 @@ pub fn push_path(
     total.conflicts = applied.conflicts;
     total.skipped = applied.skipped;
     total.failed = applied.failed;
+
+    // Full scope: the originals and metadata follow the web tree up.
+    if scope == SyncScopeKind::Full {
+        crate::full::push_full(
+            lib, remote_id, transport, path, &subtree, allow_deletes, &mut total,
+        )?;
+    }
+
+    for album in &subtree {
+        lib.mark_album_synced_for(remote_id, album)?;
+    }
+    // One subscription, for the path that was asked for — not one per album
+    // underneath it.
+    track_default(lib, remote_id, path, SyncDirection::Push, scope)?;
+
     total.albums.extend(subtree);
     Ok(total)
 }
@@ -609,6 +788,7 @@ enum AncestorResult {
 /// puts it inside the plan's scope, where three-way reconciliation applies.
 fn create_remote_index_if_absent(
     lib: &Library,
+    remote_id: i64,
     transport: &dyn RemoteTransport,
     album_path: &str,
     published_root: &Path,
@@ -623,7 +803,7 @@ fn create_remote_index_if_absent(
         Some(_) => Ok(AncestorResult::LeftAlone),
         None => {
             transport.put(&key, &bytes)?;
-            lib.record_synced(&key, &hash)?;
+            lib.record_synced_for(remote_id, &key, &hash)?;
             Ok(AncestorResult::Created)
         }
     }
@@ -639,18 +819,40 @@ pub fn sync_path(
     publish_opts: &PublishOptions,
     allow_deletes: bool,
 ) -> Result<sync::SyncOutcome> {
+    let remote_id = lib.ensure_default_remote()?;
+    sync_path_for(
+        lib, remote_id, transport, path, direction, published_root, publish_opts,
+        allow_deletes, SyncScopeKind::Web,
+    )
+}
+
+/// [`sync_path`] against one remote, in a chosen scope.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_path_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    direction: SyncDirection,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+    scope: SyncScopeKind,
+) -> Result<sync::SyncOutcome> {
     match direction {
         SyncDirection::Pull => {
-            let pulled = pull_path(lib, transport, path, published_root)?;
+            let pulled = pull_path_for(lib, remote_id, transport, path, published_root, scope)?;
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
-                conflicts: pulled.conflicts,
+                conflicts: merged_conflicts(pulled.conflicts, pulled.metadata_conflicts),
+                failed: pulled.failed,
                 ..Default::default()
             })
         }
         SyncDirection::Push => {
-            let pushed = push_path(
-                lib, transport, path, published_root, publish_opts, allow_deletes,
+            let pushed = push_path_for(
+                lib, remote_id, transport, path, published_root, publish_opts, allow_deletes,
+                scope,
             )?;
             Ok(sync::SyncOutcome {
                 pushed: pushed.files_pushed,
@@ -666,18 +868,22 @@ pub fn sync_path(
             // Pull first so local edits land on top of the newest remote state.
             // A path absent from the server is not an error here: it just means
             // this machine is the one contributing it.
-            let pulled = match pull_path(lib, transport, path, published_root) {
+            let pulled = match pull_path_for(lib, remote_id, transport, path, published_root, scope)
+            {
                 Ok(p) => p,
                 Err(Error::AlbumNotFound(_)) => PullOutcome::default(),
                 Err(e) => return Err(e),
             };
-            let pushed = push_path(
-                lib, transport, path, published_root, publish_opts, allow_deletes,
+            let pushed = push_path_for(
+                lib, remote_id, transport, path, published_root, publish_opts, allow_deletes,
+                scope,
             )?;
-            lib.track_album(path, SyncDirection::Both)?;
+            lib.track_album_for(path, SyncDirection::Both, Some(scope), remote_id)?;
 
-            let mut conflicts = pulled.conflicts;
+            let mut conflicts = merged_conflicts(pulled.conflicts, pulled.metadata_conflicts);
             conflicts.extend(pushed.conflicts);
+            let mut failed = pulled.failed;
+            failed.extend(pushed.failed);
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
                 pushed: pushed.files_pushed,
@@ -685,11 +891,18 @@ pub fn sync_path(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
-                failed: pushed.failed,
+                failed,
                 ..Default::default()
             })
         }
     }
+}
+
+/// File conflicts and metadata conflicts, one list for the outcome shape that
+/// only has one.
+fn merged_conflicts(mut conflicts: Vec<String>, metadata: Vec<String>) -> Vec<String> {
+    conflicts.extend(metadata);
+    conflicts
 }
 
 /// True when `file` sits directly inside `album_path`, not in a sub-album.
@@ -703,9 +916,15 @@ fn is_direct_child(album_path: &str, file: &str) -> bool {
 ///
 /// A one-off pull must not quietly turn a pull-only machine into one that
 /// pushes, and a one-off push must not stop a both-ways album from pulling.
-fn track_default(lib: &Library, album_path: &str, direction: SyncDirection) -> Result<()> {
-    if lib.album_subscription(album_path)?.is_none() {
-        lib.track_album(album_path, direction)?;
+fn track_default(
+    lib: &Library,
+    remote_id: i64,
+    album_path: &str,
+    direction: SyncDirection,
+    scope: SyncScopeKind,
+) -> Result<()> {
+    if lib.album_subscription_for(remote_id, album_path)?.is_none() {
+        lib.track_album_for(album_path, direction, Some(scope), remote_id)?;
     }
     Ok(())
 }
@@ -722,19 +941,36 @@ pub fn push_album(
     publish_opts: &PublishOptions,
     allow_deletes: bool,
 ) -> Result<PushOutcome> {
+    let remote_id = lib.ensure_default_remote()?;
+    push_album_for(
+        lib, remote_id, transport, album_path, published_root, publish_opts, allow_deletes,
+        SyncScopeKind::Web,
+    )
+}
+
+/// [`push_album`] against one remote, in a chosen scope.
+#[allow(clippy::too_many_arguments)]
+pub fn push_album_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    album_path: &str,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+    scope: SyncScopeKind,
+) -> Result<PushOutcome> {
     // Materialize first, so what we upload is exactly what the gallery reads.
     publish::publish_album(lib, album_path, published_root, publish_opts)?;
 
     let local = publish::manifest_of(published_root)?;
-    let synced = lib.synced_manifest()?;
+    let synced = lib.synced_manifest_for(remote_id)?;
     let remote = transport.manifest()?;
     let plan = sync::plan_album(album_path, SyncDirection::Push, &local, &synced, &remote);
 
-    let outcome_inner = sync::apply(lib, transport, &plan, published_root, allow_deletes)?;
-    track_default(lib, album_path, SyncDirection::Push)?;
-    lib.mark_album_synced(album_path)?;
+    let outcome_inner = sync::apply_for(lib, remote_id, transport, &plan, published_root, allow_deletes)?;
 
-    Ok(PushOutcome {
+    let mut out = PushOutcome {
         album_path: album_path.to_string(),
         files_pushed: outcome_inner.pushed,
         deleted_remote: outcome_inner.deleted,
@@ -744,7 +980,30 @@ pub fn push_album(
         failed: outcome_inner.failed,
         albums: vec![album_path.to_string()],
         folders_left_alone: Vec::new(),
-    })
+    };
+    if scope == SyncScopeKind::Full {
+        // The whole subtree, not just this album — because the plan inside
+        // `push_full` scopes `__gpp_full__/<path>`, which *is* the whole
+        // subtree. Handed one album's keys as the local side, every original a
+        // sub-album had pushed earlier read as locally absent: DeleteRemote
+        // with `allow_deletes`, and a withheld-delete report naming files
+        // nobody had deleted without it. The local side has to cover exactly
+        // what the plan looks at, which is what `push_path_for` already does.
+        let mut subtree: Vec<String> = lib
+            .albums()?
+            .into_iter()
+            .map(|a| a.path)
+            .filter(|p| at_or_under(album_path, p))
+            .collect();
+        shallowest_first(&mut subtree);
+        crate::full::push_full(
+            lib, remote_id, transport, album_path, &subtree, allow_deletes, &mut out,
+        )?;
+    }
+    track_default(lib, remote_id, album_path, SyncDirection::Push, scope)?;
+    lib.mark_album_synced_for(remote_id, album_path)?;
+
+    Ok(out)
 }
 
 /// Sync one album in the requested direction.
@@ -759,18 +1018,41 @@ pub fn sync_album(
     publish_opts: &PublishOptions,
     allow_deletes: bool,
 ) -> Result<sync::SyncOutcome> {
+    let remote_id = lib.ensure_default_remote()?;
+    sync_album_for(
+        lib, remote_id, transport, album_path, direction, published_root, publish_opts,
+        allow_deletes, SyncScopeKind::Web,
+    )
+}
+
+/// [`sync_album`] against one remote, in a chosen scope.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_album_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    album_path: &str,
+    direction: SyncDirection,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+    scope: SyncScopeKind,
+) -> Result<sync::SyncOutcome> {
     match direction {
         SyncDirection::Pull => {
-            let pulled = pull_album(lib, transport, album_path, published_root)?;
+            let pulled =
+                pull_album_for(lib, remote_id, transport, album_path, published_root, scope)?;
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
-                conflicts: pulled.conflicts,
+                conflicts: merged_conflicts(pulled.conflicts, pulled.metadata_conflicts),
+                failed: pulled.failed,
                 ..Default::default()
             })
         }
         SyncDirection::Push => {
-            let pushed = push_album(
-                lib, transport, album_path, published_root, publish_opts, allow_deletes,
+            let pushed = push_album_for(
+                lib, remote_id, transport, album_path, published_root, publish_opts,
+                allow_deletes, scope,
             )?;
             Ok(sync::SyncOutcome {
                 pushed: pushed.files_pushed,
@@ -785,14 +1067,18 @@ pub fn sync_album(
         SyncDirection::Both => {
             // Pull first so local edits are applied on top of the newest
             // remote state, then push the result.
-            let pulled = pull_album(lib, transport, album_path, published_root)?;
-            let pushed = push_album(
-                lib, transport, album_path, published_root, publish_opts, allow_deletes,
+            let pulled =
+                pull_album_for(lib, remote_id, transport, album_path, published_root, scope)?;
+            let pushed = push_album_for(
+                lib, remote_id, transport, album_path, published_root, publish_opts,
+                allow_deletes, scope,
             )?;
-            lib.track_album(album_path, SyncDirection::Both)?;
+            lib.track_album_for(album_path, SyncDirection::Both, Some(scope), remote_id)?;
 
-            let mut conflicts = pulled.conflicts;
+            let mut conflicts = merged_conflicts(pulled.conflicts, pulled.metadata_conflicts);
             conflicts.extend(pushed.conflicts);
+            let mut failed = pulled.failed;
+            failed.extend(pushed.failed);
             Ok(sync::SyncOutcome {
                 pulled: pulled.files_pulled,
                 pushed: pushed.files_pushed,
@@ -800,7 +1086,7 @@ pub fn sync_album(
                 withheld_deletes: pushed.withheld_deletes,
                 conflicts,
                 skipped: pushed.skipped,
-                failed: pushed.failed,
+                failed,
                 ..Default::default()
             })
         }
@@ -815,7 +1101,21 @@ pub fn sync_tracked_albums(
     publish_opts: &PublishOptions,
     allow_deletes: bool,
 ) -> Result<Vec<(String, sync::SyncOutcome)>> {
-    let subs = lib.album_subscriptions()?;
+    let remote_id = lib.ensure_default_remote()?;
+    sync_tracked_albums_for(lib, remote_id, transport, published_root, publish_opts, allow_deletes)
+}
+
+/// [`sync_tracked_albums`], for one remote's subscriptions — each album in its
+/// own direction *and its own scope*.
+pub fn sync_tracked_albums_for(
+    lib: &Library,
+    remote_id: i64,
+    transport: &dyn RemoteTransport,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    allow_deletes: bool,
+) -> Result<Vec<(String, sync::SyncOutcome)>> {
+    let subs = lib.album_subscriptions_for(remote_id)?;
     let mut out = Vec::new();
 
     for sub in &subs {
@@ -825,6 +1125,7 @@ pub fn sync_tracked_albums(
         let covered_by_parent = subs.iter().any(|other| {
             other.album_path != sub.album_path
                 && other.direction == sub.direction
+                && other.scope == sub.scope
                 && sub.album_path.starts_with(&format!("{}/", other.album_path))
         });
         if covered_by_parent {
@@ -837,14 +1138,16 @@ pub fn sync_tracked_albums(
         // and the photographer had no way to tell which one was at fault or
         // that the rest had never gone up at all. `apply` already treats a
         // single failing file this way; a failing album is the same shape.
-        let outcome = match sync_path(
+        let outcome = match sync_path_for(
             lib,
+            remote_id,
             transport,
             &sub.album_path,
             sub.direction,
             published_root,
             publish_opts,
             allow_deletes,
+            sub.scope,
         ) {
             Ok(outcome) => outcome,
             Err(e) => sync::SyncOutcome {
@@ -854,6 +1157,148 @@ pub fn sync_tracked_albums(
         };
         out.push((sub.album_path.clone(), outcome));
     }
+    Ok(out)
+}
+
+// --------------------------------------------------------- cross-library push
+
+/// What a stateless push to a *foreign* remote produced.
+///
+/// A foreign remote belongs to another library, so this machine holds no
+/// baselines for it and never will: there is no third manifest to make a
+/// deletion decidable, which is why deletes are not even an option here.
+/// Overwrites of files the remote held differently are performed — that is
+/// what pushing means — but each one is named so the caller's UI can warn.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ForeignPushOutcome {
+    /// The path that was pushed.
+    pub album_path: String,
+    /// Which library did the pushing — the sender's stable id and its root
+    /// folder's name, recorded so the receiving side can label foreign
+    /// content ("pushed from library X") without guessing.
+    pub library_id: String,
+    pub library_name: String,
+    /// Files uploaded: new to the remote, or replacing a differing copy.
+    pub files_pushed: usize,
+    /// Files the remote already held byte-identically.
+    pub skipped_unchanged: usize,
+    /// Files that existed on the remote with different bytes and were
+    /// replaced. With no baseline there is no way to know whose is newer —
+    /// the caller warns, the photographer decides whether to have done it.
+    pub overwritten: Vec<String>,
+    /// Files that never reached the remote, named with the reason.
+    pub failed: Vec<(String, String)>,
+    /// Every album the push covered.
+    pub albums: Vec<String>,
+}
+
+/// Push a path to an arbitrary remote this library has no relationship with —
+/// typically another library's remote, read via
+/// [`crate::remotes::read_library_remotes`].
+///
+/// Stateless: no subscription is created, no baseline recorded, and nothing
+/// is ever deleted from the remote (`allow_deletes` is not accepted here at
+/// all). Ancestor folders' `index.md` are created only where absent, exactly
+/// as an ordinary push treats folders it does not own. Both scopes work:
+/// `Full` also uploads the originals and metadata namespace.
+pub fn push_album_to(
+    lib: &Library,
+    transport: &dyn RemoteTransport,
+    path: &str,
+    published_root: &Path,
+    publish_opts: &PublishOptions,
+    scope: SyncScopeKind,
+) -> Result<ForeignPushOutcome> {
+    let mut out = ForeignPushOutcome {
+        album_path: path.to_string(),
+        library_id: lib.library_id()?,
+        library_name: lib
+            .root()
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+
+    // The subtree, published fresh so what goes up is what a gallery reads.
+    let mut subtree: Vec<String> = lib
+        .albums()?
+        .into_iter()
+        .map(|a| a.path)
+        .filter(|p| at_or_under(path, p))
+        .collect();
+    shallowest_first(&mut subtree);
+    if subtree.is_empty() {
+        return Err(Error::AlbumNotFound(path.to_string()));
+    }
+    for album in &subtree {
+        publish::publish_album(lib, album, published_root, publish_opts)?;
+    }
+
+    let remote = transport.manifest()?;
+
+    // Ancestors: reachable, never reconfigured — and never recorded, this is
+    // not our remote.
+    for ancestor in ancestors_of(path) {
+        if lib.album_by_path(&ancestor)?.is_none() {
+            continue;
+        }
+        publish::publish_album(lib, &ancestor, published_root, publish_opts)?;
+        let key = format!("{ancestor}/index.md");
+        if remote.contains_key(&key) {
+            out.albums.push(ancestor);
+            continue;
+        }
+        let file = published_root.join(&key);
+        match std::fs::read(&file) {
+            Ok(bytes) => match transport.put(&key, &bytes) {
+                Ok(()) => {
+                    out.files_pushed += 1;
+                    out.albums.push(ancestor);
+                }
+                Err(e) => out.failed.push((key, e.to_string())),
+            },
+            Err(e) => out.failed.push((key, e.to_string())),
+        }
+    }
+
+    // The subtree's own files: upload what is new or different, name every
+    // overwrite, delete nothing.
+    let local = publish::manifest_of(published_root)?;
+    let scope_filter = SyncScope::with(vec![path.to_string()]);
+    for (key, hash) in scope_filter.filter(&local) {
+        match remote.get(&key) {
+            Some(theirs) if *theirs == hash => {
+                out.skipped_unchanged += 1;
+                continue;
+            }
+            other => {
+                let file = published_root.join(&key);
+                let bytes = match std::fs::read(&file) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        out.failed.push((key.clone(), e.to_string()));
+                        continue;
+                    }
+                };
+                match transport.put(&key, &bytes) {
+                    Ok(()) => {
+                        out.files_pushed += 1;
+                        if other.is_some() {
+                            out.overwritten.push(key.clone());
+                        }
+                    }
+                    Err(e) => out.failed.push((key.clone(), e.to_string())),
+                }
+            }
+        }
+    }
+
+    if scope == SyncScopeKind::Full {
+        crate::full::foreign_push_full(lib, transport, path, &subtree, &remote, &mut out)?;
+    }
+
+    out.albums.extend(subtree);
     Ok(out)
 }
 

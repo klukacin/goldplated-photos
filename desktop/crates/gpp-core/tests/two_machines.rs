@@ -539,6 +539,93 @@ fn a_pull_names_the_originals_it_kept() {
     );
 }
 
+/// A dropped connection while fetching the album's own settings must not read
+/// as "the album has none".
+///
+/// A pull turns the fetched `index.md` into an `AlbumUpdate` full of explicit
+/// clear-values for whatever the parse did not find. Treating a failed fetch
+/// as an *empty* frontmatter therefore stripped password, shareToken and tags
+/// off the local album — and a Both-direction sync then pushed the stripped
+/// `index.md` to the server, unlocking the client's gallery over a network
+/// blip. The failure has to fail the album instead, landing in the same
+/// per-album reporting as any other failed transfer.
+#[test]
+fn a_failed_index_fetch_does_not_strip_the_albums_settings() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = FsTransport::new(server_dir.path());
+    let opts = PublishOptions::default();
+
+    let a = machine();
+    author_album(&a, "2026/ana-ivan", &["a1.jpg"]);
+    a.lib
+        .update_album(
+            "2026/ana-ivan",
+            &gpp_core::albums::AlbumUpdate {
+                password: Some(Some("tajna".into())),
+                share_token: Some(Some("SECRET_xyz".into())),
+                tags: Some(vec!["wedding".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    remote::push_album(&a.lib, &server, "2026/ana-ivan", a.published_root(), &opts, false)
+        .unwrap();
+
+    // The connection drops exactly on index.md.
+    let flaky = FlakyGet {
+        inner: FsTransport::new(server_dir.path()),
+        refuse: "index.md".to_string(),
+    };
+    let err = remote::pull_album(&a.lib, &flaky, "2026/ana-ivan", a.published_root());
+    assert!(err.is_err(), "a failed settings fetch must fail the album, not empty it");
+
+    let album = a.lib.album_by_path("2026/ana-ivan").unwrap().unwrap();
+    assert_eq!(album.password.as_deref(), Some("tajna"), "the password was stripped");
+    assert_eq!(
+        album.share_token.as_deref(),
+        Some("SECRET_xyz"),
+        "the share secret was stripped"
+    );
+    assert_eq!(album.tags, vec!["wedding".to_string()], "the tags were stripped");
+
+    // Through the batch entry point the same failure is reported against the
+    // album, and the batch carries on — the shape every other failure takes.
+    a.lib.track_album("2026/ana-ivan", SyncDirection::Both).unwrap();
+    let results =
+        remote::sync_tracked_albums(&a.lib, &flaky, a.published_root(), &opts, false).unwrap();
+    let (_, outcome) = results
+        .iter()
+        .find(|(path, _)| path == "2026/ana-ivan")
+        .expect("the album's outcome is reported");
+    assert_eq!(outcome.failed.len(), 1, "the failure must be named: {:?}", outcome.failed);
+    let album = a.lib.album_by_path("2026/ana-ivan").unwrap().unwrap();
+    assert_eq!(album.password.as_deref(), Some("tajna"));
+}
+
+/// A server whose GET fails for one name — the read-side twin of FlakyServer.
+struct FlakyGet {
+    inner: FsTransport,
+    refuse: String,
+}
+
+impl RemoteTransport for FlakyGet {
+    fn manifest(&self) -> gpp_core::Result<gpp_core::sync::Manifest> {
+        self.inner.manifest()
+    }
+    fn put(&self, rel: &str, bytes: &[u8]) -> gpp_core::Result<()> {
+        self.inner.put(rel, bytes)
+    }
+    fn get(&self, rel: &str) -> gpp_core::Result<Vec<u8>> {
+        if rel.ends_with(&self.refuse) {
+            return Err(gpp_core::Error::other("http status: 500"));
+        }
+        self.inner.get(rel)
+    }
+    fn delete(&self, rel: &str) -> gpp_core::Result<()> {
+        self.inner.delete(rel)
+    }
+}
+
 /// A server that refuses one file — a dropped connection, a full disk, a 500.
 struct FlakyServer {
     inner: FsTransport,

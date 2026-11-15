@@ -165,6 +165,12 @@ ALBUMS_REMOTE="${REMOTE_ROOT}/src/content/albums"
 MAX_CONCURRENT=5
 
 if [[ -n "$PARALLEL_MODE" ]]; then
+    # Parallel mode needs bash >= 4.3 (`wait -n`). macOS ships bash 3.2, where
+    # this would silently do nothing — fail loudly instead of deploying nothing.
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+        fail "Parallel mode requires bash >= 4.3 (you have ${BASH_VERSION}). Install a newer bash (e.g. 'brew install bash') or run sequential mode: npm run deploy"
+    fi
+
     echo -e "  ${DIM}→ Syncing albums (parallel mode, $MAX_CONCURRENT workers)...${NC}"
 
     # Sync a single album directory (called in background)
@@ -175,7 +181,10 @@ if [[ -n "$PARALLEL_MODE" ]]; then
 
         if [[ -d "$src" ]]; then
             # Directory: sync contents with --delete
-            "${SSH_WRAP[@]}" rsync -av --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
+            # .meta/ is excluded (and thus protected from --delete): the server
+            # stores client proofing submissions there, and the local thumbnail
+            # cache must not be uploaded.
+            "${SSH_WRAP[@]}" rsync -av --delete --exclude='.meta/' --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
                 -e "ssh $SSH_OPTS -p $SSH_PORT" \
                 "$src/" "$dest/"
         elif [[ -f "$src" ]]; then
@@ -192,13 +201,18 @@ if [[ -n "$PARALLEL_MODE" ]]; then
     export CHMOD_DIRS CHMOD_FILES FORCE_CHECKSUM SSHPASS
 
     # Gather top-level items (files and directories)
-    mapfile -t ITEMS < <(find "$ALBUMS_LOCAL" -mindepth 1 -maxdepth 1 -printf "%f\n")
+    # Portable: BSD find has no -printf, and mapfile needs bash >= 4
+    ITEMS=()
+    while IFS= read -r item_path; do
+        ITEMS+=("$(basename "$item_path")")
+    done < <(find "$ALBUMS_LOCAL" -mindepth 1 -maxdepth 1)
     echo -e "  ${DIM}  Found ${#ITEMS[@]} top-level items to sync${NC}"
 
     # Sync in parallel with worker limit; track failures
     SYNC_FAILED=0
     active=0
     for item in "${ITEMS[@]}"; do
+        [[ "$item" == ".meta" ]] && continue  # server-owned, never synced
         echo -e "  ${DIM}  Starting: $item${NC}"
         sync_album "$item" &
         ((active++))
@@ -221,6 +235,7 @@ if [[ -n "$PARALLEL_MODE" ]]; then
 
     while IFS= read -r rem_item; do
         [[ -z "$rem_item" ]] && continue
+        [[ "$rem_item" == ".meta" ]] && continue  # server-owned (proofing data), never removed
         if [ ! -e "$ALBUMS_LOCAL/$rem_item" ]; then
             echo -e "    ${DIM}Removing stale: $rem_item${NC}"
             # printf %q quotes the path safely for the remote shell
@@ -231,7 +246,10 @@ if [[ -n "$PARALLEL_MODE" ]]; then
 else
     # Sequential mode (default)
     echo -e "  ${DIM}→ Syncing albums...${NC}"
-    run_rsync -av --progress --delete --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
+    # .meta/ is excluded (and thus protected from --delete): the server stores
+    # client proofing submissions there, and the local thumbnail cache must not
+    # be uploaded.
+    run_rsync -av --progress --delete --exclude='.meta/' --chmod=D${CHMOD_DIRS},F${CHMOD_FILES} $FORCE_CHECKSUM \
         src/content/albums/ "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_ROOT}/src/content/albums/" \
         || fail "Album sync failed."
 fi
@@ -295,7 +313,7 @@ run_ssh "${REMOTE_USER}@${REMOTE_HOST}" "bash -s" <<EOF || fail "Remote configur
 
     # Install dependencies
     echo "  -> Installing dependencies..."
-    npm install --production --no-audit --no-fund
+    npm install --omit=dev --no-audit --no-fund
 EOF
 
 # 7. Restart Server

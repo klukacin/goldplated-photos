@@ -264,7 +264,8 @@
             <h2>Landing Background</h2>
             <label class="btn btn-primary btn-sm">
               Replace
-              <input type="file" id="landing-upload" accept="image/*" hidden>
+              <!-- JPEG only: the site references the background by the fixed name /images/landing-bg.jpg -->
+              <input type="file" id="landing-upload" accept=".jpg,.jpeg,image/jpeg" hidden>
             </label>
           </div>
           <div id="landing-preview" class="landing-preview"></div>

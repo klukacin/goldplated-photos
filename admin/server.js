@@ -215,6 +215,19 @@ const uploadPublicAssets = multer({
     'site images are served to browsers as-is, and HEIC/HEIF only render in Safari. Convert to JPEG, PNG or WebP first'
   )
 });
+// The landing background is stricter still: the site references it by the
+// hardcoded path /images/landing-bg.jpg (src/pages/index.astro uses it both
+// as the <img> and the CSS background), and this endpoint renames whatever it
+// accepts to that name. Renaming a PNG/WebP to .jpg ships a mislabelled file,
+// so only real JPEGs are accepted here.
+const uploadLandingBackground = multer({
+  storage,
+  limits: { fileSize: MAX_IMAGE_SIZE, files: 1 },
+  fileFilter: extFilter(
+    ['.jpg', '.jpeg'],
+    'the landing page references its background by the fixed name /images/landing-bg.jpg, so only JPEG is accepted here. Convert to JPEG first'
+  )
+});
 
 // Helper: Check if file is an image
 function isImage(filename) {
@@ -896,10 +909,12 @@ app.delete('/api/assets/cards/:name', (req, res, next) => {
 app.post('/api/assets/landing', (req, res, next) => {
   req.uploadPath = join(PUBLIC_DIR, 'images');
   next();
-}, uploadPublicAssets.single('image'), (req, res, next) => {
+}, uploadLandingBackground.single('image'), (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
-    // Rename to landing-bg.jpg (this endpoint always replaces the background)
+    // Rename to landing-bg.jpg (this endpoint always replaces the background).
+    // The filter above only lets .jpg/.jpeg through, so the fixed name never
+    // mislabels the content.
     const oldPath = req.file.path;
     const newPath = join(PUBLIC_DIR, 'images', 'landing-bg.jpg');
     if (oldPath !== newPath) {

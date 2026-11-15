@@ -125,6 +125,41 @@ pub enum Error {
     #[error("unsupported media type: {0}")]
     Unsupported(String),
 
+    /// A photo's source is registered but not reachable right now — an
+    /// external drive that is not plugged in, a network share that is not
+    /// mounted.
+    ///
+    /// A distinct variant because the answer is distinct: nothing is wrong
+    /// with the library, and the photographer's move is to plug the drive
+    /// back in, not to re-import or repair anything. It is never raised for
+    /// a file that is simply gone from an *online* source — that is an
+    /// absence [`Library::prune_missing`](crate::Library::prune_missing)
+    /// exists to resolve, and confusing the two is how a stack of catalog
+    /// rows gets deleted because a cable was loose.
+    #[error("source '{name}' is not available (expected at {path})")]
+    SourceOffline {
+        /// The source's display name, as `sources.name` holds it.
+        name: String,
+        /// Where the source is expected to be.
+        path: String,
+    },
+
+    /// A folder offered as a source's new location does not hold the photos
+    /// that source is catalogued with.
+    ///
+    /// Raised by [`Session::relocate_source`](crate::Session::relocate_source)
+    /// when a sampled file is absent or its bytes differ. Naming the file is
+    /// the whole point: "that is not the right folder" is unactionable, while
+    /// "2026/ana/DSC_0042.jpg is not there" tells the photographer which drive
+    /// they actually picked.
+    #[error("{message}")]
+    SourceMismatch {
+        /// Human-readable explanation, naming the source and the file.
+        message: String,
+        /// The sampled file, relative to the source root.
+        file: String,
+    },
+
     /// Sync found divergent changes on both sides; the caller must resolve.
     ///
     /// Note that the sync engine does not currently raise this. A three-way

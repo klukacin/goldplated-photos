@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { lookup } from 'mrmime';
 import { resolveFileAccess, getAccessCookieValue } from '../../lib/access';
+import { isSafeMediaPath } from '../../lib/access-core';
 import { imageJobSemaphore } from '../../lib/semaphore';
 import { chooseThumbnailFormat, needsBrowserTranscode, isDisabledImageFormat } from '../../lib/image-formats';
 
@@ -30,15 +31,11 @@ export const GET: APIRoute = async ({ request, cookies }) => {
     return new Response('Path required', { status: 400 });
   }
 
-  // Security: Prevent directory traversal
-  if (photoPath.includes('..') || photoPath.startsWith('/') || photoPath.includes('\0')) {
-    return new Response('Invalid path', { status: 400 });
-  }
-
-  // Security: Block metadata — markdown (contains passwords), .meta cache and
-  // dotfiles. Without this, the original-file fallback below could serve
-  // index.md verbatim.
-  if (photoPath.endsWith('.md') || photoPath.split('/').some(s => s.startsWith('.'))) {
+  // Security: shared rule set — traversal, absolute paths, NUL, backslash
+  // (a separator on Windows), dot segments (.meta cache) and markdown
+  // (contains passwords — the original-file fallback below could otherwise
+  // serve index.md verbatim) are all rejected in one place.
+  if (!isSafeMediaPath(photoPath)) {
     return new Response('Not found', { status: 404 });
   }
 

@@ -42,8 +42,12 @@ const photos = {
       e.preventDefault();
       uploadZone.classList.remove('drag-over');
 
+      // MIME type alone is not enough: Chrome/Firefox report an empty type for
+      // dropped HEIC/HEIF files, which would silently discard them here. Fall
+      // back to the allowed-extension list (from /api/config), like the video
+      // upload zone does. The server re-validates, so being permissive is fine.
       const files = Array.from(e.dataTransfer.files).filter(f =>
-        f.type.startsWith('image/')
+        f.type.startsWith('image/') || isAllowedImageFilename(f.name)
       );
 
       if (files.length > 0) {
