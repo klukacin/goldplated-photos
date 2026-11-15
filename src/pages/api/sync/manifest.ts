@@ -11,13 +11,14 @@ import type { APIRoute } from 'astro';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { checkSyncAuth, safeScope } from '../../../lib/sync-auth';
+import { getClientIp } from '../../../lib/access-core';
 import { cachedHash, flushHashCache } from './_hash-cache';
 import { CONTENT_ROOT, jsonError } from './_shared';
 
 export const prerender = false;
 
-export const GET: APIRoute = async ({ request, url }) => {
-  const auth = checkSyncAuth(request);
+export const GET: APIRoute = async ({ request, url, clientAddress }) => {
+  const auth = checkSyncAuth(request, getClientIp(clientAddress, request.headers.get('x-forwarded-for')));
   if (!auth.ok) return jsonError(auth.message, auth.status);
 
   const scope = safeScope(url.searchParams.get('scope'));

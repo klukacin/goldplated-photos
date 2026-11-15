@@ -207,3 +207,21 @@ export function formatVideoInfo(info: any): string {
 
   return html;
 }
+
+/**
+ * Remove every location field from a parsed EXIF object.
+ *
+ * A public album is public: anyone can open it, so the overlay must not tell
+ * anyone where the photo was taken — for a wedding that is the couple's
+ * house. exifr emits the raw `GPS*` tags and, when asked for `gps`, the
+ * derived `latitude`/`longitude`; all of them go. Locked albums keep theirs.
+ */
+export function stripLocation<T extends Record<string, unknown>>(exif: T): T {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(exif)) {
+    if (key.startsWith('GPS')) continue;
+    if (key === 'latitude' || key === 'longitude') continue;
+    out[key] = value;
+  }
+  return out as T;
+}

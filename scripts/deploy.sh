@@ -278,8 +278,11 @@ run_ssh "${REMOTE_USER}@${REMOTE_HOST}" "bash -s" <<EOF || fail "Remote configur
     rm -rf client/home && ln -s ../public/home client/home
     rm -rf client/images && ln -s ../public/images client/images
 
-    # Symlink albums for direct Apache serving
-    [ ! -L "albums" ] && ln -s src/content/albums albums
+    # SECURITY: originals are served by Node only (src/pages/albums/[...path].ts
+    # checks album access). An earlier deploy linked the albums tree into the
+    # web root "for direct Apache serving", which let Apache hand out files
+    # from locked albums to anyone who guessed a filename. Remove it.
+    [ -L "albums" ] && rm "albums" && echo "  -> Removed albums symlink from web root"
 
     # Set private file permissions
     echo "  -> Setting private file permissions (${CHMOD_PRIVATE})..."

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { escapeHtml, formatExifData, formatVideoInfo } from '../src/lib/media-info';
+import { escapeHtml, formatExifData, formatVideoInfo, stripLocation } from '../src/lib/media-info';
 
 const XSS = '<img src=x onerror="alert(1)">';
 
@@ -60,5 +60,30 @@ describe('formatVideoInfo', () => {
 
   it('reports when there is nothing to show', () => {
     expect(formatVideoInfo({})).toContain('No video information available.');
+  });
+});
+
+describe('stripLocation', () => {
+  // A public album's overlay must not say where the photo was taken. exifr
+  // emits the raw GPS tags and, with `gps: true`, derived coordinates too.
+  it('removes every GPS tag and the derived coordinates', () => {
+    const exif = {
+      Make: 'NIKON', Model: 'Z 7_2', ISO: 100,
+      GPSLatitude: [45, 48, 0], GPSLongitude: [15, 58, 0], GPSAltitude: 158,
+      GPSLatitudeRef: 'N', GPSLongitudeRef: 'E', GPSVersionID: '2.3.0.0',
+      latitude: 45.8, longitude: 15.97
+    };
+    expect(stripLocation(exif)).toEqual({ Make: 'NIKON', Model: 'Z 7_2', ISO: 100 });
+  });
+
+  it('leaves an object without location untouched', () => {
+    const exif = { Make: 'Canon', FNumber: 2.8 };
+    expect(stripLocation(exif)).toEqual(exif);
+  });
+
+  it('is the difference between a public and a locked overlay', () => {
+    const exif = { Make: 'NIKON', GPSLatitude: [45, 48, 0], GPSLongitude: [15, 58, 0] };
+    expect(formatExifData(stripLocation(exif))).not.toContain('Latitude');
+    expect(formatExifData(exif)).toContain('Latitude');
   });
 });

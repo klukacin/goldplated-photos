@@ -13,13 +13,30 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
+import { createRateLimiter } from './rate-limit';
 
 /** Longest path we will accept, to bound work before any filesystem call. */
 const MAX_PATH_LENGTH = 512;
 
+/**
+ * Wrong tokens per client IP before the endpoints stop answering. The token
+ * is meant to be random and long, so this is not what keeps it safe — it is
+ * what keeps a weak one from being guessed at line speed. Generous, because
+ * a photographer typing it wrong a few times must not be locked out of their
+ * own gallery for a quarter of an hour.
+ */
+const BAD_TOKEN_LIMIT = 30;
+const BAD_TOKEN_WINDOW_MS = 15 * 60 * 1000;
+const badTokens = createRateLimiter({ maxAttempts: BAD_TOKEN_LIMIT, windowMs: BAD_TOKEN_WINDOW_MS });
+
+/** Test hook: forget every counted failure. */
+export function _resetSyncAuthForTests(): void {
+  badTokens._reset();
+}
+
 export type SyncAuthResult =
   | { ok: true }
-  | { ok: false; status: 401 | 503; message: string };
+  | { ok: false; status: 401 | 429 | 503; message: string };
 
 /**
  * Check the `Authorization: Bearer …` header against `SYNC_TOKEN`.
@@ -27,8 +44,10 @@ export type SyncAuthResult =
  * Returns 503 rather than 401 when the server has no token configured: the
  * client's credentials are not the problem, and saying so saves an hour of
  * debugging a correct token against a server that can never accept one.
+ *
+ * `clientIp` is only used to count failures; pass what `getClientIp` returns.
  */
-export function checkSyncAuth(request: Request): SyncAuthResult {
+export function checkSyncAuth(request: Request, clientIp = 'unknown'): SyncAuthResult {
   const expected = process.env.SYNC_TOKEN;
 
   if (!expected || expected.length < 16) {
@@ -40,12 +59,18 @@ export function checkSyncAuth(request: Request): SyncAuthResult {
     };
   }
 
+  if (badTokens.isRateLimited(clientIp)) {
+    return { ok: false, status: 429, message: 'Too many failed attempts. Try again later.' };
+  }
+
   const header = request.headers.get('authorization') ?? '';
   const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
 
   if (!presented || !constantTimeEqual(presented, expected)) {
+    badTokens.recordFailedAttempt(clientIp);
     return { ok: false, status: 401, message: 'Bad or missing sync token.' };
   }
+  badTokens.clearRateLimit(clientIp);
   return { ok: true };
 }
 
